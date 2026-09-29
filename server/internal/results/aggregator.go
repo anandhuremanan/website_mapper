@@ -13,17 +13,34 @@ import (
 // maxDiscoveredFrom bounds how many referrers are kept per URL.
 const maxDiscoveredFrom = 5
 
+// Limits bound the memory one scan's results can use. Zero means no limit.
+type Limits struct {
+	// MaxHosts bounds recorded hostnames. Certificate logs can list tens of
+	// thousands of historical names for large domains.
+	MaxHosts int
+	// MaxURLsPerHost bounds recorded URLs per host. Pages that list
+	// thousands of links would otherwise dominate the result.
+	MaxURLsPerHost int
+	// MaxURLs bounds recorded URLs across the whole scan.
+	MaxURLs int
+}
+
 // Aggregator collects findings concurrently and builds a Result. It also
 // serves as the discovery.State engines read from.
+//
+// Every URL and host is stored once (keyed by its normalized form), with
+// only the metadata shown to users; response bodies are never retained.
 type Aggregator struct {
 	target discovery.Target
-	// maxURLsPerHost bounds how many URLs are recorded per host. Pages that
-	// list thousands of links would otherwise make results unusably large.
-	maxURLsPerHost int
+	limits Limits
 
-	mu    sync.Mutex
-	urls  map[string]*urlEntry
-	hosts map[string]*hostEntry
+	mu           sync.Mutex
+	urls         map[string]*urlEntry
+	hosts        map[string]*hostEntry
+	hostsOmitted int
+	// urlCounts is maintained incrementally so progress polling does not
+	// reclassify every URL.
+	urlCounts Counts
 }
 
 var _ discovery.State = (*Aggregator)(nil)
@@ -36,8 +53,7 @@ type urlEntry struct {
 	from    []string
 	resp    *discovery.Response
 	err     string
-	// robotsDisallowed: not fetched because robots.txt disallows it.
-	robotsDisallowed bool
+	cls     classify.Result // cached; recomputed when hints or resp change
 }
 
 type hostEntry struct {
@@ -49,14 +65,13 @@ type hostEntry struct {
 	crawl   *discovery.CrawlInfo
 }
 
-// NewAggregator creates an Aggregator scoped to target that records at most
-// maxURLsPerHost URLs per host (0 means no limit).
-func NewAggregator(target discovery.Target, maxURLsPerHost int) *Aggregator {
+// NewAggregator creates an Aggregator scoped to target.
+func NewAggregator(target discovery.Target, limits Limits) *Aggregator {
 	return &Aggregator{
-		target:         target,
-		maxURLsPerHost: maxURLsPerHost,
-		urls:           make(map[string]*urlEntry),
-		hosts:          make(map[string]*hostEntry),
+		target: target,
+		limits: limits,
+		urls:   make(map[string]*urlEntry),
+		hosts:  make(map[string]*hostEntry),
 	}
 }
 
@@ -71,8 +86,6 @@ func (a *Aggregator) Add(f discovery.Finding) {
 	if err != nil || !a.target.InScope(u.Hostname()) {
 		return
 	}
-	// Stored URLs never contain credentials that appeared in links.
-	u = normalize.RedactURL(u)
 	key := u.String()
 
 	// A URL on a host is evidence the host exists, discovered the same way.
@@ -85,41 +98,79 @@ func (a *Aggregator) Add(f discovery.Finding) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	host := a.hostLocked(u.Hostname(), src)
+	if host == nil {
+		return // host not recorded: over the host limit
+	}
 	e, ok := a.urls[key]
 	if !ok {
-		// Over the limit, only URLs the scanner actually requested are
+		// Over a limit, only URLs the scanner actually requested are
 		// recorded (bounded by the request budget); the rest are counted.
-		if a.maxURLsPerHost > 0 && host.urls >= a.maxURLsPerHost && f.Response == nil && f.Error == "" {
+		full := (a.limits.MaxURLsPerHost > 0 && host.urls >= a.limits.MaxURLsPerHost) ||
+			(a.limits.MaxURLs > 0 && len(a.urls) >= a.limits.MaxURLs)
+		if full && f.Response == nil && f.Error == "" {
 			host.omitted++
 			return
 		}
 		host.urls++
 		e = &urlEntry{u: u, sources: set[discovery.Source]{}, hints: set[discovery.Hint]{}, methods: set[string]{}}
 		a.urls[key] = e
+	} else {
+		a.urlCounts.subtract(e)
 	}
+	defer a.urlCounts.add(e)
+	reclassify := !ok
 	if f.Source != "" {
 		e.sources.add(f.Source)
 	}
 	if f.Hint != "" {
-		e.hints.add(f.Hint)
+		if _, had := e.hints[f.Hint]; !had {
+			e.hints.add(f.Hint)
+			reclassify = true
+		}
 	}
 	if f.Method != "" {
 		e.methods.add(f.Method)
 	}
-	if from := normalize.RedactString(f.From); from != "" && len(e.from) < maxDiscoveredFrom && !contains(e.from, from) {
-		e.from = append(e.from, from)
+	if f.From != "" && len(e.from) < maxDiscoveredFrom && !contains(e.from, f.From) {
+		e.from = append(e.from, f.From)
 	}
 	if f.Response != nil {
 		// Prefer a successful response over an earlier redirect or error.
 		if e.resp == nil || (e.resp.Status >= 300 && f.Response.Status < 300) {
 			e.resp = f.Response
+			reclassify = true
 		}
 		e.err = ""
 	} else if f.Error != "" && e.resp == nil {
 		e.err = f.Error
 	}
-	if f.RobotsDisallowed {
-		e.robotsDisallowed = true
+	if reclassify {
+		e.cls = classifyEntry(e)
+	}
+}
+
+// add and subtract maintain the URL part of Counts for one entry.
+func (c *Counts) add(e *urlEntry)      { c.applyURL(e, 1) }
+func (c *Counts) subtract(e *urlEntry) { c.applyURL(e, -1) }
+
+func (c *Counts) applyURL(e *urlEntry, d int) {
+	c.URLs += d
+	switch e.cls.Type {
+	case classify.TypePage:
+		c.Pages += d
+	case classify.TypeAPI:
+		c.APIs += d
+	case classify.TypeAsset:
+		c.Assets += d
+		if e.cls.AssetKind == classify.AssetJavaScript {
+			c.JavaScript += d
+		}
+	}
+	switch {
+	case e.resp != nil:
+		c.URLsFetched += d
+	case e.err != "":
+		c.URLsFailed += d
 	}
 }
 
@@ -131,22 +182,30 @@ func (a *Aggregator) addHost(f discovery.Finding) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	e := a.hostLocked(h, f.Source)
+	if e == nil {
+		return
+	}
 	if f.DNS != nil {
 		e.dns = f.DNS
 	}
 	if f.HTTP != nil {
-		h := *f.HTTP
-		h.URL, h.Redirect, h.FinalURL = normalize.RedactString(h.URL), normalize.RedactString(h.Redirect), normalize.RedactString(h.FinalURL)
-		e.http = &h
+		e.http = f.HTTP
 	}
 	if f.Crawl != nil {
 		e.crawl = f.Crawl
 	}
 }
 
+// hostLocked returns the entry for host, creating it if the host limit
+// allows; otherwise it returns nil and counts the host as omitted. The
+// target's own hosts are always recorded.
 func (a *Aggregator) hostLocked(host string, src discovery.Source) *hostEntry {
 	h, ok := a.hosts[host]
 	if !ok {
+		if a.limits.MaxHosts > 0 && len(a.hosts) >= a.limits.MaxHosts && src != discovery.SourceTarget {
+			a.hostsOmitted++
+			return nil
+		}
 		h = &hostEntry{sources: set[discovery.Source]{}}
 		a.hosts[host] = h
 	}
@@ -174,7 +233,7 @@ func (a *Aggregator) PageURLs() []string {
 	defer a.mu.Unlock()
 	var out []string
 	for key, e := range a.urls {
-		if e.resp == nil && e.err == "" && !e.robotsDisallowed && classifyEntry(e).Type == classify.TypePage {
+		if e.resp == nil && e.err == "" && e.cls.Type == classify.TypePage {
 			out = append(out, key)
 		}
 	}
@@ -182,60 +241,100 @@ func (a *Aggregator) PageURLs() []string {
 	return out
 }
 
-// Counts returns the current summary counts.
+// Counts returns the current summary counts. URL counters are maintained
+// incrementally; host counters take one pass over the (bounded) hosts.
 func (a *Aggregator) Counts() Counts {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	c := Counts{Hosts: len(a.hosts), URLs: len(a.urls)}
+	c := a.urlCounts
+	c.Limits.HostsOmitted = a.hostsOmitted
 	for _, h := range a.hosts {
-		switch hostState(h) {
-		case HostReachable:
-			c.HostsReachable++
-			c.HostsResolved++
-		case HostResolved:
-			c.HostsResolved++
-		}
-		if h.crawl != nil && h.crawl.Skipped == "" {
-			c.HostsCrawled++
-		}
-	}
-	for _, e := range a.urls {
-		countURL(&c, classifyEntry(e))
+		countHost(&c, hostState(h), h.dns, h.http, h.crawl, h.omitted)
 	}
 	return c
 }
 
-func countURL(c *Counts, r classify.Result) {
-	switch r.Type {
-	case classify.TypePage:
-		c.Pages++
-	case classify.TypeAPI:
-		c.APIs++
-	case classify.TypeAsset:
-		c.Assets++
-		if r.AssetKind == classify.AssetJavaScript {
-			c.JavaScript++
+// countHost adds one host to c. Live and final counts share it, so the two
+// always agree.
+func countHost(c *Counts, st HostState, dns *discovery.DNSInfo, http *discovery.HTTPInfo, crawl *discovery.CrawlInfo, omitted int) {
+	c.Hosts++
+	switch st {
+	case HostReachable:
+		c.HostsReachable++
+		c.HostsResolved++
+	case HostResolved:
+		c.HostsResolved++
+	}
+	switch {
+	case dns == nil:
+		c.HostsResolvePending++
+	case dns.Skipped != "":
+		c.Limits.ResolveSkipped++
+	case !dns.Resolved:
+		c.HostsUnresolved++
+	}
+	switch {
+	case http == nil:
+		if dns != nil && dns.Resolved {
+			c.HostsProbePending++
+		}
+	case http.Skipped != "":
+		if isBudgetSkip(http.Skipped) {
+			c.Limits.ProbeSkipped++
+		}
+	default:
+		c.HostsProbed++
+		if !http.Reachable {
+			c.HostsUnreachable++
 		}
 	}
+	switch {
+	case crawl == nil:
+		if http != nil && http.Reachable {
+			c.HostsCrawlPending++
+		}
+	case crawl.Skipped != "":
+		if isBudgetSkip(crawl.Skipped) {
+			c.Limits.CrawlSkipped++
+		}
+	default:
+		c.HostsCrawled++
+		if crawl.LimitReached {
+			c.Limits.CrawlLimited++
+		}
+	}
+	c.Limits.URLsOmitted += omitted
+}
+
+func isBudgetSkip(reason string) bool {
+	return reason == discovery.SkipHostLimit || reason == discovery.SkipRequestLimit
 }
 
 // Counts summarizes a finished result.
 func (r Result) Counts() Counts {
-	c := Counts{Hosts: len(r.Hosts)}
+	c := Counts{}
+	c.Limits.HostsOmitted = r.HostsOmitted
 	for _, h := range r.Hosts {
-		switch h.State {
-		case HostReachable:
-			c.HostsReachable++
-			c.HostsResolved++
-		case HostResolved:
-			c.HostsResolved++
-		}
-		if h.Crawl != nil && h.Crawl.Skipped == "" {
-			c.HostsCrawled++
-		}
-		c.URLs += h.Counts.URLs
+		countHost(&c, h.State, h.DNS, h.HTTP, h.Crawl, h.Omitted)
 		for _, u := range h.URLs {
-			countURL(&c, classify.Result{Type: u.Type, AssetKind: u.AssetKind})
+			c.URLs++
+			switch u.Type {
+			case classify.TypePage:
+				c.Pages++
+			case classify.TypeAPI:
+				c.APIs++
+			case classify.TypeAsset:
+				c.Assets++
+				if u.AssetKind == classify.AssetJavaScript {
+					c.JavaScript++
+				}
+			}
+			switch {
+			case u.Error != "":
+				c.URLsFailed++
+			case u.Fetched:
+				c.URLsFetched++
+			}
 		}
 	}
 	return c
@@ -253,7 +352,7 @@ func (a *Aggregator) Result() Result {
 		byHost[u.Hostname] = append(byHost[u.Hostname], u)
 	}
 
-	res := Result{Hosts: make([]Host, 0, len(a.hosts))}
+	res := Result{Hosts: make([]Host, 0, len(a.hosts)), HostsOmitted: a.hostsOmitted}
 	for name, h := range a.hosts {
 		urls := byHost[name]
 		sort.Slice(urls, func(i, j int) bool { return urls[i].URL < urls[j].URL })
@@ -292,25 +391,23 @@ func (a *Aggregator) Result() Result {
 
 func buildURL(key string, e *urlEntry) URL {
 	out := URL{
-		URL:              key,
-		Hostname:         e.u.Hostname(),
-		Path:             e.u.EscapedPath(),
-		Methods:          e.methods.sorted(),
-		Sources:          e.sources.sorted(),
-		DiscoveredFrom:   append([]string(nil), e.from...),
-		Error:            e.err,
-		Fetched:          e.resp != nil || e.err != "",
-		RobotsDisallowed: e.robotsDisallowed && e.resp == nil,
+		URL:            key,
+		Hostname:       e.u.Hostname(),
+		Path:           e.u.EscapedPath(),
+		Methods:        e.methods.sorted(),
+		Sources:        e.sources.sorted(),
+		DiscoveredFrom: append([]string(nil), e.from...),
+		Error:          e.err,
+		Fetched:        e.resp != nil || e.err != "",
 	}
 	if e.resp != nil {
 		out.Status = e.resp.Status
 		out.ContentType = e.resp.ContentType
 		out.Title = e.resp.Title
-		out.Redirect = normalize.RedactString(e.resp.Redirect)
+		out.Redirect = e.resp.Redirect
 		out.Server = e.resp.Server
 	}
-	c := classifyEntry(e)
-	out.Type, out.AssetKind, out.TypeEvidence = c.Type, c.AssetKind, c.Evidence
+	out.Type, out.AssetKind, out.TypeEvidence = e.cls.Type, e.cls.AssetKind, e.cls.Evidence
 	return out
 }
 

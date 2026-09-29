@@ -28,13 +28,7 @@ npm run dev
 ```
 
 Open http://localhost:3000 and enter a domain you own or have permission to
-inspect. You must confirm that permission before a scan starts; the API
-enforces it too.
-
-Before scanning sites you don't control, set `BOT_INFO_URL` (the public URL
-of the client's `/bot` page) and `BOT_CONTACT` for the server. Site owners
-can then identify the crawler and reach you. The crawler respects
-robots.txt by default. See [server/README.md](server/README.md#responsible-use).
+inspect.
 
 ## Test and build
 

@@ -24,11 +24,7 @@ export function UrlDetail({ url }: { url: DiscoveredUrl }) {
           <span className={`font-mono ${statusTone(url.status)}`}>{url.status}</span>
         ) : (
           <span className="text-muted">
-            {url.error
-              ? "Request failed"
-              : url.robotsDisallowed
-                ? "Not requested: disallowed by the host's robots.txt"
-                : "Not requested by the scanner"}
+            {url.error ? "Request failed" : "Not requested by the scanner"}
           </span>
         )}
       </Row>

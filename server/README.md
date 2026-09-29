@@ -40,7 +40,9 @@ host) are separate engines.
 ```text
 cmd/server            wiring: config → fetch clients → engines → stages → service → HTTP
 internal/api          REST handlers (net/http ServeMux)
-internal/scan         scan model, stage pipeline, worker pool, Repository interface
+internal/scan         scan model, scheduler (queue, cancellation, shutdown),
+                      stage pipeline, Repository interface
+internal/resource     shared resource pools with fair sharing; per-scan accounts
 internal/store        in-memory Repository (swap for PostgreSQL later)
 internal/discovery    Engine interface, Finding, State, Target/scope
   subdomains          passive hostname discovery; Source providers: crt.sh, Cert Spotter
@@ -51,6 +53,7 @@ internal/results      Aggregator: merges findings into hosts → URLs, implement
 internal/normalize    URL and hostname canonicalization (deduplication keys)
 internal/classify     page / api / asset / unknown, always with evidence
 internal/fetch        outbound HTTP: timeouts, size caps, per-host rate limit,
+                      global concurrency pool, per-scan request budget,
                       no auto-redirects, non-public address guard
 internal/htmlmeta     <title> extraction
 internal/config       environment configuration
@@ -94,7 +97,131 @@ to the `sources` list. The engine normalizes names (case, trailing dot, `*.`
 prefix), drops anything outside the scope (`evil-example.com` is not part of
 `example.com`), and fails only if every provider fails.
 
-### Budgets
+### Resource management
+
+Several users can scan large domains at the same time. The server bounds its
+total work in three layers, so no scan (and no number of scans) can grow its
+resource use without limit.
+
+**1. Scheduler: how many scans run.** At most `MAX_CONCURRENT_SCANS` scans run
+at once. Further scans wait in a FIFO queue of up to `SCAN_QUEUE_SIZE` (beyond
+that, `POST /api/scans` returns `503`). A queued scan reports its
+`queuePosition` and starts automatically when a running scan ends. Queued and
+running scans can be cancelled. There is one goroutine per running scan and
+none for queued scans.
+
+**2. Shared pools: how much work all running scans do together.** Every
+outbound operation takes a slot from a pool shared by all scans, and gives it
+back as soon as that single operation ends:
+
+| Pool | Size | Covers |
+| --- | --- | --- |
+| `http` | `GLOBAL_HTTP_CONCURRENCY` | every probe and crawl request, including reading its body |
+| `dns` | `GLOBAL_DNS_CONCURRENCY` | each host's A/AAAA and CNAME lookups |
+| `certificate-transparency` | 4 (fixed) | crt.sh / Cert Spotter queries, whose responses can be tens of MB |
+
+Per-scan settings such as `SCAN_HOST_CONCURRENCY` and `SCAN_CONCURRENCY` only
+limit how many operations one scan asks for at once; the pools decide how many
+actually run. Slots are shared **fairly**: when a slot frees up and several
+scans are waiting, it goes to the waiting scan that holds the fewest slots.
+A large scan can use the whole pool while it is alone, but as soon as a small
+scan needs capacity, freed slots flow to the small scan until they hold equal
+shares. Rate-limit delays (`SCAN_REQUESTS_PER_SECOND` per host) are waited out
+*before* taking a slot, so politeness pauses never occupy shared capacity.
+
+**3. Per-scan budgets: how much one scan may do in total.** These are
+safety limits for very large domains, not the intended coverage. Defaults
+are generous; a scan that hits one reports it (see `limits` below) instead
+of pretending to be complete.
+
+| Budget | Setting | When reached |
+| --- | --- | --- |
+| duration | `SCAN_TIMEOUT` | the scan stops, keeps its results, `stopReason: "scan_timeout"` |
+| requests | `SCAN_MAX_REQUESTS` | remaining probes/crawls are skipped (`request_budget_reached`) |
+| hostnames recorded | `SCAN_MAX_DISCOVERED_HOSTS` | further names are counted, not listed (`host_budget_reached`) |
+| hosts resolved / probed / crawled | `SCAN_MAX_RESOLVE_HOSTS`, `SCAN_MAX_PROBE_HOSTS`, `SCAN_MAX_HOSTS` | the rest are marked `skipped` (`host_budget_reached`) |
+| requests per host | `SCAN_MAX_URLS` | that host's crawl stops (`crawl_limit_reached`) |
+| URLs recorded | `SCAN_MAX_RECORDED_URLS_PER_HOST`, `SCAN_MAX_RECORDED_URLS` | further URLs are counted, not stored (`url_budget_reached`) |
+| response size | `SCAN_MAX_BODY_BYTES` | the body is truncated |
+
+**Backpressure.** Nothing queues without a bound: crawl frontiers are cut to
+the host's remaining request budget (links beyond it are still recorded as
+discovered, just not queued for fetching), worker goroutines are created
+only after acquiring a per-scan concurrency slot, and results keep one entry
+per normalized URL or host with metadata only (no response bodies).
+
+**Cancellation and time limits.** Each scan runs under its own context,
+cancelled by `POST /api/scans/{id}/cancel`, by `SCAN_TIMEOUT` or by server
+shutdown. The context reaches pool waits, rate-limit waits, DNS lookups and
+HTTP requests, so all of the scan's work stops within moments and its pool
+slots are released immediately. The scan then saves the results it has.
+
+**Shutdown.** On SIGINT/SIGTERM the server stops accepting scans, marks
+queued scans `cancelled` (`stopReason: "server_shutdown"`), interrupts running
+scans (which save partial results), waits up to 15 s for them, then stops
+serving HTTP.
+
+**Progress.** Status responses contain only fixed-size counters (see
+`counts` below), never the discovered hosts or URLs, so polling stays cheap
+for any scan size. URL counters are maintained incrementally.
+
+**Retention.** Finished scans stay in memory until evicted, oldest first,
+when there are more than `MAX_STORED_SCANS` of them or their results hold
+more than `MAX_STORED_RESULT_URLS` URLs in total. Queued and running scans are
+never evicted. The URL budget is the real memory bound: measured, a stored
+result costs about 0.6 KB per URL (1 KB per URL while the scan runs), so a
+scan at the 50,000-URL cap keeps about 30 MB.
+
+**Bandwidth.** Assets referenced by pages (scripts, styles, images, fonts,
+media, documents) are recorded, never requested. The scanning client reads
+response bodies only for HTML; other responses (JSON, XML, feeds) are
+classified from their status and headers, and their bodies are not
+downloaded.
+
+`GET /api/health` shows the scheduler and each pool's live use.
+
+### Design decisions (Phase 1 review)
+
+Reviewed and deliberately left as they are:
+
+- **No separate HTML-parsing pool.** Parsing runs at about 53 MB/s per core
+  (1.9 ms for a 100 KB page). Parsing can't outrun downloading, and the
+  global HTTP pool bounds downloads, so it bounds parsing CPU as well: even a
+  full 1 Gbit/s link needs about 2.4 cores. Bodies are dropped as soon as
+  they are parsed.
+- **Progress ticks scan the hosts.** Host counters are recomputed each second
+  (236 µs for 10,000 hosts, no allocations); URL counters are incremental.
+  Making host counters incremental would add bookkeeping for no measurable
+  gain.
+- **The per-host rate stays at 5 requests/second, and crawl parallelism at
+  8 hosts per scan.** One large host occupies one crawl slot while the
+  others keep flowing (tested). One scan's crawl ceiling is 8 hosts x 5/s =
+  40 requests/s. Measured on python.org (46 hosts, ~2,130 requests), the
+  global pool of 32 slots sustained about 47 requests/s, because real
+  responses hold a slot for their full duration. Raising host parallelism
+  to 32 made 91% of requests queue at the pool (average 0.5 s) and gave no
+  reliable speed-up (crawl stage 45-93 s vs 63-78 s at 8). In a synthetic
+  test with fast hosts, 32 was 2.5x faster, so raise `SCAN_HOST_CONCURRENCY`
+  together with `GLOBAL_HTTP_CONCURRENCY` when targets respond quickly.
+  One remaining inefficiency: a request that had to wait for a pool slot
+  takes a fresh per-host rate slot, which keeps politeness exact but can
+  slow a heavily contended host.
+- **One follow-up round.** Hosts first found while crawling are resolved,
+  probed and crawled once more. Hosts first found in that last round are
+  listed but not processed, and the scan says so
+  (`discovery_round_limit`). More rounds would be safe (every budget counts
+  hosts across rounds) but real scans found almost no hosts in the
+  follow-up round, so they are not worth the extra time yet.
+- **Certificate providers are isolated.** Each has its own deadline
+  (`SCAN_CT_TIMEOUT`, retries included); hosts from a provider that answered
+  are always kept, and a failed provider is recorded as a partial error.
+  Caching provider answers across scans belongs to the shared-cache
+  milestone.
+- **Shutdown** is covered by unit tests. A real SIGINT/SIGTERM end-to-end test
+  is still to be run on Linux or macOS, since Windows cannot deliver the
+  signal to a background process.
+
+### Host budgets
 
 - `SCAN_MAX_RESOLVE_HOSTS` bounds how many hosts are resolved,
   `SCAN_MAX_PROBE_HOSTS` how many are probed, and `SCAN_MAX_HOSTS` how many
@@ -111,44 +238,6 @@ prefix), drops anything outside the scope (`evil-example.com` is not part of
 - `SCAN_MAX_RECORDED_URLS_PER_HOST` caps the URLs kept per host. Pages that
   link thousands of URLs would otherwise make results huge. The rest are
   counted in `urlsOmitted`.
-
-### Responsible use
-
-- **Consent.** `POST /api/scans` requires `"authorizationConfirmed": true`:
-  the caller confirms they own the domain or have permission to scan it.
-  The check is in the scan service, so it applies to direct API calls as
-  well as the UI's checkbox. Rejected attempts are logged. The confirmation
-  is recorded on the scan.
-- **Identification.** Every request sends a recognizable User-Agent,
-  `WebsiteMapperBot/0.1 (+<BOT_INFO_URL>)`, which links to the client's
-  `/bot` page. That page describes the crawler, its limits and the operator
-  contact (`BOT_CONTACT`), using `GET /api/bot`. The server logs a warning
-  at startup when `BOT_INFO_URL` or `BOT_CONTACT` is not set.
-- **robots.txt** is respected by default (`SCAN_RESPECT_ROBOTS`). Before
-  crawling a host, the crawler fetches its `/robots.txt` (RFC 9309:
-  a group for our product token takes precedence over `*`, the longest
-  match wins, and `*`/`$` patterns are supported) and never requests
-  disallowed URLs. Links to disallowed URLs are still reported as found,
-  marked `robotsDisallowed`. `Disallow` lines themselves are never treated as
-  routes. If robots.txt cannot be fetched, the crawl continues normally.
-  The probe's single request to a host's root happens before robots.txt is
-  read.
-- **Request limits.** Each scan has a total request budget
-  (`SCAN_MAX_REQUESTS`) and an overall rate limit
-  (`SCAN_MAX_REQUESTS_PER_SECOND`), carried in the scan's context and
-  enforced by the shared HTTP client for every engine. These come on top of
-  the per-host rate, per-host request budget and host limits. Scans report
-  `requests`; hitting the budget adds a notice and leaves partial results.
-- **Only metadata is stored.** Response bodies are read into memory to
-  extract links and titles, then discarded. Results hold URL, hostname,
-  status, content type, title, redirect target, `Server` header, discovery
-  source, timestamps and crawl metadata. No other response headers
-  (including `Set-Cookie`) are stored.
-- **No credentials.** Requests carry no cookies (there is no cookie jar),
-  no `Authorization` header and no body, and URL user info is dropped
-  before sending. Before storage, user info is removed from URLs and the
-  values of sensitive query parameters (`token`, `password`, `api_key`,
-  `session`, `sig`, `X-Amz-Signature`, …) are replaced with `REDACTED`.
 
 ### Scope and safety
 
@@ -178,35 +267,38 @@ All responses are JSON. Errors look like `{"error": "message"}`.
 ### `GET /api/health`
 
 ```json
-{ "status": "ok" }
+{
+  "status": "ok",
+  "scheduler": {
+    "running": 3, "queued": 2, "maxRunning": 3, "queueSize": 100,
+    "pools": [
+      { "name": "http", "capacity": 32, "inUse": 32, "waiting": 41, "peak": 32, "acquired": 18231, "waitedMs": 912004 },
+      { "name": "dns", "capacity": 16, "inUse": 0, "waiting": 0, "peak": 16, "acquired": 7390, "waitedMs": 20411 },
+      { "name": "certificate-transparency", "capacity": 4, "inUse": 1, "waiting": 0, "peak": 4, "acquired": 12, "waitedMs": 0 }
+    ]
+  }
+}
 ```
 
-### `GET /api/bot`
-
-Describes the crawler for the `/bot` page: `name`, `userAgent`,
-`robotsToken`, `infoUrl`, `contact`, `respectsRobotsTxt` and `limits`
-(`requestsPerSecondPerHost`, `requestsPerSecondPerScan`,
-`maxRequestsPerScan`, `maxRequestsPerHost`, `maxHostsCrawled`,
-`requestTimeoutSeconds`).
+`peak` is the highest number of slots ever in use at once; it never exceeds
+`capacity`.
 
 ### `POST /api/scans`
 
 Request:
 
 ```json
-{ "target": "example.com", "authorizationConfirmed": true }
+{ "target": "example.com" }
 ```
 
 `target` can be a bare domain or a URL such as `https://www.example.com/docs`.
-`authorizationConfirmed` is required and must be `true`. It confirms that the
-caller owns the domain or has permission to scan it.
 
 Response `202 Accepted` (with a `Location` header) contains the scan status
-object described below, with `"status": "queued"`.
+object described below. It returns immediately: `"status": "running"` if
+capacity was free, otherwise `"status": "queued"` with a `queuePosition`.
 
-Errors: `400` for a missing or false `authorizationConfirmed`, an invalid
-target or an invalid body, and `503` with `Retry-After` when the queue is
-full.
+Errors: `400` for an invalid target or body, and `503` with `Retry-After`
+when the queue is full or the server is shutting down.
 
 ### `GET /api/scans/{id}`
 
@@ -221,6 +313,13 @@ Returns the scan status. Poll this every 1–2 seconds while a scan runs.
   "status": "running",
   "createdAt": "2026-09-29T06:54:02Z",
   "startedAt": "2026-09-29T06:54:02Z",
+  "phase": "resolving_hosts",
+  "progress": { "total": 15, "completed": 11, "pending": 4 },
+  "limits": [],
+  "resources": {
+    "requests": 3, "maxRequests": 50000,
+    "pools": { "dns": { "operations": 11, "delayed": 2, "avgWaitMs": 40 } }
+  },
   "steps": [
     { "id": "validate", "label": "Validating target", "status": "done", "findings": 0 },
     { "id": "subdomains", "label": "Discovering subdomains", "status": "done", "findings": 26 },
@@ -232,17 +331,42 @@ Returns the scan status. Poll this every 1–2 seconds while a scan runs.
   ],
   "counts": {
     "hosts": 15, "hostsResolved": 11, "hostsReachable": 0, "hostsCrawled": 0,
-    "urls": 0, "pages": 0, "apis": 0, "assets": 0, "javascript": 0
+    "hostsUnresolved": 0, "hostsResolvePending": 4, "hostsProbed": 0,
+    "hostsUnreachable": 0, "hostsProbePending": 11, "hostsCrawlPending": 0,
+    "urls": 0, "pages": 0, "apis": 0, "assets": 0, "javascript": 0,
+    "urlsFetched": 0, "urlsFailed": 0,
+    "limits": {
+      "hostsOmitted": 0, "resolveSkipped": 0, "probeSkipped": 0,
+      "crawlSkipped": 0, "crawlLimited": 0, "urlsOmitted": 0
+    }
   },
-  "requests": 57,
-  "authorizationConfirmed": true,
   "errors": []
 }
 ```
 
-- `status`: `queued` | `running` | `completed` | `failed`
-- `requests`: outbound HTTP requests made so far
-- `steps[].status`: `pending` | `running` | `done` | `failed` | `skipped`
+- `status`: `queued` | `running` | `completed` | `failed` | `cancelled`
+- `queuePosition`: 1-based, only while `queued`.
+- `phase`: `queued` | `discovering_subdomains` | `resolving_hosts` |
+  `probing_hosts` | `crawling_hosts` | `finalizing` | `done`.
+- `progress`: the current phase measured in hosts (resolving, probing and
+  crawling only), e.g. "Probing 6,921 / 7,200".
+- `stopReason`: set when the scan ended early: `scan_timeout` (status
+  `completed`, results partial), `cancelled` or `server_shutdown` (status
+  `cancelled`).
+- `limits`: notices about budgets that shaped the result, each
+  `{ "code", "message" }`. Codes: `scan_timeout`, `request_budget_reached`,
+  `host_budget_reached`, `crawl_limit_reached`, `url_budget_reached`,
+  `global_resource_wait` (operations waited a noticeable time for shared
+  capacity: slower, but nothing was dropped), `discovery_round_limit` (hosts
+  found in the last crawl round were listed but not checked).
+- `resources`: requests used against the budget, and per pool how many of
+  this scan's operations had to wait and for how long on average.
+- `counts`: fixed-size aggregate counters. `*Pending` hosts are waiting for
+  that stage; `counts.limits` counts work cut short by a budget.
+- `steps[].status`: `pending` | `running` | `done` | `failed` | `skipped` |
+  `stopped` (interrupted by cancellation or the time limit)
+- `errors[].partial`: `true` when the step still produced results, e.g. one
+  certificate provider failed and the other answered.
 - `errors`: engine failures, e.g.
   `{ "stage": "subdomains", "engine": "subdomains", "message": "crt.sh: …; certspotter: …" }`.
   A `completed` scan can still have errors; its results are then partial.
@@ -251,10 +375,20 @@ Returns the scan status. Poll this every 1–2 seconds while a scan runs.
 
 `404` if the scan does not exist. Scans live in memory and are lost on restart.
 
+### `POST /api/scans/{id}/cancel`
+
+Cancels a queued or running scan and returns `202` with its status. A queued
+scan is `cancelled` immediately and never runs. A running scan stops within
+moments, releases its share of the server, and saves the results collected
+so far; its status becomes `cancelled` shortly after the response. `409` if
+the scan already finished, `404` if it does not exist.
+
 ### `GET /api/scans/{id}/results`
 
-Available once the scan is `completed` or `failed`. Returns `409` with
-`{"error": "...", "status": "running"}` before that.
+Available once the scan is `completed`, `failed` or `cancelled` (after it
+started running). Returns `409` with `{"error": "...", "status": "running"}`
+before that, and for scans cancelled while still queued. The result carries
+the same `stopReason` and `limits` as the status, plus `hostsOmitted`.
 
 The result has a hierarchy: `hosts[]`, each with its own `urls[]`.
 
@@ -320,7 +454,7 @@ Host fields:
 | `sources` | How the host was discovered: `target`, `certificate-transparency`, `html`, `redirect`, … |
 | `dns` | Absent if not checked. `resolved`, `addresses`, `cname`, `nonPublic` (all addresses private/reserved, never contacted), `error`, or `skipped` (limit reached) |
 | `http` | Absent if not probed. `reachable` means any HTTP response, including 4xx/5xx. `status` and `redirect` come from the root URL; `finalUrl`, `finalStatus` and `title` come from the end of an in-scope redirect chain. Also `error` or `skipped` |
-| `crawl` | `requests`, `limitReached`, `robots` (`respected`, `not found`, `unavailable` or `ignored`), `robotsDisallowed` (URLs not requested), or `skipped` with a reason |
+| `crawl` | `requests`, `limitReached`, or `skipped` with a reason |
 | `urlsOmitted` | URLs seen on the host beyond the per-host recording limit |
 
 URL fields:
@@ -337,7 +471,6 @@ URL fields:
 | `status`, `contentType`, `title`, `redirect`, `server` | Response metadata when fetched |
 | `discoveredFrom` | Up to 5 pages that referenced the URL |
 | `error` | Why a request for this URL failed |
-| `robotsDisallowed` | Not requested because the host's robots.txt disallows it |
 
 ## Notes on data sources
 

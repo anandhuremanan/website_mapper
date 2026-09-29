@@ -14,6 +14,9 @@ import (
 type Result struct {
 	Hosts        []Host       `json:"hosts"`
 	Technologies []Technology `json:"technologies"`
+	// HostsOmitted counts hostnames discovered after the scan's host limit
+	// was reached; they were not recorded.
+	HostsOmitted int `json:"hostsOmitted,omitempty"`
 }
 
 // HostState summarizes how far a host got through the pipeline.
@@ -75,9 +78,6 @@ type URL struct {
 	// Fetched is true when the scanner requested this URL itself.
 	Fetched bool   `json:"fetched"`
 	Error   string `json:"error,omitempty"`
-	// RobotsDisallowed is true when the URL was not requested because the
-	// host's robots.txt disallows it.
-	RobotsDisallowed bool `json:"robotsDisallowed,omitempty"`
 }
 
 // Technology is a technology detected from observable evidence.
@@ -86,15 +86,48 @@ type Technology struct {
 	Evidence []string `json:"evidence"`
 }
 
-// Counts summarizes a result for progress display.
+// Counts summarizes a scan's progress and result. It is a fixed set of
+// aggregate counters, so it stays small however large the scan grows.
 type Counts struct {
 	Hosts          int `json:"hosts"`
 	HostsResolved  int `json:"hostsResolved"`
 	HostsReachable int `json:"hostsReachable"`
 	HostsCrawled   int `json:"hostsCrawled"`
-	URLs           int `json:"urls"`
-	Pages          int `json:"pages"`
-	APIs           int `json:"apis"`
-	Assets         int `json:"assets"`
-	JavaScript     int `json:"javascript"`
+
+	// Pipeline progress. "Pending" hosts are waiting for that stage.
+	HostsUnresolved     int `json:"hostsUnresolved"`
+	HostsResolvePending int `json:"hostsResolvePending"`
+	HostsProbed         int `json:"hostsProbed"`
+	HostsUnreachable    int `json:"hostsUnreachable"`
+	HostsProbePending   int `json:"hostsProbePending"`
+	HostsCrawlPending   int `json:"hostsCrawlPending"`
+
+	URLs       int `json:"urls"`
+	Pages      int `json:"pages"`
+	APIs       int `json:"apis"`
+	Assets     int `json:"assets"`
+	JavaScript int `json:"javascript"`
+	// URLsFetched and URLsFailed count URLs the scanner requested itself.
+	URLsFetched int `json:"urlsFetched"`
+	URLsFailed  int `json:"urlsFailed"`
+
+	Limits LimitCounts `json:"limits"`
+}
+
+// LimitCounts counts work cut short by a per-scan budget. All zero means
+// no budget affected the scan.
+type LimitCounts struct {
+	// HostsOmitted: hostnames not recorded (discovered-host limit).
+	HostsOmitted int `json:"hostsOmitted"`
+	// ResolveSkipped: hosts not resolved (resolve host limit).
+	ResolveSkipped int `json:"resolveSkipped"`
+	// ProbeSkipped: hosts not probed (probe host limit or request limit).
+	ProbeSkipped int `json:"probeSkipped"`
+	// CrawlSkipped: reachable hosts not crawled (crawl host limit or
+	// request limit).
+	CrawlSkipped int `json:"crawlSkipped"`
+	// CrawlLimited: hosts whose crawl stopped at the per-host request limit.
+	CrawlLimited int `json:"crawlLimited"`
+	// URLsOmitted: URLs seen but not recorded (recorded-URL limits).
+	URLsOmitted int `json:"urlsOmitted"`
 }

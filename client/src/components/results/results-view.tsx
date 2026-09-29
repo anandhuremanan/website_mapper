@@ -67,6 +67,24 @@ export function ResultsView({ scan, result }: { scan: Scan; result: ScanResult }
         </p>
       )}
 
+      {(scan.status === "cancelled" || result.limits.length > 0) && (
+        <div className="space-y-1 rounded-md border border-border bg-surface px-3 py-2 text-sm">
+          {scan.status === "cancelled" && (
+            <p className="font-medium">
+              {scan.stopReason === "server_shutdown"
+                ? "The scan was stopped because the server shut down."
+                : "The scan was cancelled."}{" "}
+              Results collected before it stopped are shown below.
+            </p>
+          )}
+          {result.limits.map((l, i) => (
+            <p key={i} className="text-muted">
+              {l.message}
+            </p>
+          ))}
+        </div>
+      )}
+
       <nav className="-mx-4 overflow-x-auto px-4" aria-label="Result sections">
         <div className="flex gap-1 border-b border-border">
           {tabs.map((t) => (
@@ -172,11 +190,12 @@ function Overview({ result, goTo, showHost }: OverviewProps) {
 
         {result.errors.length > 0 && (
           <div className="text-sm">
-            <h2 className="mb-2 font-medium">Steps that did not finish</h2>
+            <h2 className="mb-2 font-medium">Problems during the scan</h2>
             <ul className="space-y-1">
               {result.errors.map((e, i) => (
                 <li key={i}>
                   <span className="font-mono">{sourceLabel(e.engine)}</span>
+                  {e.partial && <span className="text-muted"> (partly succeeded)</span>}
                   <span className="text-muted"> — {e.message}</span>
                 </li>
               ))}

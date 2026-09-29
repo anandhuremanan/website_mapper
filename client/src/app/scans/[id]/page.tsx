@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { ResultsView } from "@/components/results/results-view";
 import { ScanProgress } from "@/components/scan-progress";
+import { isFinished } from "@/lib/types";
 import { useScan } from "@/lib/use-scan";
 
 export default function ScanPage() {
@@ -15,7 +16,8 @@ export default function ScanPage() {
       <div className="space-y-2">
         <h1 className="text-xl font-semibold">Scan not found</h1>
         <p className="text-sm text-muted">
-          Scans are kept in memory and disappear when the server restarts.{" "}
+          Scans are kept in memory: they disappear when the server restarts, and the oldest
+          finished scans are cleared to free memory.{" "}
           <Link href="/" className="text-accent underline-offset-2 hover:underline">
             Start a new scan
           </Link>
@@ -28,7 +30,7 @@ export default function ScanPage() {
     return <p className="text-sm text-muted">{error ?? "Loading…"}</p>;
   }
 
-  const finished = scan.status === "completed" || scan.status === "failed";
+  const finished = isFinished(scan.status);
 
   return (
     <div className="space-y-8">

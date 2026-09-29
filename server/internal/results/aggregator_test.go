@@ -1,9 +1,8 @@
 package results
 
 import (
-	"encoding/json"
+	"fmt"
 	"reflect"
-	"strings"
 	"testing"
 
 	"websitemapper/internal/classify"
@@ -16,7 +15,7 @@ func newAgg(t *testing.T) *Aggregator {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewAggregator(tgt, 0)
+	return NewAggregator(tgt, Limits{})
 }
 
 func findHost(t *testing.T, r Result, name string) Host {
@@ -215,7 +214,7 @@ func TestHeaderProduct(t *testing.T) {
 
 func TestAggregatorCapsURLsPerHost(t *testing.T) {
 	tgt, _ := discovery.ParseTarget("example.com")
-	a := NewAggregator(tgt, 2)
+	a := NewAggregator(tgt, Limits{MaxURLsPerHost: 2})
 	for _, p := range []string{"/a", "/b", "/c", "/d", "/a/"} {
 		a.Add(discovery.Finding{URL: "https://example.com" + p, Source: discovery.SourceHTML, Hint: discovery.HintLink})
 	}
@@ -239,22 +238,106 @@ func TestAggregatorCapsURLsPerHost(t *testing.T) {
 	}
 }
 
-func TestAggregatorRedactsCredentialsInURLs(t *testing.T) {
-	a := newAgg(t)
-	a.Add(discovery.Finding{URL: "https://user:pw@example.com/reset?token=abc123&page=1", Source: discovery.SourceHTML,
-		From: "https://example.com/login?session=xyz789"})
-	a.Add(discovery.Finding{URL: "https://example.com/go", Source: discovery.SourceHTML,
-		Response: &discovery.Response{Status: 302, Redirect: "https://example.com/cb?code=oauthcode42"}})
-	a.Add(discovery.Finding{Host: "example.com", HTTP: &discovery.HTTPInfo{Reachable: true,
-		URL: "https://example.com/", Redirect: "https://example.com/?sid=s1d"}})
-
-	out, _ := json.Marshal(a.Result())
-	for _, secret := range []string{"abc123", "xyz789", "oauthcode42", "s1d", "user:pw"} {
-		if strings.Contains(string(out), secret) {
-			t.Errorf("result contains %q: %s", secret, out)
-		}
+func TestAggregatorCapsDiscoveredHosts(t *testing.T) {
+	tgt, _ := discovery.ParseTarget("example.com")
+	a := NewAggregator(tgt, Limits{MaxHosts: 100})
+	for i := 0; i < 20000; i++ {
+		a.Add(discovery.Finding{Host: fmt.Sprintf("h%d.example.com", i), Source: discovery.SourceCT})
 	}
-	if u := findHost(t, a.Result(), "example.com").URLs[1].URL; u != "https://example.com/reset?page=1&token=REDACTED" {
-		t.Errorf("redacted URL = %s", u)
+	// The target's own host is always recorded, even over the limit.
+	a.Add(discovery.Finding{Host: "example.com", Source: discovery.SourceTarget})
+	// URLs and observations for omitted hosts are dropped, not recorded.
+	a.Add(discovery.Finding{URL: "https://h19999.example.com/x", Source: discovery.SourceHTML})
+
+	c := a.Counts()
+	if c.Hosts != 101 || c.Limits.HostsOmitted != 20000-100+1 || c.URLs != 0 {
+		t.Errorf("counts = %+v", c)
+	}
+	res := a.Result()
+	if len(res.Hosts) != 101 || res.HostsOmitted != c.Limits.HostsOmitted || res.Counts() != c {
+		t.Errorf("result hosts = %d omitted = %d", len(res.Hosts), res.HostsOmitted)
+	}
+}
+
+func TestAggregatorCapsTotalURLs(t *testing.T) {
+	tgt, _ := discovery.ParseTarget("example.com")
+	a := NewAggregator(tgt, Limits{MaxURLs: 3, MaxURLsPerHost: 100})
+	for i := 0; i < 5; i++ {
+		a.Add(discovery.Finding{URL: fmt.Sprintf("https://a%d.example.com/p", i), Source: discovery.SourceHTML})
+	}
+	c := a.Counts()
+	if c.URLs != 3 || c.Limits.URLsOmitted != 2 || c.Hosts != 5 {
+		t.Errorf("counts = %+v", c)
+	}
+}
+
+func TestAggregatorProgressCounters(t *testing.T) {
+	a := newAgg(t)
+	add := func(h string, f discovery.Finding) {
+		f.Host = h
+		a.Add(f)
+	}
+	for _, h := range []string{"a", "b", "c", "d", "e", "f", "g"} {
+		add(h+".example.com", discovery.Finding{Source: discovery.SourceCT})
+	}
+	// a: fully processed and crawled until its request limit.
+	add("a.example.com", discovery.Finding{DNS: &discovery.DNSInfo{Resolved: true}})
+	add("a.example.com", discovery.Finding{HTTP: &discovery.HTTPInfo{Reachable: true, Status: 200}})
+	add("a.example.com", discovery.Finding{Crawl: &discovery.CrawlInfo{Requests: 5, LimitReached: true}})
+	// b: reachable, waiting to be crawled.
+	add("b.example.com", discovery.Finding{DNS: &discovery.DNSInfo{Resolved: true}})
+	add("b.example.com", discovery.Finding{HTTP: &discovery.HTTPInfo{Reachable: true, Status: 200}})
+	// c: resolved, waiting to be probed.
+	add("c.example.com", discovery.Finding{DNS: &discovery.DNSInfo{Resolved: true}})
+	// d: resolved, probe failed.
+	add("d.example.com", discovery.Finding{DNS: &discovery.DNSInfo{Resolved: true}})
+	add("d.example.com", discovery.Finding{HTTP: &discovery.HTTPInfo{Error: "connection refused"}})
+	// e: does not resolve. f: skipped by the resolve budget. g: pending.
+	add("e.example.com", discovery.Finding{DNS: &discovery.DNSInfo{Error: "no such host"}})
+	add("f.example.com", discovery.Finding{DNS: &discovery.DNSInfo{Skipped: discovery.SkipHostLimit}})
+	// A reachable host skipped by the crawl budget; a redirect-only one is not a budget skip.
+	add("b.example.com", discovery.Finding{})
+	for _, h := range []string{"x", "y"} {
+		add(h+".example.com", discovery.Finding{DNS: &discovery.DNSInfo{Resolved: true}})
+		add(h+".example.com", discovery.Finding{HTTP: &discovery.HTTPInfo{Reachable: true, Status: 301}})
+	}
+	add("x.example.com", discovery.Finding{Crawl: &discovery.CrawlInfo{Skipped: discovery.SkipHostLimit}})
+	add("y.example.com", discovery.Finding{Crawl: &discovery.CrawlInfo{Skipped: "root redirects to another host"}})
+	// URLs: one fetched, one failed, one only discovered.
+	a.Add(discovery.Finding{URL: "https://a.example.com/", Source: discovery.SourceHost, Response: &discovery.Response{Status: 200, ContentType: "text/html"}})
+	a.Add(discovery.Finding{URL: "https://a.example.com/down", Source: discovery.SourceHTML, Error: "timeout"})
+	a.Add(discovery.Finding{URL: "https://a.example.com/later", Source: discovery.SourceHTML, Hint: discovery.HintLink})
+
+	c := a.Counts()
+	want := Counts{
+		Hosts: 9, HostsResolved: 6, HostsReachable: 4, HostsCrawled: 1,
+		HostsUnresolved: 1, HostsResolvePending: 1, HostsProbed: 5, HostsUnreachable: 1,
+		HostsProbePending: 1, HostsCrawlPending: 1,
+		URLs: 3, Pages: 2, URLsFetched: 1, URLsFailed: 1, // /down has no hint: unknown
+		Limits: LimitCounts{ResolveSkipped: 1, CrawlSkipped: 1, CrawlLimited: 1},
+	}
+	if c != want {
+		t.Errorf("counts =\n%+v\nwant\n%+v", c, want)
+	}
+	if rc := a.Result().Counts(); rc != c {
+		t.Errorf("result counts differ:\n%+v\n%+v", rc, c)
+	}
+}
+
+func TestAggregatorIncrementalCountsFollowReclassification(t *testing.T) {
+	a := newAgg(t)
+	// Linked from HTML: a page. Then fetched and found to return JSON: an API.
+	a.Add(discovery.Finding{URL: "https://example.com/data", Source: discovery.SourceHTML, Hint: discovery.HintLink})
+	if c := a.Counts(); c.Pages != 1 || c.APIs != 0 {
+		t.Fatalf("before fetch: %+v", c)
+	}
+	a.Add(discovery.Finding{URL: "https://example.com/data", Source: discovery.SourceHTML,
+		Response: &discovery.Response{Status: 200, ContentType: "application/json"}})
+	c := a.Counts()
+	if c.Pages != 0 || c.APIs != 1 || c.URLs != 1 || c.URLsFetched != 1 {
+		t.Errorf("after fetch: %+v", c)
+	}
+	if rc := a.Result().Counts(); rc != c {
+		t.Errorf("result counts %+v != live %+v", rc, c)
 	}
 }

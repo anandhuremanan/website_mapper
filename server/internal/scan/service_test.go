@@ -5,16 +5,12 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"reflect"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"websitemapper/internal/discovery"
-	"websitemapper/internal/fetch"
 	"websitemapper/internal/scan"
 	"websitemapper/internal/store"
 )
@@ -56,9 +52,9 @@ var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 func startService(t *testing.T, stages []scan.Stage, opts scan.Options) *scan.Service {
 	t.Helper()
-	repo := store.NewMemory(100)
-	if opts.Workers == 0 {
-		opts.Workers = 1
+	repo := store.NewMemory(store.Limits{MaxScans: 100})
+	if opts.MaxRunning == 0 {
+		opts.MaxRunning = 1
 	}
 	if opts.QueueSize == 0 {
 		opts.QueueSize = 10
@@ -79,7 +75,7 @@ func waitFinished(t *testing.T, svc *scan.Service, id string) scan.Scan {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if sc.Status == scan.StatusCompleted || sc.Status == scan.StatusFailed {
+		if sc.Status.Finished() {
 			return sc
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -120,11 +116,12 @@ func TestScanPipeline(t *testing.T) {
 		stage("crawl", crawl),
 	}, scan.Options{})
 
-	sc, err := svc.Create(context.Background(), confirmed("https://Example.com"))
+	sc, err := svc.Create(context.Background(), "https://Example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sc.Status != scan.StatusQueued || sc.ID == "" || sc.Domain != "example.com" {
+	// Capacity is free, so the scan starts immediately.
+	if sc.Status != scan.StatusRunning || sc.QueuePosition != 0 || sc.ID == "" || sc.Domain != "example.com" {
 		t.Fatalf("created scan = %+v", sc)
 	}
 	var ids []string
@@ -190,7 +187,7 @@ func TestScanPipeline(t *testing.T) {
 func TestScanSeedsEnteredHostAndApex(t *testing.T) {
 	e := &fakeEngine{name: "noop"}
 	svc := startService(t, []scan.Stage{stage("s", e)}, scan.Options{})
-	sc, _ := svc.Create(context.Background(), confirmed("https://www.example.com/docs"))
+	sc, _ := svc.Create(context.Background(), "https://www.example.com/docs")
 	waitFinished(t, svc, sc.ID)
 	if got := e.sawHosts[0]; !reflect.DeepEqual(got, []string{"example.com", "www.example.com"}) {
 		t.Errorf("seeded hosts = %v", got)
@@ -202,7 +199,7 @@ func TestScanFailsWhenEveryEngineFails(t *testing.T) {
 		stage("a", &fakeEngine{name: "a", err: errors.New("down")}),
 		stage("b", &fakeEngine{name: "b", err: errors.New("down")}),
 	}, scan.Options{})
-	sc, err := svc.Create(context.Background(), confirmed("example.com"))
+	sc, err := svc.Create(context.Background(), "example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,96 +219,83 @@ func TestScanTimeoutKeepsPartialResults(t *testing.T) {
 	}}
 	next := &fakeEngine{name: "js"}
 	svc := startService(t, []scan.Stage{stage("crawl", slow), stage("js", next)}, scan.Options{ScanTimeout: 50 * time.Millisecond})
-	sc, _ := svc.Create(context.Background(), confirmed("example.com"))
+	sc, _ := svc.Create(context.Background(), "example.com")
 	sc = waitFinished(t, svc, sc.ID)
-	if sc.Status != scan.StatusCompleted {
-		t.Errorf("status = %s (%s), want completed with partial results", sc.Status, sc.Error)
+	if sc.Status != scan.StatusCompleted || sc.StopReason != scan.StopTimeout {
+		t.Errorf("status = %s stop = %q (%s), want completed with scan_timeout", sc.Status, sc.StopReason, sc.Error)
 	}
-	if last := sc.Errors[len(sc.Errors)-1]; last.Engine != "scan" {
-		t.Errorf("errors = %+v, want time limit notice", sc.Errors)
+	// Being stopped by the deadline is not an engine failure.
+	if len(sc.Errors) != 0 {
+		t.Errorf("errors = %+v", sc.Errors)
 	}
-	if sc.Steps[2].Status != scan.StepSkipped {
-		t.Errorf("js step = %s, want skipped", sc.Steps[2].Status)
+	if !hasLimit(sc.Limits, scan.LimitScanTimeout) {
+		t.Errorf("limits = %+v, want scan_timeout notice", sc.Limits)
+	}
+	if sc.Steps[1].Status != scan.StepStopped || sc.Steps[2].Status != scan.StepSkipped {
+		t.Errorf("steps = %s / %s, want stopped / skipped", sc.Steps[1].Status, sc.Steps[2].Status)
 	}
 	res, err := svc.Result(context.Background(), sc.ID)
-	if err != nil || res.Counts.URLs != 1 {
+	if err != nil || res.Counts.URLs != 1 || res.StopReason != scan.StopTimeout {
 		t.Errorf("partial result = %+v, err %v", res.Counts, err)
 	}
 }
 
+func hasLimit(ls []scan.LimitNotice, code string) bool {
+	for _, l := range ls {
+		if l.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
 func TestCreateRejectsInvalidTarget(t *testing.T) {
 	svc := startService(t, nil, scan.Options{})
-	if _, err := svc.Create(context.Background(), confirmed("http://127.0.0.1")); !errors.Is(err, discovery.ErrInvalidTarget) {
+	if _, err := svc.Create(context.Background(), "http://127.0.0.1"); !errors.Is(err, discovery.ErrInvalidTarget) {
 		t.Errorf("err = %v", err)
 	}
 }
 
 func TestCreateQueueFull(t *testing.T) {
 	// No workers started, queue of 1.
-	svc := scan.NewService(store.NewMemory(10), nil, scan.Options{QueueSize: 1}, quiet)
-	if _, err := svc.Create(context.Background(), confirmed("example.com")); err != nil {
+	svc := scan.NewService(store.NewMemory(store.Limits{MaxScans: 10}), nil, scan.Options{QueueSize: 1}, quiet)
+	if _, err := svc.Create(context.Background(), "example.com"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.Create(context.Background(), confirmed("example.org")); !errors.Is(err, scan.ErrQueueFull) {
+	sc, err := svc.Create(context.Background(), "example.org")
+	if !errors.Is(err, scan.ErrQueueFull) {
 		t.Errorf("err = %v, want ErrQueueFull", err)
 	}
-}
-
-func confirmed(target string) scan.CreateRequest {
-	return scan.CreateRequest{Target: target, AuthorizationConfirmed: true}
-}
-
-func TestCreateRequiresAuthorizationConfirmation(t *testing.T) {
-	svc := startService(t, nil, scan.Options{})
-	_, err := svc.Create(context.Background(), scan.CreateRequest{Target: "example.com"})
-	if !errors.Is(err, scan.ErrAuthorizationRequired) {
-		t.Fatalf("err = %v, want ErrAuthorizationRequired", err)
-	}
-	sc, err := svc.Create(context.Background(), confirmed("example.com"))
-	if err != nil || !sc.AuthorizationConfirmed {
-		t.Fatalf("confirmed scan = %+v, %v", sc, err)
+	// A rejected scan leaves no record behind.
+	if sc.ID != "" {
+		t.Errorf("rejected scan returned %+v", sc)
 	}
 }
 
-// fetchingEngine makes n requests through the shared client using the
-// scan's context, so the scan's request budget applies.
-type fetchingEngine struct {
-	client *fetch.Client
-	url    string
-	n      int
-	errs   []error
-}
-
-func (e *fetchingEngine) Name() string { return "fetcher" }
-func (e *fetchingEngine) Discover(ctx context.Context, _ discovery.Input, _ discovery.Emit) error {
-	for i := 0; i < e.n; i++ {
-		_, err := e.client.Get(ctx, e.url)
-		e.errs = append(e.errs, err)
+func TestPartialEngineErrorIsRecordedNotFailed(t *testing.T) {
+	e := &fakeEngine{name: "subdomains", err: discovery.Partial(errors.New("certspotter: HTTP 429")),
+		findings: []discovery.Finding{{Host: "api.example.com", Source: discovery.SourceCT}}}
+	svc := startService(t, []scan.Stage{stage("subdomains", e)}, scan.Options{})
+	sc := waitFinished(t, svc, mustCreate(t, svc, "example.com").ID)
+	if sc.Status != scan.StatusCompleted || sc.Steps[1].Status != scan.StepDone {
+		t.Errorf("status = %s, step = %s", sc.Status, sc.Steps[1].Status)
 	}
-	return nil
-}
-
-func TestScanRequestLimit(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer srv.Close()
-	e := &fetchingEngine{client: fetch.New(fetch.Options{AllowPrivate: true}), url: srv.URL, n: 5}
-	svc := startService(t, []scan.Stage{stage("fetch", e)}, scan.Options{MaxRequests: 3})
-
-	sc, _ := svc.Create(context.Background(), confirmed("example.com"))
-	sc = waitFinished(t, svc, sc.ID)
-	if sc.Requests != 3 {
-		t.Errorf("requests = %d, want 3", sc.Requests)
-	}
-	blocked := 0
-	for _, err := range e.errs {
-		if errors.Is(err, fetch.ErrRequestLimit) {
-			blocked++
-		}
-	}
-	if blocked != 2 {
-		t.Errorf("blocked = %d, want 2 (errs %v)", blocked, e.errs)
-	}
-	if last := sc.Errors[len(sc.Errors)-1]; last.Engine != "scan" || !strings.Contains(last.Message, "request limit") {
+	if len(sc.Errors) != 1 || !sc.Errors[0].Partial || sc.Errors[0].Message != "certspotter: HTTP 429" {
 		t.Errorf("errors = %+v", sc.Errors)
+	}
+	if sc.Counts.Hosts != 2 {
+		t.Errorf("hosts from the working provider were not kept: %+v", sc.Counts)
+	}
+}
+
+func TestHostsFromLastRoundAreReported(t *testing.T) {
+	lastCrawl := &fakeEngine{name: "html", findings: []discovery.Finding{
+		{URL: "https://late.example.com/page", Source: discovery.SourceHTML, Hint: discovery.HintLink},
+	}}
+	dns := &fakeEngine{name: "dns", findings: []discovery.Finding{{Host: "example.com", DNS: &discovery.DNSInfo{Resolved: true}}}}
+	svc := startService(t, []scan.Stage{stage("resolve", dns), stage("follow-up", lastCrawl)}, scan.Options{})
+	sc := waitFinished(t, svc, mustCreate(t, svc, "example.com").ID)
+	if sc.Counts.HostsResolvePending != 1 || !hasLimit(sc.Limits, scan.LimitDiscoveryRounds) {
+		t.Errorf("pending = %d, limits = %+v", sc.Counts.HostsResolvePending, sc.Limits)
 	}
 }

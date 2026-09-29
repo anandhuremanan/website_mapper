@@ -122,7 +122,7 @@ func TestEngineMergesSourcesAndKeepsPartialResults(t *testing.T) {
 		fakeSource{name: "one", names: []string{"*.example.com", "api.example.com", "other.net"}},
 		fakeSource{name: "two", names: []string{"API.example.com.", "status.example.com"}},
 		fakeSource{name: "broken", err: errors.New("timeout")},
-	}, quiet)
+	}, 0, quiet)
 
 	var mu sync.Mutex
 	var got []string
@@ -134,9 +134,11 @@ func TestEngineMergesSourcesAndKeepsPartialResults(t *testing.T) {
 		}
 		got = append(got, f.Host)
 	})
-	// One provider failing is not an engine failure when others succeed.
-	if err != nil {
-		t.Errorf("err = %v", err)
+	// One provider failing is not an engine failure when others succeed,
+	// but the failure is still reported.
+	var partial *discovery.PartialError
+	if !errors.As(err, &partial) || !strings.Contains(err.Error(), "broken: timeout") {
+		t.Errorf("err = %v, want a partial error naming the failed source", err)
 	}
 	sort.Strings(got)
 	// api.example.com comes from both providers; the aggregator merges it.
@@ -149,7 +151,7 @@ func TestEngineFailsWhenEverySourceFails(t *testing.T) {
 	e := New([]Source{
 		fakeSource{name: "a", err: errors.New("HTTP 502")},
 		fakeSource{name: "b", err: errors.New("timeout")},
-	}, quiet)
+	}, 0, quiet)
 	err := e.Discover(context.Background(), discovery.Input{Target: target(t, "example.com")}, func(discovery.Finding) {})
 	if err == nil || !strings.Contains(err.Error(), "a: HTTP 502") || !strings.Contains(err.Error(), "b: timeout") {
 		t.Errorf("err = %v", err)
@@ -197,5 +199,40 @@ func TestCertSpotterRateLimited(t *testing.T) {
 	c.BaseURL = srv.URL
 	if _, err := c.Discover(context.Background(), "example.com"); err == nil || !strings.Contains(err.Error(), "429") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// hangingSource never answers until its context ends.
+type hangingSource struct{}
+
+func (hangingSource) Name() string                 { return "slow" }
+func (hangingSource) Provenance() discovery.Source { return discovery.SourceCT }
+func (hangingSource) Discover(ctx context.Context, _ string) ([]string, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestEngineDoesNotWaitForAHangingSource(t *testing.T) {
+	e := New([]Source{
+		hangingSource{},
+		fakeSource{name: "fast", names: []string{"api.example.com"}},
+	}, 100*time.Millisecond, quiet)
+	var got []string
+	var mu sync.Mutex
+	start := time.Now()
+	err := e.Discover(context.Background(), discovery.Input{Target: target(t, "example.com")}, func(f discovery.Finding) {
+		mu.Lock()
+		got = append(got, f.Host)
+		mu.Unlock()
+	})
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("engine waited %v for the hanging source", time.Since(start))
+	}
+	var partial *discovery.PartialError
+	if !errors.As(err, &partial) || !strings.Contains(err.Error(), "slow: no answer within 100ms") {
+		t.Errorf("err = %v", err)
+	}
+	if len(got) != 1 || got[0] != "api.example.com" {
+		t.Errorf("hosts = %v", got)
 	}
 }

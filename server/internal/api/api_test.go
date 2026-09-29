@@ -30,14 +30,14 @@ var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 func newServer(t *testing.T, workers bool) *httptest.Server {
 	t.Helper()
-	svc := scan.NewService(store.NewMemory(10), []scan.Stage{{ID: "crawl", Label: "Crawling", Engines: []discovery.Engine{oneFinding{}}}},
+	svc := scan.NewService(store.NewMemory(store.Limits{MaxScans: 10}), []scan.Stage{{ID: "crawl", Label: "Crawling", Engines: []discovery.Engine{oneFinding{}}}},
 		scan.Options{QueueSize: 5, ProgressInterval: 10 * time.Millisecond}, quiet)
 	if workers {
 		ctx, cancel := context.WithCancel(context.Background())
 		svc.Start(ctx)
 		t.Cleanup(func() { cancel(); svc.Wait() })
 	}
-	srv := httptest.NewServer(api.NewHandler(svc, api.BotInfo{Name: "WebsiteMapperBot", UserAgent: "WebsiteMapperBot/0.1 (+https://mapper.example/bot)", RespectsRobotsTxt: true}, quiet))
+	srv := httptest.NewServer(api.NewHandler(svc, quiet))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -61,13 +61,43 @@ func TestHealth(t *testing.T) {
 	if code != 200 || body["status"] != "ok" {
 		t.Errorf("health = %d %v", code, body)
 	}
+	sched, _ := body["scheduler"].(map[string]any)
+	if sched == nil || sched["maxRunning"] == nil || sched["queued"] == nil {
+		t.Errorf("health scheduler = %v", body["scheduler"])
+	}
+}
+
+func TestCancelScan(t *testing.T) {
+	// No workers: scans stay queued, so cancellation is deterministic.
+	srv := newServer(t, false)
+	_, body := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com"}`)
+	id := body["id"].(string)
+	if body["queuePosition"] != float64(1) {
+		t.Errorf("queuePosition = %v", body["queuePosition"])
+	}
+
+	code, body := do(t, "POST", srv.URL+"/api/scans/"+id+"/cancel", "")
+	if code != http.StatusAccepted || body["status"] != "cancelled" || body["stopReason"] != "cancelled" {
+		t.Fatalf("cancel = %d %v", code, body)
+	}
+	if code, body = do(t, "POST", srv.URL+"/api/scans/"+id+"/cancel", ""); code != http.StatusConflict || body["status"] != "cancelled" {
+		t.Errorf("second cancel = %d %v", code, body)
+	}
+	if code, _ = do(t, "POST", srv.URL+"/api/scans/missing/cancel", ""); code != http.StatusNotFound {
+		t.Errorf("cancel missing = %d", code)
+	}
+	// A scan cancelled before running has no results.
+	if code, body = do(t, "GET", srv.URL+"/api/scans/"+id+"/results", ""); code != http.StatusConflict || body["status"] != "cancelled" {
+		t.Errorf("results = %d %v", code, body)
+	}
 }
 
 func TestScanFlow(t *testing.T) {
 	srv := newServer(t, true)
 
-	code, body := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com","authorizationConfirmed":true}`)
-	if code != http.StatusAccepted || body["status"] != "queued" || body["id"] == "" {
+	code, body := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com"}`)
+	// Capacity is free, so the scan starts at once.
+	if code != http.StatusAccepted || body["status"] != "running" || body["id"] == "" {
 		t.Fatalf("create = %d %v", code, body)
 	}
 	id := body["id"].(string)
@@ -104,7 +134,7 @@ func TestScanFlow(t *testing.T) {
 
 func TestResultsBeforeFinish(t *testing.T) {
 	srv := newServer(t, false) // no workers: the scan stays queued
-	_, body := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com","authorizationConfirmed":true}`)
+	_, body := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com"}`)
 	code, body := do(t, "GET", srv.URL+"/api/scans/"+body["id"].(string)+"/results", "")
 	if code != http.StatusConflict || body["status"] != "queued" {
 		t.Errorf("results = %d %v", code, body)
@@ -117,7 +147,7 @@ func TestErrors(t *testing.T) {
 		method, path, body string
 		want               int
 	}{
-		{"POST", "/api/scans", `{"target":"localhost","authorizationConfirmed":true}`, 400},
+		{"POST", "/api/scans", `{"target":"localhost"}`, 400},
 		{"POST", "/api/scans", `not json`, 400},
 		{"POST", "/api/scans", `{"target":"example.com","extra":1}`, 400},
 		{"GET", "/api/scans/missing", "", 404},
@@ -133,35 +163,5 @@ func TestErrors(t *testing.T) {
 		if body["error"] == "" {
 			t.Errorf("%s %s: missing error message", tt.method, tt.path)
 		}
-	}
-}
-
-func TestCreateRequiresAuthorizationConfirmation(t *testing.T) {
-	srv := newServer(t, false)
-	for _, body := range []string{
-		`{"target":"example.com"}`,
-		`{"target":"example.com","authorizationConfirmed":false}`,
-	} {
-		code, resp := do(t, "POST", srv.URL+"/api/scans", body)
-		if code != http.StatusBadRequest || !strings.Contains(resp["error"].(string), "authorization not confirmed") {
-			t.Errorf("%s: %d %v", body, code, resp)
-		}
-	}
-	// A non-boolean value is rejected too.
-	if code, _ := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com","authorizationConfirmed":"yes"}`); code != http.StatusBadRequest {
-		t.Errorf("string confirmation accepted: %d", code)
-	}
-
-	code, resp := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com","authorizationConfirmed":true}`)
-	if code != http.StatusAccepted || resp["authorizationConfirmed"] != true {
-		t.Errorf("confirmed: %d %v", code, resp)
-	}
-}
-
-func TestBotInfo(t *testing.T) {
-	srv := newServer(t, false)
-	code, body := do(t, "GET", srv.URL+"/api/bot", "")
-	if code != 200 || body["userAgent"] != "WebsiteMapperBot/0.1 (+https://mapper.example/bot)" || body["respectsRobotsTxt"] != true {
-		t.Errorf("bot = %d %v", code, body)
 	}
 }

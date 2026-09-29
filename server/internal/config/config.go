@@ -15,31 +15,25 @@ type Config struct {
 	Port     string
 	LogLevel slog.Level
 
-	// MaxConcurrentScans bounds how many scans run at the same time.
+	// MaxConcurrentScans bounds how many scans run at the same time; the
+	// rest wait in a FIFO queue.
 	MaxConcurrentScans int
-	// QueueSize bounds how many scans may wait for a free worker.
+	// QueueSize bounds how many scans may wait to run.
 	QueueSize int
-	// MaxStoredScans bounds how many scans the in-memory store keeps.
+	// MaxStoredScans bounds how many finished scans (and their results) the
+	// in-memory store keeps. Queued and running scans are never evicted.
 	MaxStoredScans int
+	// MaxStoredResultURLs bounds the URLs held by stored results in total,
+	// the main driver of retained memory (about 0.6 KB per URL).
+	MaxStoredResultURLs int
 
-	Bot BotConfig
+	// GlobalHTTPConcurrency bounds HTTP requests in flight across all scans.
+	GlobalHTTPConcurrency int
+	// GlobalDNSConcurrency bounds DNS lookups in flight across all scans.
+	GlobalDNSConcurrency int
 
 	Scan ScanConfig
 }
-
-// BotConfig identifies the crawler to the sites it visits.
-type BotConfig struct {
-	// InfoURL is the public page describing the crawler (the client's /bot
-	// page). It is included in the default User-Agent.
-	InfoURL string
-	// InfoURLSet is false when InfoURL is the development default.
-	InfoURLSet bool
-	// Contact is how site owners can reach the operator (email or URL).
-	Contact string
-}
-
-// DefaultBotInfoURL is used when BOT_INFO_URL is not set.
-const DefaultBotInfoURL = "http://localhost:3000/bot"
 
 // ScanConfig controls how a single scan behaves.
 type ScanConfig struct {
@@ -47,6 +41,12 @@ type ScanConfig struct {
 	RequestTimeout time.Duration
 	// Timeout is the overall time budget for one scan.
 	Timeout time.Duration
+	// MaxRequests bounds one scan's outbound HTTP requests.
+	MaxRequests int
+	// MaxDiscoveredHosts bounds the hostnames one scan records.
+	MaxDiscoveredHosts int
+	// MaxRecordedURLs bounds the URLs one scan records.
+	MaxRecordedURLs int
 	// MaxDepth is how many links deep the crawler follows from a host's start page.
 	MaxDepth int
 	// MaxURLs is the maximum number of requests the crawler makes to one host.
@@ -61,7 +61,9 @@ type ScanConfig struct {
 	MaxProbeHosts int
 	// MaxResolveHosts is the maximum number of hosts resolved per scan.
 	MaxResolveHosts int
-	// HostConcurrency is the number of hosts probed or crawled in parallel.
+	// HostConcurrency is how many hosts one scan probes or crawls in parallel.
+	// Crawls are rate-limited per host, so this sets one scan's crawl ceiling
+	// (hosts x per-host rate); the global HTTP pool decides what actually runs.
 	HostConcurrency int
 	// DNSTimeout bounds resolving one host.
 	DNSTimeout time.Duration
@@ -75,13 +77,6 @@ type ScanConfig struct {
 	MaxBodyBytes int64
 	// UserAgent is sent with every outbound request.
 	UserAgent string
-	// RespectRobots applies robots.txt rules while crawling.
-	RespectRobots bool
-	// MaxRequests bounds one scan's outbound HTTP requests across all hosts.
-	MaxRequests int
-	// ScanRequestsPerSecond bounds one scan's overall request rate across
-	// all hosts. RequestsPerSecond still limits each host.
-	ScanRequestsPerSecond float64
 	// AllowPrivateNetworks permits requests to loopback/private addresses.
 	// Only intended for local development and tests.
 	AllowPrivateNetworks bool
@@ -95,38 +90,35 @@ func Load() (Config, error) {
 // LoadFrom reads configuration using the given lookup function.
 func LoadFrom(getenv func(string) string) (Config, error) {
 	p := parser{getenv: getenv}
-	infoURL := p.str("BOT_INFO_URL", DefaultBotInfoURL)
 	cfg := Config{
-		Bot: BotConfig{
-			InfoURL:    infoURL,
-			InfoURLSet: strings.TrimSpace(getenv("BOT_INFO_URL")) != "",
-			Contact:    p.str("BOT_CONTACT", ""),
-		},
-		Port:               p.str("SERVER_PORT", "8080"),
-		LogLevel:           p.level("LOG_LEVEL", slog.LevelInfo),
-		MaxConcurrentScans: p.int("MAX_CONCURRENT_SCANS", 4, 1),
-		QueueSize:          p.int("SCAN_QUEUE_SIZE", 100, 1),
-		MaxStoredScans:     p.int("MAX_STORED_SCANS", 500, 1),
+		Port:                  p.str("SERVER_PORT", "8080"),
+		LogLevel:              p.level("LOG_LEVEL", slog.LevelInfo),
+		MaxConcurrentScans:    p.int("MAX_CONCURRENT_SCANS", 3, 1),
+		QueueSize:             p.int("SCAN_QUEUE_SIZE", 100, 1),
+		MaxStoredScans:        p.int("MAX_STORED_SCANS", 100, 1),
+		MaxStoredResultURLs:   p.int("MAX_STORED_RESULT_URLS", 500000, 1),
+		GlobalHTTPConcurrency: p.int("GLOBAL_HTTP_CONCURRENCY", 32, 1),
+		GlobalDNSConcurrency:  p.int("GLOBAL_DNS_CONCURRENCY", 16, 1),
 		Scan: ScanConfig{
 			RequestTimeout:         p.duration("SCAN_REQUEST_TIMEOUT", 10*time.Second),
-			Timeout:                p.duration("SCAN_TIMEOUT", 5*time.Minute),
-			MaxDepth:               p.int("SCAN_MAX_DEPTH", 2, 0),
-			MaxURLs:                p.int("SCAN_MAX_URLS", 100, 1),
+			Timeout:                p.duration("SCAN_TIMEOUT", 30*time.Minute),
+			MaxRequests:            p.int("SCAN_MAX_REQUESTS", 50000, 1),
+			MaxDiscoveredHosts:     p.int("SCAN_MAX_DISCOVERED_HOSTS", 10000, 1),
+			MaxRecordedURLs:        p.int("SCAN_MAX_RECORDED_URLS", 50000, 1),
+			MaxDepth:               p.int("SCAN_MAX_DEPTH", 3, 0),
+			MaxURLs:                p.int("SCAN_MAX_URLS", 500, 1),
 			Concurrency:            p.int("SCAN_CONCURRENCY", 4, 1),
-			MaxHosts:               p.int("SCAN_MAX_HOSTS", 20, 1),
-			MaxRecordedURLsPerHost: p.int("SCAN_MAX_RECORDED_URLS_PER_HOST", 1000, 1),
-			MaxProbeHosts:          p.int("SCAN_MAX_PROBE_HOSTS", 100, 1),
-			MaxResolveHosts:        p.int("SCAN_MAX_RESOLVE_HOSTS", 500, 1),
-			HostConcurrency:        p.int("SCAN_HOST_CONCURRENCY", 4, 1),
+			MaxHosts:               p.int("SCAN_MAX_HOSTS", 500, 1),
+			MaxRecordedURLsPerHost: p.int("SCAN_MAX_RECORDED_URLS_PER_HOST", 2000, 1),
+			MaxProbeHosts:          p.int("SCAN_MAX_PROBE_HOSTS", 2000, 1),
+			MaxResolveHosts:        p.int("SCAN_MAX_RESOLVE_HOSTS", 10000, 1),
+			HostConcurrency:        p.int("SCAN_HOST_CONCURRENCY", 8, 1),
 			DNSTimeout:             p.duration("SCAN_DNS_TIMEOUT", 5*time.Second),
 			CTEnabled:              p.bool("SCAN_CT_ENABLED", true),
 			CTTimeout:              p.duration("SCAN_CT_TIMEOUT", 60*time.Second),
 			RequestsPerSecond:      p.float("SCAN_REQUESTS_PER_SECOND", 5),
 			MaxBodyBytes:           int64(p.int("SCAN_MAX_BODY_BYTES", 2<<20, 1024)),
-			UserAgent:              p.str("SCAN_USER_AGENT", "WebsiteMapperBot/0.1 (+"+infoURL+")"),
-			RespectRobots:          p.bool("SCAN_RESPECT_ROBOTS", true),
-			MaxRequests:            p.int("SCAN_MAX_REQUESTS", 3000, 1),
-			ScanRequestsPerSecond:  p.float("SCAN_MAX_REQUESTS_PER_SECOND", 20),
+			UserAgent:              p.str("SCAN_USER_AGENT", "WebsiteMapper/0.1 (+passive public discovery)"),
 			AllowPrivateNetworks:   p.bool("SCAN_ALLOW_PRIVATE_NETWORKS", false),
 		},
 	}
@@ -211,15 +203,4 @@ func (p *parser) level(key string, def slog.Level) slog.Level {
 		return def
 	}
 	return l
-}
-
-// RobotsAgent returns the product token robots.txt rules are matched
-// against: the User-Agent up to the first "/" or space, e.g.
-// "WebsiteMapperBot".
-func (c ScanConfig) RobotsAgent() string {
-	ua := strings.TrimSpace(c.UserAgent)
-	if i := strings.IndexAny(ua, "/ "); i > 0 {
-		ua = ua[:i]
-	}
-	return ua
 }

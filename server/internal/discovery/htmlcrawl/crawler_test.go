@@ -7,12 +7,17 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"websitemapper/internal/discovery"
 	"websitemapper/internal/fetch"
+	"websitemapper/internal/resource"
 )
 
 // fakeSite serves canned responses keyed by exact URL, across any number of hosts.
@@ -434,5 +439,122 @@ func TestCrawlRecordsRedirectOnlyHostsWithoutCrawling(t *testing.T) {
 	}
 	if info := col.crawlInfo("gone.example.com"); info == nil || info.Skipped != "host limit reached" {
 		t.Errorf("gone = %+v", info)
+	}
+}
+
+// linkFarm serves an HTML page linking n pages under every path, so the
+// crawl frontier explodes unless it is bounded.
+type linkFarm struct {
+	n         int
+	requests  atomic.Int64
+	peakGorou atomic.Int64
+	delay     time.Duration
+	started   chan struct{}
+	once      sync.Once
+}
+
+func (f *linkFarm) Get(ctx context.Context, u string) (*fetch.Response, error) {
+	if err := resource.FromContext(ctx).TakeRequest(); err != nil {
+		return nil, err
+	}
+	f.requests.Add(1)
+	if f.started != nil {
+		f.once.Do(func() { close(f.started) })
+	}
+	if g := int64(runtime.NumGoroutine()); g > f.peakGorou.Load() {
+		f.peakGorou.Store(g)
+	}
+	if f.delay > 0 {
+		select {
+		case <-time.After(f.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	var b strings.Builder
+	for i := 0; i < f.n; i++ {
+		fmt.Fprintf(&b, `<a href="/p%d">p</a>`, i)
+	}
+	return htmlPage(b.String()), nil
+}
+
+func TestCrawlFrontierIsBoundedByBudget(t *testing.T) {
+	farm := &linkFarm{n: 5000}
+	col := &collector{}
+	base := runtime.NumGoroutine()
+	c := New(farm, Options{MaxHosts: 1, MaxDepth: 3, MaxPagesPerHost: 10, Concurrency: 4}, quiet)
+	if err := c.Discover(context.Background(), input(t, "example.com", reachable("example.com")), col.emit); err != nil {
+		t.Fatal(err)
+	}
+	if got := farm.requests.Load(); got != 10 {
+		t.Errorf("requests = %d, want the per-host budget of 10", got)
+	}
+	// Workers are bounded by Concurrency, not by the 5000 links per page.
+	if extra := farm.peakGorou.Load() - int64(base); extra > 20 {
+		t.Errorf("goroutines grew by %d during the crawl", extra)
+	}
+	if info := col.crawlInfo("example.com"); info == nil || !info.LimitReached || info.Requests != 10 {
+		t.Errorf("crawl info = %+v", info)
+	}
+	// Every link is still reported as discovered.
+	if len(col.byURL("https://example.com/p4999")) == 0 {
+		t.Error("links beyond the budget were not reported")
+	}
+}
+
+func TestCrawlStopsAtScanRequestBudget(t *testing.T) {
+	farm := &linkFarm{n: 50}
+	col := &collector{}
+	acct := resource.NewAccount("scan", 7)
+	ctx := resource.WithAccount(context.Background(), acct)
+	c := New(farm, Options{MaxHosts: 5, MaxDepth: 3, MaxPagesPerHost: 100, Concurrency: 2}, quiet)
+	err := c.Discover(ctx, input(t, "example.com", reachable("example.com"), reachable("a.example.com"), reachable("b.example.com")), col.emit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := farm.requests.Load(); got != 7 {
+		t.Errorf("requests = %d, want the scan budget of 7", got)
+	}
+	// Refused requests are not recorded as failed URLs.
+	for _, f := range col.findings {
+		if f.Error != "" {
+			t.Errorf("budget refusal recorded as failure: %+v", f)
+		}
+	}
+	skipped := 0
+	for _, h := range []string{"a.example.com", "b.example.com"} {
+		if info := col.crawlInfo(h); info != nil && info.Skipped == discovery.SkipRequestLimit {
+			skipped++
+		}
+	}
+	if info := col.crawlInfo("example.com"); info == nil || !info.LimitReached {
+		t.Errorf("example.com crawl = %+v", info)
+	}
+	if skipped == 0 {
+		t.Error("hosts after the budget ran out should be skipped with the request-limit reason")
+	}
+}
+
+func TestCrawlStopsPromptlyOnCancel(t *testing.T) {
+	farm := &linkFarm{n: 200, delay: 20 * time.Millisecond, started: make(chan struct{})}
+	col := &collector{}
+	ctx, cancel := context.WithCancel(context.Background())
+	c := New(farm, Options{MaxHosts: 3, MaxDepth: 5, MaxPagesPerHost: 10000, Concurrency: 4, HostConcurrency: 3}, quiet)
+	done := make(chan error)
+	go func() {
+		done <- c.Discover(ctx, input(t, "example.com", reachable("example.com"), reachable("a.example.com")), col.emit)
+	}()
+	<-farm.started
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("crawl did not stop after cancel")
+	}
+	after := farm.requests.Load()
+	time.Sleep(100 * time.Millisecond)
+	if farm.requests.Load() != after {
+		t.Error("requests continued after Discover returned")
 	}
 }

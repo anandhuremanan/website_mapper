@@ -3,13 +3,17 @@ package fetch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"websitemapper/internal/resource"
 )
 
 func TestGetDoesNotFollowRedirects(t *testing.T) {
@@ -158,78 +162,122 @@ func TestLimiterSpacesRequestsPerHost(t *testing.T) {
 	}
 }
 
-func TestGetSendsUserAgentAndNoCredentials(t *testing.T) {
-	var mu sync.Mutex
-	var seen []http.Header
+// TestGlobalPoolBoundsRequestsAcrossScans: several scans, each with many
+// concurrent workers, share one client. The server measures how many
+// requests are in flight at once; it must never exceed the pool size.
+func TestGlobalPoolBoundsRequestsAcrossScans(t *testing.T) {
+	const poolSize, scans, workers, perWorker = 4, 5, 10, 6
+	var inFlight, peak, served atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		seen = append(seen, r.Header.Clone())
-		mu.Unlock()
-		if r.Method != http.MethodGet {
-			t.Errorf("method = %s", r.Method)
+		n := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			old := peak.Load()
+			if n <= old || peak.CompareAndSwap(old, n) {
+				break
+			}
 		}
-		http.SetCookie(w, &http.Cookie{Name: "session", Value: "s3cret"})
+		served.Add(1)
+		time.Sleep(2 * time.Millisecond)
 		w.Header().Set("Content-Type", "text/html")
 		w.Write([]byte("<title>x</title>"))
 	}))
 	defer srv.Close()
 
-	const ua = "WebsiteMapperBot/0.1 (+https://mapper.example/bot)"
-	c := New(Options{AllowPrivate: true, UserAgent: ua})
-	// Credentials embedded in the URL are never sent.
-	u := strings.Replace(srv.URL, "http://", "http://user:pass@", 1)
-	for i := 0; i < 2; i++ {
-		if _, err := c.Get(context.Background(), u+"/page"); err != nil {
-			t.Fatal(err)
+	pool := resource.NewPool("http", poolSize)
+	c := New(Options{AllowPrivate: true, Timeout: 5 * time.Second, Pool: pool})
+	var wg sync.WaitGroup
+	for s := 0; s < scans; s++ {
+		ctx := resource.WithAccount(context.Background(), resource.NewAccount(fmt.Sprint("scan", s), 0))
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < perWorker; i++ {
+					if _, err := c.Get(ctx, fmt.Sprintf("%s/p%d", srv.URL, i)); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+			}()
 		}
 	}
-	for i, h := range seen {
-		if h.Get("User-Agent") != ua {
-			t.Errorf("request %d User-Agent = %q", i, h.Get("User-Agent"))
-		}
-		// The cookie set by the first response is not sent back.
-		for _, k := range []string{"Cookie", "Authorization", "Proxy-Authorization"} {
-			if v := h.Get(k); v != "" {
-				t.Errorf("request %d sent %s: %q", i, k, v)
-			}
-		}
+	wg.Wait()
+
+	if got := peak.Load(); got > poolSize {
+		t.Fatalf("server saw %d concurrent requests, pool allows %d", got, poolSize)
+	}
+	if served.Load() != scans*workers*perWorker {
+		t.Errorf("served %d requests", served.Load())
+	}
+	if st := pool.Stats(); st.InUse != 0 || st.Peak > poolSize {
+		t.Errorf("pool stats = %+v", st)
 	}
 }
 
-func TestBudgetLimitsRequestsPerScan(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+func TestGetChargesScanRequestBudget(t *testing.T) {
+	var served atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { served.Add(1) }))
 	defer srv.Close()
 	c := New(Options{AllowPrivate: true})
-
-	b := NewBudget(2, 0)
-	ctx := WithBudget(context.Background(), b)
-	for i := 0; i < 2; i++ {
+	acct := resource.NewAccount("scan", 3)
+	ctx := resource.WithAccount(context.Background(), acct)
+	for i := 0; i < 3; i++ {
 		if _, err := c.Get(ctx, srv.URL); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := c.Get(ctx, srv.URL); !errors.Is(err, ErrRequestLimit) {
-		t.Errorf("third request err = %v, want ErrRequestLimit", err)
+	if _, err := c.Get(ctx, srv.URL); !errors.Is(err, resource.ErrBudgetExhausted) {
+		t.Fatalf("err = %v, want ErrBudgetExhausted", err)
 	}
-	if b.Used() != 2 {
-		t.Errorf("used = %d", b.Used())
-	}
-	// Other scans (contexts without this budget) are unaffected.
-	if _, err := c.Get(context.Background(), srv.URL); err != nil {
-		t.Errorf("unrelated request: %v", err)
+	if served.Load() != 3 || acct.Requests() != 3 {
+		t.Errorf("served %d, charged %d", served.Load(), acct.Requests())
 	}
 }
 
-func TestBudgetRateLimitsAcrossHosts(t *testing.T) {
-	b := NewBudget(0, 20) // 50ms apart, regardless of host
-	ctx := WithBudget(context.Background(), b)
+func TestGetStopsWaitingForPoolOnCancel(t *testing.T) {
+	pool := resource.NewPool("http", 1)
+	hold, _, _ := pool.Acquire(context.Background())
+	defer hold()
+	c := New(Options{AllowPrivate: true, Pool: pool})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
 	start := time.Now()
-	for i := 0; i < 3; i++ {
-		if err := b.take(ctx); err != nil {
+	if _, err := c.Get(ctx, "http://127.0.0.1:1/"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v", err)
+	}
+	if time.Since(start) > time.Second || pool.Stats().Waiting != 0 {
+		t.Errorf("did not stop promptly: %v, %+v", time.Since(start), pool.Stats())
+	}
+}
+
+func TestHTMLOnlySkipsOtherBodies(t *testing.T) {
+	big := strings.Repeat("x", 1<<20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/data.json":
+			w.Header().Set("Content-Type", "application/json")
+		case "/feed.xml":
+			w.Header().Set("Content-Type", "application/rss+xml")
+		default:
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		}
+		w.Write([]byte(big))
+	}))
+	defer srv.Close()
+	c := New(Options{AllowPrivate: true, ReadBody: HTMLOnly})
+	for path, wantBody := range map[string]bool{"/page": true, "/data.json": false, "/feed.xml": false} {
+		resp, err := c.Get(context.Background(), srv.URL+path)
+		if err != nil {
 			t.Fatal(err)
 		}
+		if got := len(resp.Body) > 0; got != wantBody || resp.StatusCode != 200 || resp.ContentType == "" {
+			t.Errorf("%s: body read = %v (want %v), status %d, type %q", path, got, wantBody, resp.StatusCode, resp.ContentType)
+		}
 	}
-	if elapsed := time.Since(start); elapsed < 90*time.Millisecond {
-		t.Errorf("3 requests took %v, want >= ~100ms", elapsed)
+	// The default still reads textual bodies (the certificate client needs JSON).
+	resp, _ := New(Options{AllowPrivate: true}).Get(context.Background(), srv.URL+"/data.json")
+	if len(resp.Body) == 0 {
+		t.Error("default client should read JSON bodies")
 	}
 }

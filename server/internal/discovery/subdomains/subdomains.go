@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"time"
 
 	"websitemapper/internal/discovery"
 	"websitemapper/internal/normalize"
@@ -29,19 +30,24 @@ type Source interface {
 // Engine runs all sources concurrently and reports in-scope hostnames.
 type Engine struct {
 	sources []Source
+	timeout time.Duration
 	log     *slog.Logger
 }
 
 // New creates an Engine.
-func New(sources []Source, log *slog.Logger) *Engine {
-	return &Engine{sources: sources, log: log}
+// Each source gets at most timeout in total, including its retries, so a
+// slow or hanging provider cannot hold up the scan (0: no per-source limit).
+func New(sources []Source, timeout time.Duration, log *slog.Logger) *Engine {
+	return &Engine{sources: sources, timeout: timeout, log: log}
 }
 
 func (e *Engine) Name() string { return "subdomains" }
 
 // Discover queries every source concurrently and reports the union of
-// their hosts. Providers are unreliable, so the engine fails only when every
-// source fails; individual failures are logged.
+// their hosts. Providers are unreliable and isolated from each other: hosts
+// from sources that succeed are always kept. If some sources fail, the
+// failures are returned as a discovery.PartialError (recorded, not a
+// failure); only when every source fails does the engine fail.
 func (e *Engine) Discover(ctx context.Context, in discovery.Input, emit discovery.Emit) error {
 	var (
 		mu   sync.Mutex
@@ -52,7 +58,16 @@ func (e *Engine) Discover(ctx context.Context, in discovery.Input, emit discover
 		wg.Add(1)
 		go func(src Source) {
 			defer wg.Done()
-			names, err := src.Discover(ctx, in.Target.Domain)
+			sctx := ctx
+			if e.timeout > 0 {
+				var cancel context.CancelFunc
+				sctx, cancel = context.WithTimeout(ctx, e.timeout)
+				defer cancel()
+			}
+			names, err := src.Discover(sctx, in.Target.Domain)
+			if err != nil && ctx.Err() == nil && sctx.Err() != nil {
+				err = fmt.Errorf("no answer within %s", e.timeout)
+			}
 			if err != nil {
 				e.log.Warn("passive source failed", "source", src.Name(), "error", err)
 				mu.Lock()
@@ -68,10 +83,15 @@ func (e *Engine) Discover(ctx context.Context, in discovery.Input, emit discover
 		}(src)
 	}
 	wg.Wait()
-	if len(errs) == len(e.sources) {
+	switch {
+	case ctx.Err() != nil:
+		return ctx.Err()
+	case len(errs) == 0:
+		return nil
+	case len(errs) == len(e.sources):
 		return errors.Join(errs...)
 	}
-	return nil
+	return discovery.Partial(errors.Join(errs...))
 }
 
 // Filter normalizes raw names (lowercase, no trailing dot, no "*." prefix),

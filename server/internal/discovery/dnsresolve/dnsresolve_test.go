@@ -2,12 +2,16 @@ package dnsresolve
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"websitemapper/internal/discovery"
+	"websitemapper/internal/resource"
 )
 
 type fakeResolver struct {
@@ -110,5 +114,103 @@ func TestResolveSkipsKnownAndRespectsLimit(t *testing.T) {
 	}
 	if d := got["b.example.com"]; d == nil || d.Skipped == "" {
 		t.Errorf("b over limit = %+v", d)
+	}
+}
+
+// slowResolver answers every name after a short delay and records the peak
+// number of lookups in flight.
+type slowResolver struct {
+	inFlight, peak, calls atomic.Int64
+	delay                 time.Duration
+}
+
+func (r *slowResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	n := r.inFlight.Add(1)
+	defer r.inFlight.Add(-1)
+	r.calls.Add(1)
+	for {
+		old := r.peak.Load()
+		if n <= old || r.peak.CompareAndSwap(old, n) {
+			break
+		}
+	}
+	select {
+	case <-time.After(r.delay):
+		return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (r *slowResolver) LookupCNAME(context.Context, string) (string, error) { return "", nil }
+
+func manyHosts(prefix string, n int) []discovery.HostView {
+	hosts := make([]discovery.HostView, n)
+	for i := range hosts {
+		hosts[i] = discovery.HostView{Name: fmt.Sprintf("%s%d.example.com", prefix, i)}
+	}
+	return hosts
+}
+
+// TestGlobalDNSLimitAcrossScans: three scans, each resolving thousands of
+// hosts with its own high concurrency, share a pool of 5 lookups.
+func TestGlobalDNSLimitAcrossScans(t *testing.T) {
+	const poolSize, scans, hostsPerScan = 5, 3, 3000
+	r := &slowResolver{delay: 50 * time.Microsecond}
+	pool := resource.NewPool("dns", poolSize)
+	e := New(r, Options{MaxHosts: hostsPerScan, Concurrency: 50, Pool: pool})
+	tgt, _ := discovery.ParseTarget("example.com")
+
+	var wg sync.WaitGroup
+	var resolved atomic.Int64
+	for s := 0; s < scans; s++ {
+		ctx := resource.WithAccount(context.Background(), resource.NewAccount(fmt.Sprint(s), 0))
+		in := discovery.Input{Target: tgt, State: state{manyHosts(fmt.Sprintf("s%d-", s), hostsPerScan)}}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := e.Discover(ctx, in, func(f discovery.Finding) {
+				if f.DNS != nil && f.DNS.Resolved {
+					resolved.Add(1)
+				}
+			}); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if p := r.peak.Load(); p > poolSize {
+		t.Fatalf("peak lookups in flight = %d, global limit %d", p, poolSize)
+	}
+	if resolved.Load() != scans*hostsPerScan {
+		t.Errorf("resolved %d hosts", resolved.Load())
+	}
+}
+
+func TestResolveStopsOnCancel(t *testing.T) {
+	r := &slowResolver{delay: time.Hour}
+	e := New(r, Options{MaxHosts: 1000, Concurrency: 4, Pool: resource.NewPool("dns", 2)})
+	tgt, _ := discovery.ParseTarget("example.com")
+	ctx, cancel := context.WithCancel(context.Background())
+	var emitted atomic.Int64
+	done := make(chan error)
+	go func() {
+		done <- e.Discover(ctx, discovery.Input{Target: tgt, State: state{manyHosts("h", 1000)}},
+			func(discovery.Finding) { emitted.Add(1) })
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("expected cancellation error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Discover did not stop after cancel")
+	}
+	// Interrupted lookups are not reported as DNS failures, and only a
+	// handful of lookups ever started.
+	if emitted.Load() != 0 || r.calls.Load() > 4 {
+		t.Errorf("emitted %d findings, %d lookups", emitted.Load(), r.calls.Load())
 	}
 }

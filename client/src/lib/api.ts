@@ -29,19 +29,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
-/**
- * Starts a scan. The server rejects the request unless
- * authorizationConfirmed is true.
- */
-export function createScan(target: string, authorizationConfirmed: boolean): Promise<Scan> {
+export function createScan(target: string): Promise<Scan> {
   return request<Scan>("/api/scans", {
     method: "POST",
-    body: JSON.stringify({ target, authorizationConfirmed }),
+    body: JSON.stringify({ target }),
   });
 }
 
 export function getScan(id: string): Promise<Scan> {
   return request<Scan>(`/api/scans/${encodeURIComponent(id)}`);
+}
+
+export function cancelScan(id: string): Promise<Scan> {
+  return request<Scan>(`/api/scans/${encodeURIComponent(id)}/cancel`, { method: "POST" });
 }
 
 export function getResults(id: string): Promise<ScanResult> {

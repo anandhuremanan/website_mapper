@@ -14,6 +14,7 @@ import (
 
 	"websitemapper/internal/discovery"
 	"websitemapper/internal/fetch"
+	"websitemapper/internal/resource"
 )
 
 // Resolver looks up addresses. *net.Resolver satisfies it.
@@ -26,10 +27,12 @@ type Resolver interface {
 type Options struct {
 	// MaxHosts is the maximum number of hosts resolved per scan.
 	MaxHosts int
-	// Concurrency is the number of lookups in flight.
+	// Concurrency is the number of this scan's lookups in flight.
 	Concurrency int
 	// Timeout bounds a single host's lookups.
 	Timeout time.Duration
+	// Pool bounds lookups in flight across all scans (nil: unbounded).
+	Pool *resource.Pool
 }
 
 // Engine resolves hosts that have not been resolved yet.
@@ -66,7 +69,7 @@ func (e *Engine) Discover(ctx context.Context, in discovery.Input, emit discover
 	budget := max(e.opts.MaxHosts-done, 0)
 	if len(todo) > budget {
 		for _, h := range todo[budget:] {
-			emit(discovery.Finding{Host: h, DNS: &discovery.DNSInfo{Skipped: "host limit reached"}})
+			emit(discovery.Finding{Host: h, DNS: &discovery.DNSInfo{Skipped: discovery.SkipHostLimit}})
 		}
 		todo = todo[:budget]
 	}
@@ -75,17 +78,31 @@ func (e *Engine) Discover(ctx context.Context, in discovery.Input, emit discover
 		if ctx.Err() != nil {
 			return
 		}
-		emit(discovery.Finding{Host: h, DNS: e.resolve(ctx, h)})
+		if info := e.resolve(ctx, h); info != nil {
+			emit(discovery.Finding{Host: h, DNS: info})
+		}
 	})
 	return ctx.Err()
 }
 
+// resolve returns nil if ctx ended first, leaving the host unresolved.
 func (e *Engine) resolve(ctx context.Context, host string) *discovery.DNSInfo {
+	// Waiting for a shared slot does not count against the lookup timeout.
+	release, _, err := e.opts.Pool.Acquire(ctx)
+	if err != nil {
+		return nil
+	}
+	defer release()
+
+	parent := ctx
 	ctx, cancel := context.WithTimeout(ctx, e.opts.Timeout)
 	defer cancel()
 
 	addrs, err := e.resolver.LookupIPAddr(ctx, host)
 	if err != nil {
+		if parent.Err() != nil {
+			return nil // the scan stopped; this is not a DNS answer
+		}
 		return &discovery.DNSInfo{Resolved: false, Error: describe(err)}
 	}
 	if len(addrs) == 0 {

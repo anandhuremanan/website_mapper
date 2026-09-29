@@ -1,4 +1,8 @@
-import type { Scan, StepStatus } from "@/lib/types";
+"use client";
+
+import { useState } from "react";
+import { cancelScan } from "@/lib/api";
+import type { Phase, Scan, StepStatus } from "@/lib/types";
 
 const stepIcon: Record<StepStatus, { icon: string; className: string }> = {
   pending: { icon: "○", className: "text-muted" },
@@ -6,30 +10,92 @@ const stepIcon: Record<StepStatus, { icon: string; className: string }> = {
   done: { icon: "✓", className: "text-ok" },
   failed: { icon: "✕", className: "text-warn" },
   skipped: { icon: "–", className: "text-muted" },
+  stopped: { icon: "■", className: "text-muted" },
 };
+
+const phaseLabel: Partial<Record<Phase, string>> = {
+  discovering_subdomains: "Discovering subdomains",
+  resolving_hosts: "Resolving hosts",
+  probing_hosts: "Probing hosts",
+  crawling_hosts: "Crawling hosts",
+  finalizing: "Finalizing results",
+};
+
+function heading(scan: Scan): string {
+  switch (scan.status) {
+    case "queued":
+      return scan.queuePosition
+        ? `Queued — position ${scan.queuePosition}. Other scans are using the server's capacity; this one starts automatically.`
+        : "Queued — starting…";
+    case "failed":
+      return "Scan failed";
+    case "cancelled":
+      return scan.stopReason === "server_shutdown" ? "Stopped: the server shut down" : "Cancelled";
+    default: {
+      const label = phaseLabel[scan.phase] ?? "Scanning";
+      const p = scan.progress;
+      return p && p.total > 0
+        ? `${label} ${p.completed.toLocaleString()} / ${p.total.toLocaleString()}`
+        : `${label}…`;
+    }
+  }
+}
 
 export function ScanProgress({ scan }: { scan: Scan }) {
   const { counts } = scan;
-  const heading =
-    scan.status === "queued"
-      ? "Waiting to start…"
-      : scan.status === "failed"
-        ? "Scan failed"
-        : "Scanning…";
+  const active = scan.status === "queued" || scan.status === "running";
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+
+  async function onCancel() {
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      await cancelScan(scan.id);
+    } catch (err) {
+      setCancelError(err instanceof Error ? err.message : String(err));
+      setCancelling(false);
+    }
+  }
 
   return (
     <div className="max-w-xl space-y-8">
       <div>
-        <h1 className="font-mono text-2xl font-semibold tracking-tight">{scan.domain}</h1>
-        <p className="mt-1 text-sm text-muted">{heading}</p>
+        <div className="flex items-baseline justify-between gap-4">
+          <h1 className="font-mono text-2xl font-semibold tracking-tight">{scan.domain}</h1>
+          {active && (
+            <button
+              type="button"
+              onClick={onCancel}
+              disabled={cancelling}
+              className="text-sm text-muted hover:text-danger disabled:opacity-50"
+            >
+              {cancelling ? "Cancelling…" : "Cancel scan"}
+            </button>
+          )}
+        </div>
+        <p className="mt-1 text-sm text-muted" aria-live="polite">
+          {heading(scan)}
+        </p>
+        {scan.progress && scan.progress.total > 0 && scan.status === "running" && (
+          <div className="mt-3 h-1 overflow-hidden rounded bg-subtle" aria-hidden>
+            <div
+              className="h-full bg-accent transition-[width]"
+              style={{ width: `${(100 * scan.progress.completed) / scan.progress.total}%` }}
+            />
+          </div>
+        )}
         {scan.error && <p className="mt-2 text-sm text-danger">{scan.error}</p>}
+        {cancelError && <p className="mt-2 text-sm text-danger">{cancelError}</p>}
       </div>
 
       <dl className="grid grid-cols-2 gap-x-8 gap-y-3 text-sm sm:grid-cols-3">
         <Count label="Hosts discovered" value={counts.hosts} />
         <Count label="Hosts resolved" value={counts.hostsResolved} />
         <Count label="Hosts reachable" value={counts.hostsReachable} />
+        <Count label="Hosts crawled" value={counts.hostsCrawled} />
         <Count label="URLs discovered" value={counts.urls} />
+        <Count label="URLs fetched" value={counts.urlsFetched} />
         <Count label="API-like endpoints" value={counts.apis} />
         <Count label="JavaScript files" value={counts.javascript} />
       </dl>
@@ -48,6 +114,14 @@ export function ScanProgress({ scan }: { scan: Scan }) {
           );
         })}
       </ol>
+
+      {scan.limits.length > 0 && (
+        <ul className="space-y-1 text-sm text-muted">
+          {scan.limits.map((l, i) => (
+            <li key={i}>{l.message}</li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

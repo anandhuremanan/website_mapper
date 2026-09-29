@@ -33,13 +33,6 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
           </div>
         </header>
         <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-10">{children}</main>
-        <footer className="border-t border-border">
-          <div className="mx-auto flex h-12 max-w-5xl items-center px-4 text-xs text-muted">
-            <Link href="/bot" className="hover:text-fg">
-              About the crawler
-            </Link>
-          </div>
-        </footer>
       </body>
     </html>
   );

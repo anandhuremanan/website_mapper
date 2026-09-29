@@ -24,57 +24,37 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Scan.AllowPrivateNetworks {
 		t.Error("AllowPrivateNetworks should default to false")
 	}
-	if !cfg.Scan.CTEnabled || cfg.Scan.MaxHosts != 20 || cfg.Scan.MaxURLs != 100 {
+	if !cfg.Scan.CTEnabled || cfg.Scan.MaxHosts != 500 || cfg.Scan.MaxURLs != 500 || cfg.Scan.MaxRequests != 50000 {
 		t.Errorf("host defaults = %+v", cfg.Scan)
 	}
-	if !cfg.Scan.RespectRobots || cfg.Scan.MaxRequests != 3000 || cfg.Scan.ScanRequestsPerSecond != 20 {
-		t.Errorf("safeguard defaults = %+v", cfg.Scan)
-	}
-	if cfg.Scan.UserAgent != "WebsiteMapperBot/0.1 (+http://localhost:3000/bot)" || cfg.Scan.RobotsAgent() != "WebsiteMapperBot" {
-		t.Errorf("user agent = %q / %q", cfg.Scan.UserAgent, cfg.Scan.RobotsAgent())
-	}
-	if cfg.Bot.InfoURLSet {
-		t.Error("InfoURLSet should be false by default")
-	}
-}
-
-func TestLoadBotIdentity(t *testing.T) {
-	cfg, err := LoadFrom(env(map[string]string{
-		"BOT_INFO_URL":        "https://mapper.example/bot",
-		"BOT_CONTACT":         "abuse@mapper.example",
-		"SCAN_RESPECT_ROBOTS": "false",
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Scan.UserAgent != "WebsiteMapperBot/0.1 (+https://mapper.example/bot)" || !cfg.Bot.InfoURLSet ||
-		cfg.Bot.Contact != "abuse@mapper.example" || cfg.Scan.RespectRobots {
-		t.Errorf("cfg = %+v / %+v", cfg.Bot, cfg.Scan)
-	}
-
-	cfg, _ = LoadFrom(env(map[string]string{"SCAN_USER_AGENT": "CustomBot/2.0 (+https://x.example)"}))
-	if cfg.Scan.RobotsAgent() != "CustomBot" {
-		t.Errorf("robots agent = %q", cfg.Scan.RobotsAgent())
+	if cfg.MaxConcurrentScans != 3 || cfg.GlobalHTTPConcurrency != 32 || cfg.GlobalDNSConcurrency != 16 || cfg.Scan.Timeout != 30*time.Minute {
+		t.Errorf("resource defaults = %+v", cfg)
 	}
 }
 
 func TestLoadOverrides(t *testing.T) {
 	cfg, err := LoadFrom(env(map[string]string{
-		"SERVER_PORT":          "9000",
-		"SCAN_REQUEST_TIMEOUT": "3s",
-		"SCAN_MAX_DEPTH":       "0",
-		"SCAN_MAX_URLS":        "20",
-		"SCAN_CONCURRENCY":     "2",
-		"LOG_LEVEL":            "debug",
-		"SCAN_MAX_HOSTS":       "5",
-		"SCAN_CT_ENABLED":      "false",
+		"SERVER_PORT":               "9000",
+		"SCAN_REQUEST_TIMEOUT":      "3s",
+		"SCAN_MAX_DEPTH":            "0",
+		"SCAN_MAX_URLS":             "20",
+		"SCAN_CONCURRENCY":          "2",
+		"LOG_LEVEL":                 "debug",
+		"SCAN_MAX_HOSTS":            "5",
+		"SCAN_CT_ENABLED":           "false",
+		"GLOBAL_HTTP_CONCURRENCY":   "8",
+		"GLOBAL_DNS_CONCURRENCY":    "2",
+		"MAX_CONCURRENT_SCANS":      "1",
+		"SCAN_MAX_REQUESTS":         "100",
+		"SCAN_MAX_DISCOVERED_HOSTS": "50",
 	}))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if cfg.Port != "9000" || cfg.Scan.RequestTimeout != 3*time.Second || cfg.Scan.MaxDepth != 0 ||
 		cfg.Scan.MaxURLs != 20 || cfg.Scan.Concurrency != 2 || cfg.LogLevel != slog.LevelDebug ||
-		cfg.Scan.MaxHosts != 5 || cfg.Scan.CTEnabled {
+		cfg.Scan.MaxHosts != 5 || cfg.Scan.CTEnabled || cfg.GlobalHTTPConcurrency != 8 || cfg.GlobalDNSConcurrency != 2 ||
+		cfg.MaxConcurrentScans != 1 || cfg.Scan.MaxRequests != 100 || cfg.Scan.MaxDiscoveredHosts != 50 {
 		t.Errorf("overrides not applied: %+v", cfg)
 	}
 }

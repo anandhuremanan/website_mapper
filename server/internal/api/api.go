@@ -15,52 +15,30 @@ import (
 
 // Scans is the subset of the scan service the API needs.
 type Scans interface {
-	Create(ctx context.Context, req scan.CreateRequest) (scan.Scan, error)
+	Create(ctx context.Context, input string) (scan.Scan, error)
 	Get(ctx context.Context, id string) (scan.Scan, error)
 	Result(ctx context.Context, id string) (scan.Result, error)
+	Cancel(ctx context.Context, id string) (scan.Scan, error)
+	Stats() scan.Stats
 }
 
 // maxRequestBody bounds JSON request bodies.
 const maxRequestBody = 4 << 10
 
-// BotInfo describes the crawler to site owners. It is served at
-// GET /api/bot and rendered by the client's /bot page.
-type BotInfo struct {
-	Name        string `json:"name"`
-	UserAgent   string `json:"userAgent"`
-	RobotsToken string `json:"robotsToken"`
-	InfoURL     string `json:"infoUrl"`
-	Contact     string `json:"contact,omitempty"`
-	// RespectsRobotsTxt is true when crawling follows robots.txt rules.
-	RespectsRobotsTxt bool      `json:"respectsRobotsTxt"`
-	Limits            BotLimits `json:"limits"`
-}
-
-// BotLimits are the request limits that apply to every scan.
-type BotLimits struct {
-	RequestsPerSecondPerHost float64 `json:"requestsPerSecondPerHost"`
-	RequestsPerSecondPerScan float64 `json:"requestsPerSecondPerScan"`
-	MaxRequestsPerScan       int     `json:"maxRequestsPerScan"`
-	MaxRequestsPerHost       int     `json:"maxRequestsPerHost"`
-	MaxHostsCrawled          int     `json:"maxHostsCrawled"`
-	RequestTimeoutSeconds    float64 `json:"requestTimeoutSeconds"`
-}
-
 type handler struct {
 	scans Scans
-	bot   BotInfo
 	log   *slog.Logger
 }
 
 // NewHandler returns the API's http.Handler.
-func NewHandler(scans Scans, bot BotInfo, log *slog.Logger) http.Handler {
-	h := &handler{scans: scans, bot: bot, log: log}
+func NewHandler(scans Scans, log *slog.Logger) http.Handler {
+	h := &handler{scans: scans, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", h.health)
-	mux.HandleFunc("GET /api/bot", h.botInfo)
 	mux.HandleFunc("POST /api/scans", h.createScan)
 	mux.HandleFunc("GET /api/scans/{id}", h.getScan)
 	mux.HandleFunc("GET /api/scans/{id}/results", h.getResults)
+	mux.HandleFunc("POST /api/scans/{id}/cancel", h.cancelScan)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})
@@ -68,19 +46,11 @@ func NewHandler(scans Scans, bot BotInfo, log *slog.Logger) http.Handler {
 }
 
 func (h *handler) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-func (h *handler) botInfo(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, h.bot)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "scheduler": h.scans.Stats()})
 }
 
 type createRequest struct {
 	Target string `json:"target"`
-	// AuthorizationConfirmed must be true: the caller confirms they own the
-	// domain or have permission to scan it. The UI's consent checkbox sets
-	// it, and API clients must send it explicitly.
-	AuthorizationConfirmed bool `json:"authorizationConfirmed"`
 }
 
 func (h *handler) createScan(w http.ResponseWriter, r *http.Request) {
@@ -88,20 +58,16 @@ func (h *handler) createScan(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, `request body must be JSON like {"target": "example.com", "authorizationConfirmed": true}`)
+		writeError(w, http.StatusBadRequest, `request body must be JSON like {"target": "example.com"}`)
 		return
 	}
 
-	sc, err := h.scans.Create(r.Context(), scan.CreateRequest{Target: req.Target, AuthorizationConfirmed: req.AuthorizationConfirmed})
+	sc, err := h.scans.Create(r.Context(), req.Target)
 	switch {
-	case errors.Is(err, scan.ErrAuthorizationRequired):
-		h.log.Warn("scan rejected without authorization confirmation", "event", "scan_rejected", "reason", "authorization_not_confirmed")
-		writeError(w, http.StatusBadRequest, `authorization not confirmed: set "authorizationConfirmed": true to confirm you own this domain or have permission to scan it`)
-		return
 	case errors.Is(err, discovery.ErrInvalidTarget):
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
-	case errors.Is(err, scan.ErrQueueFull):
+	case errors.Is(err, scan.ErrQueueFull), errors.Is(err, scan.ErrShuttingDown):
 		w.Header().Set("Retry-After", "10")
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
@@ -126,6 +92,24 @@ func (h *handler) getScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, sc)
+}
+
+// cancelScan stops a queued or running scan. A queued scan is cancelled at
+// once; a running scan stops within moments and keeps its partial results.
+func (h *handler) cancelScan(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sc, err := h.scans.Cancel(r.Context(), id)
+	switch {
+	case errors.Is(err, scan.ErrNotFound):
+		writeError(w, http.StatusNotFound, "scan not found")
+	case errors.Is(err, scan.ErrFinished):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "status": string(sc.Status)})
+	case err != nil:
+		h.log.Error("cancelling scan failed", "scan_id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, "could not cancel scan")
+	default:
+		writeJSON(w, http.StatusAccepted, sc)
+	}
 }
 
 func (h *handler) getResults(w http.ResponseWriter, r *http.Request) {

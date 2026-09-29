@@ -149,20 +149,10 @@ export function HostDetail({ host }: { host: Host }) {
             {crawl.skipped ? (
               <span className="text-muted">Not crawled: {crawl.skipped}</span>
             ) : (
-              <span className="space-y-0.5">
-                <span className="block">
-                  {plural(crawl.requests, "request")}
-                  {crawl.limitReached && (
-                    <span className="text-muted"> — per-host request limit reached</span>
-                  )}
-                </span>
-                {crawl.robots && (
-                  <span className="block text-muted">
-                    robots.txt: {robotsLabel(crawl.robots)}
-                    {crawl.robotsDisallowed
-                      ? ` — ${plural(crawl.robotsDisallowed, "URL")} not requested because disallowed`
-                      : ""}
-                  </span>
+              <span>
+                {plural(crawl.requests, "request")}
+                {crawl.limitReached && (
+                  <span className="text-muted"> — per-host request limit reached</span>
                 )}
               </span>
             )}
@@ -204,20 +194,6 @@ export function HostDetail({ host }: { host: Host }) {
       )}
     </div>
   );
-}
-
-function robotsLabel(status: string): string {
-  switch (status) {
-    case "respected":
-      return "rules applied";
-    case "not found":
-      return "none published";
-    case "unavailable":
-      return "could not be fetched; crawled normally";
-    case "ignored":
-      return "not checked (disabled by the operator)";
-  }
-  return status;
 }
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { ApiError, getResults, getScan } from "./api";
-import type { Scan, ScanResult } from "./types";
+import { isFinished, type Scan, type ScanResult } from "./types";
 
 const POLL_INTERVAL_MS = 1500;
 
@@ -35,9 +35,9 @@ export function useScan(id: string): ScanState {
         if (cancelled) return;
         setState((s) => ({ ...s, scan, error: null }));
 
-        if (scan.status === "completed" || scan.status === "failed") {
+        if (isFinished(scan.status)) {
           const result = await getResults(id).catch((err) => {
-            // A scan that failed before starting has no results.
+            // A scan that failed or was cancelled before starting has no results.
             if (err instanceof ApiError && err.status === 409) return null;
             throw err;
           });

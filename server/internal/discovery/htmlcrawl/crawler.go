@@ -16,7 +16,7 @@ import (
 	"websitemapper/internal/discovery"
 	"websitemapper/internal/fetch"
 	"websitemapper/internal/normalize"
-	"websitemapper/internal/robots"
+	"websitemapper/internal/resource"
 )
 
 // maxRedirects bounds a single redirect chain.
@@ -40,11 +40,6 @@ type Options struct {
 	Concurrency int
 	// HostConcurrency is the number of hosts crawled in parallel.
 	HostConcurrency int
-	// RespectRobots applies each host's robots.txt rules to the crawl.
-	RespectRobots bool
-	// RobotsAgent is the product token matched against robots.txt
-	// User-agent lines, e.g. "WebsiteMapperBot".
-	RobotsAgent string
 }
 
 // Crawler is the HTML discovery engine.
@@ -99,7 +94,7 @@ func (c *Crawler) Discover(ctx context.Context, in discovery.Input, emit discove
 	budget := max(c.opts.MaxHosts-done, 0)
 	if len(todo) > budget {
 		for _, h := range todo[budget:] {
-			emit(discovery.Finding{Host: h.Name, Crawl: &discovery.CrawlInfo{Skipped: "host limit reached"}})
+			emit(discovery.Finding{Host: h.Name, Crawl: &discovery.CrawlInfo{Skipped: discovery.SkipHostLimit}})
 		}
 		todo = todo[:budget]
 	}
@@ -110,8 +105,13 @@ func (c *Crawler) Discover(ctx context.Context, in discovery.Input, emit discove
 		seeds[h] = append(seeds[h], u)
 	}
 
+	acct := resource.FromContext(ctx)
 	discovery.ForEachLimited(todo, c.opts.HostConcurrency, func(h discovery.HostView) {
 		if ctx.Err() != nil {
+			return
+		}
+		if acct.Exhausted() {
+			emit(discovery.Finding{Host: h.Name, Crawl: &discovery.CrawlInfo{Skipped: discovery.SkipRequestLimit}})
 			return
 		}
 		info := c.crawlHost(ctx, in.Target, h, seeds[h.Name], emit)
@@ -162,21 +162,16 @@ func startURL(t discovery.Target, h discovery.HostView) item {
 }
 
 func (c *Crawler) crawlHost(ctx context.Context, t discovery.Target, h discovery.HostView, seeds []string, emit discovery.Emit) *discovery.CrawlInfo {
-	start := startURL(t, h)
-	rules, robotsStatus := robots.AllowAll, "ignored"
-	if c.opts.RespectRobots {
-		rules, robotsStatus = c.fetchRobots(ctx, t, start.url)
-	}
 	run := &crawl{
 		Crawler: c,
 		target:  t,
 		host:    h.Name,
 		emit:    emit,
-		rules:   rules,
 		seen:    make(map[string]bool),
 		budget:  int64(c.opts.MaxPagesPerHost),
 	}
 	var frontier []item
+	start := startURL(t, h)
 	if run.markSeen(start.url) {
 		frontier = append(frontier, start)
 	}
@@ -186,43 +181,18 @@ func (c *Crawler) crawlHost(ctx context.Context, t discovery.Target, h discovery
 			frontier = append(frontier, item{url: s, hint: discovery.HintLink})
 		}
 	}
-	for depth := 0; len(frontier) > 0 && ctx.Err() == nil; depth++ {
+	for depth := 0; len(frontier) > 0 && ctx.Err() == nil && !run.stopped.Load(); depth++ {
 		frontier = run.level(ctx, frontier, depth < c.opts.MaxDepth)
-	}
-	c.log.Debug("host crawled", "host", h.Name, "requests", run.fetched.Load())
-	return &discovery.CrawlInfo{
-		Requests:         int(run.fetched.Load()),
-		LimitReached:     run.exhausted.Load(),
-		Robots:           robotsStatus,
-		RobotsDisallowed: int(run.disallowed.Load()),
-	}
-}
-
-// fetchRobots retrieves the robots.txt for the host of pageURL, following
-// in-scope redirects. Any failure means crawling continues without rules.
-func (c *Crawler) fetchRobots(ctx context.Context, t discovery.Target, pageURL string) (*robots.Rules, string) {
-	u, err := url.Parse(pageURL)
-	if err != nil {
-		return robots.AllowAll, "unavailable"
-	}
-	cur := u.Scheme + "://" + u.Host + "/robots.txt"
-	for hop := 0; hop <= maxRedirects; hop++ {
-		resp, err := c.fetcher.Get(ctx, cur)
-		switch {
-		case err != nil:
-			return robots.AllowAll, "unavailable"
-		case resp.IsRedirect() && t.URLInScope(resp.Location):
-			cur = resp.Location
-			continue
-		case resp.StatusCode == 200:
-			return robots.Parse(resp.Body, c.opts.RobotsAgent), "respected"
-		case resp.StatusCode >= 400 && resp.StatusCode < 500:
-			return robots.AllowAll, "not found"
-		default:
-			return robots.AllowAll, "unavailable"
+		// Backpressure: links beyond the host's remaining request budget
+		// can never be fetched, so they are not queued (they were already
+		// reported as discovered URLs).
+		if remaining := int(atomic.LoadInt64(&run.budget)); len(frontier) > remaining {
+			frontier = frontier[:max(remaining, 0)]
+			run.exhausted.Store(true)
 		}
 	}
-	return robots.AllowAll, "unavailable"
+	c.log.Debug("host crawled", "host", h.Name, "requests", run.fetched.Load())
+	return &discovery.CrawlInfo{Requests: int(run.fetched.Load()), LimitReached: run.exhausted.Load()}
 }
 
 // crawl is the state of one host's crawl.
@@ -231,26 +201,15 @@ type crawl struct {
 	target discovery.Target
 	host   string
 	emit   discovery.Emit
-	rules  *robots.Rules
 
 	mu   sync.Mutex
 	seen map[string]bool
 
-	budget     int64
-	fetched    atomic.Int64
-	exhausted  atomic.Bool
-	disallowed atomic.Int64
-	// scanLimit is set when the scan-wide request budget is used up.
-	scanLimit atomic.Bool
-}
-
-// allowed checks a URL against the host's robots.txt rules.
-func (r *crawl) allowed(raw string) bool {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return false
-	}
-	return r.rules.Allowed(u.RequestURI())
+	budget    int64
+	fetched   atomic.Int64
+	exhausted atomic.Bool
+	// stopped is set when the scan's request budget runs out.
+	stopped atomic.Bool
 }
 
 // markSeen records a URL and reports whether it was new.
@@ -286,6 +245,9 @@ func (r *crawl) level(ctx context.Context, items []item, follow bool) []item {
 		sem  = make(chan struct{}, r.opts.Concurrency)
 	)
 	for _, it := range items {
+		if r.stopped.Load() {
+			break
+		}
 		select {
 		case <-ctx.Done():
 			wg.Wait()
@@ -313,26 +275,19 @@ func (r *crawl) level(ctx context.Context, items []item, follow bool) []item {
 func (r *crawl) visit(ctx context.Context, it item) []item {
 	cur, source, hint, from := it.url, it.source, it.hint, it.from
 	for hop := 0; hop <= maxRedirects; hop++ {
-		if r.scanLimit.Load() {
-			return nil
-		}
-		if !r.allowed(cur) {
-			r.disallowed.Add(1)
-			r.emit(discovery.Finding{URL: cur, Source: source, Hint: hint, From: from, RobotsDisallowed: true})
-			return nil
-		}
 		if !r.takeBudget() {
 			return nil
 		}
 		r.fetched.Add(1)
 		resp, err := r.fetcher.Get(ctx, cur)
 		if err != nil {
-			if errors.Is(err, fetch.ErrRequestLimit) {
-				r.fetched.Add(-1)
-				r.scanLimit.Store(true)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil
 			}
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if errors.Is(err, resource.ErrBudgetExhausted) {
+				r.fetched.Add(-1)
+				r.exhausted.Store(true)
+				r.stopped.Store(true)
 				return nil
 			}
 			r.log.Debug("fetch failed", "url", cur, "error", err)

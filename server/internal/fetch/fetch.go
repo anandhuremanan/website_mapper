@@ -1,6 +1,8 @@
 // Package fetch is the single outbound HTTP client used by discovery engines.
 //
 // It enforces request timeouts, response size limits, per-host rate limits,
+// the server-wide concurrency limit (a resource.Pool shared by all scans),
+// each scan's request budget (the resource.Account in the request context),
 // and refuses to connect to private or loopback addresses (unless explicitly
 // allowed for development). Redirects are never followed automatically so
 // that callers can record them and decide whether they stay in scope.
@@ -19,6 +21,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"websitemapper/internal/resource"
 )
 
 // ErrBlockedAddress is returned when a host resolves to a non-public address.
@@ -31,6 +35,20 @@ type Options struct {
 	UserAgent         string
 	RequestsPerSecond float64
 	AllowPrivate      bool
+	// Pool bounds requests in flight across every scan using this client.
+	// Nil means unbounded (tests only).
+	Pool *resource.Pool
+	// ReadBody decides, by media type, whether a response body is read.
+	// Bodies that are not read are never downloaded beyond what the
+	// connection has already buffered. Nil reads textual types (HTML, JSON,
+	// XML, JavaScript, text).
+	ReadBody func(mediaType string) bool
+}
+
+// HTMLOnly reads only HTML bodies: enough for crawling and page titles,
+// without downloading JSON, XML, feeds or scripts that are only classified.
+func HTMLOnly(mediaType string) bool {
+	return mediaType == "" || mediaType == "text/html" || mediaType == "application/xhtml+xml"
 }
 
 // Client performs polite, bounded GET requests.
@@ -68,6 +86,9 @@ func New(opts Options) *Client {
 	if opts.MaxBodyBytes <= 0 {
 		opts.MaxBodyBytes = 2 << 20
 	}
+	if opts.ReadBody == nil {
+		opts.ReadBody = isTextual
+	}
 	dialer := &net.Dialer{Timeout: opts.Timeout, KeepAlive: 30 * time.Second}
 	if !opts.AllowPrivate {
 		dialer.Control = blockNonPublic
@@ -78,6 +99,7 @@ func New(opts Options) *Client {
 		TLSHandshakeTimeout:   opts.Timeout,
 		ResponseHeaderTimeout: opts.Timeout,
 		MaxIdleConnsPerHost:   4,
+		MaxIdleConns:          idleConns(opts.Pool),
 		IdleConnTimeout:       60 * time.Second,
 	}
 	return &Client{
@@ -93,7 +115,20 @@ func New(opts Options) *Client {
 	}
 }
 
+// idleConns bounds idle keep-alive connections kept across all hosts.
+func idleConns(p *resource.Pool) int {
+	if p == nil {
+		return 64
+	}
+	return 2 * p.Stats().Capacity
+}
+
 // Get performs a single GET request without following redirects.
+//
+// Order of admission: the scan's request budget, then the per-host rate
+// limit, then a slot in the shared pool. The pool slot is held only for the
+// request itself (including reading the body), never while sleeping for the
+// rate limit, so politeness delays do not consume server-wide capacity.
 func (c *Client) Get(ctx context.Context, rawURL string) (*Response, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -102,18 +137,25 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*Response, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("unsupported scheme %q", u.Scheme)
 	}
-	if b := budgetFrom(ctx); b != nil {
-		if err := b.take(ctx); err != nil {
-			return nil, err
-		}
+	if err := resource.FromContext(ctx).TakeRequest(); err != nil {
+		return nil, err
 	}
 	if err := c.limiter.wait(ctx, u.Host); err != nil {
 		return nil, err
 	}
+	release, waited, err := c.opts.Pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if waited > 0 {
+		// The rate-limit slot reserved above may have passed while waiting
+		// for capacity; reserve a fresh one so per-host spacing still holds.
+		if err := c.limiter.wait(ctx, u.Host); err != nil {
+			return nil, err
+		}
+	}
 
-	// Requests carry no cookies, credentials or body: there is no cookie
-	// jar, URL user info is dropped, and only these headers are set.
-	u.User = nil
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
@@ -138,7 +180,7 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*Response, error) {
 			out.Location = ref.String()
 		}
 	}
-	if isTextual(out.ContentType) {
+	if c.opts.ReadBody(out.ContentType) {
 		body, err := io.ReadAll(io.LimitReader(resp.Body, c.opts.MaxBodyBytes+1))
 		if err != nil {
 			return nil, fmt.Errorf("reading body: %w", err)

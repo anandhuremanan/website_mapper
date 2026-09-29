@@ -11,6 +11,7 @@ import (
 	"websitemapper/internal/discovery"
 	"websitemapper/internal/fetch"
 	"websitemapper/internal/htmlmeta"
+	"websitemapper/internal/resource"
 )
 
 // maxRedirects bounds the redirects followed from a host's root URL.
@@ -47,6 +48,11 @@ func (e *Engine) Name() string { return "http" }
 
 // Discover probes https://host/ and, if that fails, http://host/ for every
 // resolved host, up to MaxHosts per scan.
+//
+// The two schemes are tried one after the other rather than in parallel:
+// most hosts answer HTTPS, so racing both would roughly double the requests
+// sent (and the global slots used) for the common case to save time only
+// on hosts that fail HTTPS.
 func (e *Engine) Discover(ctx context.Context, in discovery.Input, emit discovery.Emit) error {
 	hosts := in.State.Hosts()
 	discovery.PrioritizeHosts(hosts, in.Target)
@@ -68,7 +74,7 @@ func (e *Engine) Discover(ctx context.Context, in discovery.Input, emit discover
 	budget := max(e.opts.MaxHosts-done, 0)
 	if len(todo) > budget {
 		for _, h := range todo[budget:] {
-			emit(discovery.Finding{Host: h, HTTP: &discovery.HTTPInfo{Skipped: "host limit reached"}})
+			emit(discovery.Finding{Host: h, HTTP: &discovery.HTTPInfo{Skipped: discovery.SkipHostLimit}})
 		}
 		todo = todo[:budget]
 	}
@@ -94,8 +100,8 @@ func (e *Engine) probe(ctx context.Context, t discovery.Target, host string) *di
 			if ctx.Err() != nil {
 				return nil
 			}
-			if errors.Is(err, fetch.ErrRequestLimit) {
-				return &discovery.HTTPInfo{Skipped: "scan request limit reached"}
+			if errors.Is(err, resource.ErrBudgetExhausted) {
+				return &discovery.HTTPInfo{Skipped: discovery.SkipRequestLimit}
 			}
 			lastErr = err
 			continue

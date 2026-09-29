@@ -70,9 +70,6 @@ type Finding struct {
 	Response *Response
 	// Error describes a failed fetch of URL, if any.
 	Error string
-	// RobotsDisallowed means URL was not fetched because the host's
-	// robots.txt disallows it.
-	RobotsDisallowed bool
 
 	// Host observations. Each replaces any earlier value for the host.
 	DNS   *DNSInfo
@@ -127,19 +124,38 @@ type HTTPInfo struct {
 
 // CrawlInfo summarizes the crawl of one host. Values are immutable once emitted.
 type CrawlInfo struct {
-	// Requests counts page requests; the robots.txt request is not included.
 	Requests int `json:"requests"`
 	// LimitReached is true when the per-host request budget ran out.
 	LimitReached bool `json:"limitReached,omitempty"`
-	// Robots describes robots.txt handling: "respected" (rules applied),
-	// "not found", "unavailable" (could not be fetched; crawled normally)
-	// or "ignored" (checking disabled by configuration).
-	Robots string `json:"robots,omitempty"`
-	// RobotsDisallowed counts URLs not fetched because robots.txt disallows them.
-	RobotsDisallowed int `json:"robotsDisallowed,omitempty"`
 	// Skipped explains why the host was not crawled.
 	Skipped string `json:"skipped,omitempty"`
 }
+
+// PartialError reports that an engine finished but part of its work failed,
+// for example one of several independent providers. The scan records the
+// failure in its errors without treating the engine as failed.
+type PartialError struct{ Err error }
+
+func (e *PartialError) Error() string { return e.Err.Error() }
+func (e *PartialError) Unwrap() error { return e.Err }
+
+// Partial wraps err as a PartialError; it returns nil for a nil err.
+func Partial(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &PartialError{Err: err}
+}
+
+// Skip reasons shared by host engines. Budget skips are counted and shown
+// to users as resource limits, distinct from skips that are expected (such
+// as hosts that only redirect elsewhere).
+const (
+	// SkipHostLimit: the scan's host budget for this stage was used up.
+	SkipHostLimit = "host limit reached"
+	// SkipRequestLimit: the scan's total request budget was used up.
+	SkipRequestLimit = "scan request limit reached"
+)
 
 // HostView is a read-only snapshot of what is known about a host.
 type HostView struct {

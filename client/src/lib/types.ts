@@ -1,7 +1,21 @@
 // Types mirroring the Go server's JSON API. See server/README.md.
 
-export type ScanStatus = "queued" | "running" | "completed" | "failed";
-export type StepStatus = "pending" | "running" | "done" | "failed" | "skipped";
+export type ScanStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type StepStatus = "pending" | "running" | "done" | "failed" | "skipped" | "stopped";
+export type Phase =
+  | "queued"
+  | "discovering_subdomains"
+  | "resolving_hosts"
+  | "probing_hosts"
+  | "crawling_hosts"
+  | "finalizing"
+  | "done";
+/** Why a scan ended before finishing its work. */
+export type StopReason = "scan_timeout" | "cancelled" | "server_shutdown";
+
+export function isFinished(status: ScanStatus): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
 
 export type Source =
   | "target"
@@ -28,11 +42,40 @@ export interface Counts {
   hostsResolved: number;
   hostsReachable: number;
   hostsCrawled: number;
+  hostsUnresolved: number;
+  hostsResolvePending: number;
+  hostsProbed: number;
+  hostsUnreachable: number;
+  hostsProbePending: number;
+  hostsCrawlPending: number;
   urls: number;
   pages: number;
   apis: number;
   assets: number;
   javascript: number;
+  urlsFetched: number;
+  urlsFailed: number;
+  limits: {
+    hostsOmitted: number;
+    resolveSkipped: number;
+    probeSkipped: number;
+    crawlSkipped: number;
+    crawlLimited: number;
+    urlsOmitted: number;
+  };
+}
+
+/** A resource limit that shaped the result. */
+export interface LimitNotice {
+  code:
+    | "scan_timeout"
+    | "host_budget_reached"
+    | "crawl_limit_reached"
+    | "url_budget_reached"
+    | "request_budget_reached"
+    | "global_resource_wait"
+    | "discovery_round_limit";
+  message: string;
 }
 
 export interface Step {
@@ -46,6 +89,8 @@ export interface EngineError {
   stage?: string;
   engine: string;
   message: string;
+  /** The step still produced results (e.g. one provider of several failed). */
+  partial?: boolean;
 }
 
 export interface Scan {
@@ -58,11 +103,21 @@ export interface Scan {
   startedAt?: string;
   finishedAt?: string;
   durationMs?: number;
+  phase: Phase;
+  /** 1-based position while queued. */
+  queuePosition?: number;
+  /** Progress of the current phase, in hosts. */
+  progress?: { total: number; completed: number; pending: number };
+  stopReason?: StopReason;
+  limits: LimitNotice[];
+  resources: {
+    requests: number;
+    maxRequests?: number;
+    /** Per shared pool: operations, how many waited, and the average wait. */
+    pools?: Record<string, { operations: number; delayed: number; avgWaitMs: number }>;
+  };
   steps: Step[];
   counts: Counts;
-  /** Outbound HTTP requests made so far. */
-  requests: number;
-  authorizationConfirmed: boolean;
   errors: EngineError[];
   error?: string;
 }
@@ -97,9 +152,6 @@ export interface CrawlInfo {
   requests: number;
   limitReached?: boolean;
   skipped?: string;
-  /** "respected" | "not found" | "unavailable" | "ignored" */
-  robots?: string;
-  robotsDisallowed?: number;
 }
 
 export interface Host {
@@ -133,25 +185,6 @@ export interface DiscoveredUrl {
   discoveredFrom?: string[];
   fetched: boolean;
   error?: string;
-  /** Not requested because the host's robots.txt disallows it. */
-  robotsDisallowed?: boolean;
-}
-
-export interface BotInfo {
-  name: string;
-  userAgent: string;
-  robotsToken: string;
-  infoUrl: string;
-  contact?: string;
-  respectsRobotsTxt: boolean;
-  limits: {
-    requestsPerSecondPerHost: number;
-    requestsPerSecondPerScan: number;
-    maxRequestsPerScan: number;
-    maxRequestsPerHost: number;
-    maxHostsCrawled: number;
-    requestTimeoutSeconds: number;
-  };
 }
 
 export interface Technology {
@@ -162,6 +195,10 @@ export interface Technology {
 export interface ScanResult {
   scanId: string;
   status: ScanStatus;
+  stopReason?: StopReason;
+  limits: LimitNotice[];
+  /** Hostnames discovered after the host limit; not listed. */
+  hostsOmitted?: number;
   domain: {
     target: string;
     canonical: string;
