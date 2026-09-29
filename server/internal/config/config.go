@@ -32,7 +32,22 @@ type Config struct {
 	// GlobalDNSConcurrency bounds DNS lookups in flight across all scans.
 	GlobalDNSConcurrency int
 
+	Cache CacheConfig
+
 	Scan ScanConfig
+}
+
+// CacheConfig sizes the shared discovery cache.
+type CacheConfig struct {
+	// MaxBytes is the whole cache's memory budget (estimated); 0 disables
+	// caching. It is split between the layers below.
+	MaxBytes int64
+	// CertTTL, DNSTTL, ProbeTTL and PageTTL are how long each layer's
+	// entries are reused.
+	CertTTL  time.Duration
+	DNSTTL   time.Duration
+	ProbeTTL time.Duration
+	PageTTL  time.Duration
 }
 
 // ScanConfig controls how a single scan behaves.
@@ -99,6 +114,13 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 		MaxStoredResultURLs:   p.int("MAX_STORED_RESULT_URLS", 500000, 1),
 		GlobalHTTPConcurrency: p.int("GLOBAL_HTTP_CONCURRENCY", 32, 1),
 		GlobalDNSConcurrency:  p.int("GLOBAL_DNS_CONCURRENCY", 16, 1),
+		Cache: CacheConfig{
+			MaxBytes: int64(p.int("CACHE_MAX_MB", 64, 0)) << 20,
+			CertTTL:  p.duration("CACHE_CERT_TTL", 6*time.Hour),
+			DNSTTL:   p.duration("CACHE_DNS_TTL", 5*time.Minute),
+			ProbeTTL: p.duration("CACHE_PROBE_TTL", 2*time.Minute),
+			PageTTL:  p.duration("CACHE_PAGE_TTL", 15*time.Minute),
+		},
 		Scan: ScanConfig{
 			RequestTimeout:         p.duration("SCAN_REQUEST_TIMEOUT", 10*time.Second),
 			Timeout:                p.duration("SCAN_TIMEOUT", 30*time.Minute),

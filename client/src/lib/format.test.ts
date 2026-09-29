@@ -61,6 +61,7 @@ describe("allUrls", () => {
       typeEvidence: "",
       sources: [],
       fetched: false,
+      state: "discovered" as const,
     });
     const hosts = [
       host({ hostname: "a.example.com", urls: [u("https://a.example.com/1")] }),

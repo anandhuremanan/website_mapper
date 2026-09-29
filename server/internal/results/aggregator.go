@@ -57,12 +57,15 @@ type urlEntry struct {
 }
 
 type hostEntry struct {
-	urls    int // recorded URLs
-	omitted int // URLs seen after the per-host limit was reached
-	sources set[discovery.Source]
-	dns     *discovery.DNSInfo
-	http    *discovery.HTTPInfo
-	crawl   *discovery.CrawlInfo
+	// liveSeen / cachedSeen record whether the host was discovered by this
+	// scan's own work and/or through reused cache entries.
+	liveSeen, cachedSeen bool
+	urls                 int // recorded URLs
+	omitted              int // URLs seen after the per-host limit was reached
+	sources              set[discovery.Source]
+	dns                  *discovery.DNSInfo
+	http                 *discovery.HTTPInfo
+	crawl                *discovery.CrawlInfo
 }
 
 // NewAggregator creates an Aggregator scoped to target.
@@ -97,7 +100,7 @@ func (a *Aggregator) Add(f discovery.Finding) {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	host := a.hostLocked(u.Hostname(), src)
+	host := a.hostLocked(u.Hostname(), src, !f.CachedAt.IsZero())
 	if host == nil {
 		return // host not recorded: over the host limit
 	}
@@ -135,8 +138,10 @@ func (a *Aggregator) Add(f discovery.Finding) {
 		e.from = append(e.from, f.From)
 	}
 	if f.Response != nil {
-		// Prefer a successful response over an earlier redirect or error.
-		if e.resp == nil || (e.resp.Status >= 300 && f.Response.Status < 300) {
+		// Prefer a successful response over an earlier redirect or error,
+		// and this scan's own response over a cached one.
+		if e.resp == nil || (e.resp.Status >= 300 && f.Response.Status < 300) ||
+			(e.resp.CachedAt != nil && f.Response.CachedAt == nil) {
 			e.resp = f.Response
 			reclassify = true
 		}
@@ -169,6 +174,9 @@ func (c *Counts) applyURL(e *urlEntry, d int) {
 	switch {
 	case e.resp != nil:
 		c.URLsFetched += d
+		if e.resp.CachedAt != nil {
+			c.Cache.Pages += d
+		}
 	case e.err != "":
 		c.URLsFailed += d
 	}
@@ -181,7 +189,7 @@ func (a *Aggregator) addHost(f discovery.Finding) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	e := a.hostLocked(h, f.Source)
+	e := a.hostLocked(h, f.Source, !f.CachedAt.IsZero())
 	if e == nil {
 		return
 	}
@@ -199,7 +207,7 @@ func (a *Aggregator) addHost(f discovery.Finding) {
 // hostLocked returns the entry for host, creating it if the host limit
 // allows; otherwise it returns nil and counts the host as omitted. The
 // target's own hosts are always recorded.
-func (a *Aggregator) hostLocked(host string, src discovery.Source) *hostEntry {
+func (a *Aggregator) hostLocked(host string, src discovery.Source, cached bool) *hostEntry {
 	h, ok := a.hosts[host]
 	if !ok {
 		if a.limits.MaxHosts > 0 && len(a.hosts) >= a.limits.MaxHosts && src != discovery.SourceTarget {
@@ -211,6 +219,11 @@ func (a *Aggregator) hostLocked(host string, src discovery.Source) *hostEntry {
 	}
 	if src != "" && src != discovery.SourceHost {
 		h.sources.add(src)
+		if cached {
+			h.cachedSeen = true
+		} else {
+			h.liveSeen = true
+		}
 	}
 	return h
 }
@@ -250,14 +263,26 @@ func (a *Aggregator) Counts() Counts {
 	c.Limits.HostsOmitted = a.hostsOmitted
 	for _, h := range a.hosts {
 		countHost(&c, hostState(h), h.dns, h.http, h.crawl, h.omitted)
+		if h.fromCache() {
+			c.Cache.Hosts++
+		}
 	}
 	return c
 }
+
+// fromCache reports whether the host was discovered only through the cache.
+func (h *hostEntry) fromCache() bool { return h.cachedSeen && !h.liveSeen }
 
 // countHost adds one host to c. Live and final counts share it, so the two
 // always agree.
 func countHost(c *Counts, st HostState, dns *discovery.DNSInfo, http *discovery.HTTPInfo, crawl *discovery.CrawlInfo, omitted int) {
 	c.Hosts++
+	if dns != nil && dns.CachedAt != nil {
+		c.Cache.DNS++
+	}
+	if http != nil && http.CachedAt != nil {
+		c.Cache.Probes++
+	}
 	switch st {
 	case HostReachable:
 		c.HostsReachable++
@@ -316,6 +341,9 @@ func (r Result) Counts() Counts {
 	c.Limits.HostsOmitted = r.HostsOmitted
 	for _, h := range r.Hosts {
 		countHost(&c, h.State, h.DNS, h.HTTP, h.Crawl, h.Omitted)
+		if h.FromCache {
+			c.Cache.Hosts++
+		}
 		for _, u := range h.URLs {
 			c.URLs++
 			switch u.Type {
@@ -334,6 +362,9 @@ func (r Result) Counts() Counts {
 				c.URLsFailed++
 			case u.Fetched:
 				c.URLsFetched++
+				if u.CachedAt != nil {
+					c.Cache.Pages++
+				}
 			}
 		}
 	}
@@ -357,14 +388,15 @@ func (a *Aggregator) Result() Result {
 		urls := byHost[name]
 		sort.Slice(urls, func(i, j int) bool { return urls[i].URL < urls[j].URL })
 		host := Host{
-			Hostname: name,
-			State:    hostState(h),
-			Sources:  h.sources.sorted(),
-			DNS:      h.dns,
-			HTTP:     h.http,
-			Crawl:    h.crawl,
-			URLs:     urls,
-			Omitted:  h.omitted,
+			Hostname:  name,
+			State:     hostState(h),
+			Sources:   h.sources.sorted(),
+			FromCache: h.fromCache(),
+			DNS:       h.dns,
+			HTTP:      h.http,
+			Crawl:     h.crawl,
+			URLs:      urls,
+			Omitted:   h.omitted,
 		}
 		if host.URLs == nil {
 			host.URLs = []URL{}
@@ -399,6 +431,14 @@ func buildURL(key string, e *urlEntry) URL {
 		DiscoveredFrom: append([]string(nil), e.from...),
 		Error:          e.err,
 		Fetched:        e.resp != nil || e.err != "",
+		State:          URLDiscovered,
+	}
+	switch {
+	case e.resp != nil:
+		out.State = URLVerified
+		out.CachedAt = e.resp.CachedAt
+	case e.err != "":
+		out.State = URLFetched
 	}
 	if e.resp != nil {
 		out.Status = e.resp.Status

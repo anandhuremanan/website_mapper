@@ -55,6 +55,8 @@ export interface Counts {
   javascript: number;
   urlsFetched: number;
   urlsFailed: number;
+  /** Observations reused from the shared cache instead of made by this scan. */
+  cache: { hosts: number; dns: number; probes: number; pages: number };
   limits: {
     hostsOmitted: number;
     resolveSkipped: number;
@@ -106,6 +108,14 @@ export interface Scan {
   phase: Phase;
   /** 1-based position while queued. */
   queuePosition?: number;
+  /** Requesters currently sharing this active scan. */
+  subscribers?: number;
+  /** Create responses only: this requester's subscription. */
+  subscriptionId?: string;
+  /** Create responses only: joined an equivalent scan already running. */
+  coalesced?: boolean;
+  /** Cancel responses only: our subscription was released; others remain. */
+  detached?: boolean;
   /** Progress of the current phase, in hosts. */
   progress?: { total: number; completed: number; pending: number };
   stopReason?: StopReason;
@@ -131,6 +141,8 @@ export interface DnsInfo {
   nonPublic?: boolean;
   error?: string;
   skipped?: string;
+  /** Set when the answer was reused from the cache (time of the lookup). */
+  cachedAt?: string;
 }
 
 export interface HttpInfo {
@@ -146,10 +158,14 @@ export interface HttpInfo {
   contentType?: string;
   error?: string;
   skipped?: string;
+  /** Set when the probe result was reused from the cache. */
+  cachedAt?: string;
 }
 
 export interface CrawlInfo {
   requests: number;
+  /** Pages reused from the page cache (not included in requests). */
+  fromCache?: number;
   limitReached?: boolean;
   skipped?: string;
 }
@@ -159,6 +175,8 @@ export interface Host {
   state: HostState;
   /** How the host itself was discovered. */
   sources: Source[];
+  /** Discovered only through data reused from the shared cache. */
+  fromCache?: boolean;
   dns?: DnsInfo;
   http?: HttpInfo;
   crawl?: CrawlInfo;
@@ -185,6 +203,10 @@ export interface DiscoveredUrl {
   discoveredFrom?: string[];
   fetched: boolean;
   error?: string;
+  /** discovered: referenced only; fetched: requested, no response; verified: responded. */
+  state: "discovered" | "fetched" | "verified";
+  /** Set when the response was reused from the page cache. */
+  cachedAt?: string;
 }
 
 export interface Technology {

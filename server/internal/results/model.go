@@ -6,6 +6,8 @@
 package results
 
 import (
+	"time"
+
 	"websitemapper/internal/classify"
 	"websitemapper/internal/discovery"
 )
@@ -37,12 +39,16 @@ type Host struct {
 	Hostname string    `json:"hostname"`
 	State    HostState `json:"state"`
 	// Sources are how the host itself was discovered.
-	Sources []discovery.Source   `json:"sources"`
-	DNS     *discovery.DNSInfo   `json:"dns,omitempty"`
-	HTTP    *discovery.HTTPInfo  `json:"http,omitempty"`
-	Crawl   *discovery.CrawlInfo `json:"crawl,omitempty"`
-	Counts  HostCounts           `json:"counts"`
-	URLs    []URL                `json:"urls"`
+	Sources []discovery.Source `json:"sources"`
+	// FromCache is true when every discovery of this host was reused from
+	// the shared cache (e.g. an earlier scan's certificate lookup) rather
+	// than made by this scan.
+	FromCache bool                 `json:"fromCache,omitempty"`
+	DNS       *discovery.DNSInfo   `json:"dns,omitempty"`
+	HTTP      *discovery.HTTPInfo  `json:"http,omitempty"`
+	Crawl     *discovery.CrawlInfo `json:"crawl,omitempty"`
+	Counts    HostCounts           `json:"counts"`
+	URLs      []URL                `json:"urls"`
 	// Omitted counts URLs seen on this host but not recorded because the
 	// per-host URL limit was reached.
 	Omitted int `json:"urlsOmitted,omitempty"`
@@ -78,7 +84,23 @@ type URL struct {
 	// Fetched is true when the scanner requested this URL itself.
 	Fetched bool   `json:"fetched"`
 	Error   string `json:"error,omitempty"`
+	// State is discovered (referenced, never requested; assets stay here),
+	// fetched (requested, no HTTP response) or verified (an HTTP response
+	// was received).
+	State URLState `json:"state"`
+	// CachedAt is set when the response was reused from the page cache; it
+	// is when the page was actually fetched.
+	CachedAt *time.Time `json:"cachedAt,omitempty"`
 }
+
+// URLState distinguishes discovering a URL from requesting it.
+type URLState string
+
+const (
+	URLDiscovered URLState = "discovered"
+	URLFetched    URLState = "fetched"
+	URLVerified   URLState = "verified"
+)
 
 // Technology is a technology detected from observable evidence.
 type Technology struct {
@@ -107,11 +129,26 @@ type Counts struct {
 	APIs       int `json:"apis"`
 	Assets     int `json:"assets"`
 	JavaScript int `json:"javascript"`
-	// URLsFetched and URLsFailed count URLs the scanner requested itself.
+	// URLsFetched counts verified URLs (an HTTP response was received);
+	// URLsFailed counts requests that got no response.
 	URLsFetched int `json:"urlsFetched"`
 	URLsFailed  int `json:"urlsFailed"`
 
 	Limits LimitCounts `json:"limits"`
+	// Cache counts results reused from the shared cache instead of being
+	// looked up, probed or fetched by this scan.
+	Cache CacheCounts `json:"cache"`
+}
+
+// CacheCounts counts reused observations. Everything else was newly
+// observed by this scan.
+type CacheCounts struct {
+	// Hosts discovered only through cached observations.
+	Hosts int `json:"hosts"`
+	// DNS answers, probe results and verified pages reused from the cache.
+	DNS    int `json:"dns"`
+	Probes int `json:"probes"`
+	Pages  int `json:"pages"`
 }
 
 // LimitCounts counts work cut short by a per-scan budget. All zero means

@@ -123,17 +123,17 @@ func TestCancelQueuedScan(t *testing.T) {
 	b := mustCreate(t, svc, "b.com")
 	c := mustCreate(t, svc, "c.com")
 
-	got, err := svc.Cancel(context.Background(), b.ID)
+	got, err := svc.Cancel(context.Background(), b.ID, "")
 	if err != nil || got.Status != scan.StatusCancelled || got.StopReason != scan.StopCancel || got.FinishedAt == nil {
 		t.Fatalf("cancel queued = %+v, %v", got, err)
 	}
 	if got, _ := svc.Get(context.Background(), c.ID); got.QueuePosition != 1 {
 		t.Errorf("c moved to #%d, want #1", got.QueuePosition)
 	}
-	if _, err := svc.Cancel(context.Background(), b.ID); !errors.Is(err, scan.ErrFinished) {
+	if _, err := svc.Cancel(context.Background(), b.ID, ""); !errors.Is(err, scan.ErrFinished) {
 		t.Errorf("second cancel err = %v", err)
 	}
-	if _, err := svc.Cancel(context.Background(), "nope"); !errors.Is(err, scan.ErrNotFound) {
+	if _, err := svc.Cancel(context.Background(), "nope", ""); !errors.Is(err, scan.ErrNotFound) {
 		t.Errorf("cancel unknown err = %v", err)
 	}
 
@@ -156,7 +156,7 @@ func TestCancelRunningScanReleasesCapacity(t *testing.T) {
 	b := mustCreate(t, svc, "b.com")
 	waitFor(t, func() bool { return g.didStart("a.com") })
 
-	if _, err := svc.Cancel(context.Background(), a.ID); err != nil {
+	if _, err := svc.Cancel(context.Background(), a.ID, ""); err != nil {
 		t.Fatal(err)
 	}
 	got := waitStatus(t, svc, a.ID, scan.StatusCancelled)
@@ -280,7 +280,7 @@ func TestCancellationPropagatesAndLeavesNoGoroutines(t *testing.T) {
 
 	a := mustCreate(t, svc, "a.com")
 	waitFor(t, func() bool { return eng.completed("a.com") > 20 })
-	if _, err := svc.Cancel(context.Background(), a.ID); err != nil {
+	if _, err := svc.Cancel(context.Background(), a.ID, ""); err != nil {
 		t.Fatal(err)
 	}
 	waitStatus(t, svc, a.ID, scan.StatusCancelled)
@@ -444,7 +444,7 @@ func TestLargeScanDoesNotStarveSmallScans(t *testing.T) {
 	if got, _ := svc.Get(context.Background(), bigScan.ID); got.Status != scan.StatusRunning {
 		t.Errorf("big scan = %s; it should still be running", got.Status)
 	}
-	if _, err := svc.Cancel(context.Background(), bigScan.ID); err != nil {
+	if _, err := svc.Cancel(context.Background(), bigScan.ID, ""); err != nil {
 		t.Fatal(err)
 	}
 	waitStatus(t, svc, bigScan.ID, scan.StatusCancelled)

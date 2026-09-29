@@ -9,6 +9,7 @@ function url(u: string): DiscoveredUrl {
     hostname: parsed.hostname,
     path: parsed.pathname,
     type: "page",
+    state: "discovered",
     typeEvidence: "",
     sources: ["html"],
     fetched: false,

@@ -56,6 +56,8 @@ func (c *CertSpotter) Discover(ctx context.Context, domain string) ([]string, er
 		switch {
 		case resp.StatusCode == 429 && page > 0:
 			return names, nil // rate limited mid-way; keep what we have
+		case resp.StatusCode == 429:
+			return nil, fmt.Errorf("%w: Cert Spotter returned HTTP 429", ErrRateLimited)
 		case resp.StatusCode != 200:
 			return nil, fmt.Errorf("Cert Spotter returned HTTP %d", resp.StatusCode)
 		}

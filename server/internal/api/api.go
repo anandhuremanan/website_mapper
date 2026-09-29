@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -18,7 +19,7 @@ type Scans interface {
 	Create(ctx context.Context, input string) (scan.Scan, error)
 	Get(ctx context.Context, id string) (scan.Scan, error)
 	Result(ctx context.Context, id string) (scan.Result, error)
-	Cancel(ctx context.Context, id string) (scan.Scan, error)
+	Cancel(ctx context.Context, id, subscription string) (scan.Scan, error)
 	Stats() scan.Stats
 }
 
@@ -94,14 +95,31 @@ func (h *handler) getScan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sc)
 }
 
-// cancelScan stops a queued or running scan. A queued scan is cancelled at
-// once; a running scan stops within moments and keeps its partial results.
+type cancelRequest struct {
+	SubscriptionID string `json:"subscriptionId"`
+}
+
+// cancelScan releases the requester's subscription to a queued or running
+// scan; the scan itself stops when no subscription remains. A queued scan
+// is cancelled at once; a running scan stops within moments and keeps its
+// partial results. The body is optional: {"subscriptionId": "..."}.
 func (h *handler) cancelScan(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	sc, err := h.scans.Cancel(r.Context(), id)
+	var req cancelRequest
+	if r.ContentLength != 0 {
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, `request body must be empty or JSON like {"subscriptionId": "..."}`)
+			return
+		}
+	}
+	sc, err := h.scans.Cancel(r.Context(), id, req.SubscriptionID)
 	switch {
 	case errors.Is(err, scan.ErrNotFound):
 		writeError(w, http.StatusNotFound, "scan not found")
+	case errors.Is(err, scan.ErrShared), errors.Is(err, scan.ErrNotSubscribed):
+		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, scan.ErrFinished):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "status": string(sc.Status)})
 	case err != nil:

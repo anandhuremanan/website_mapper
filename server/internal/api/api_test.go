@@ -165,3 +165,37 @@ func TestErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestCoalescedScansAndSubscriptionCancel(t *testing.T) {
+	// No workers: scans stay queued, so the sequence is deterministic.
+	srv := newServer(t, false)
+	_, a := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com"}`)
+	_, b := do(t, "POST", srv.URL+"/api/scans", `{"target":"https://example.com/"}`)
+	if a["id"] != b["id"] || b["coalesced"] != true || a["subscriptionId"] == b["subscriptionId"] || b["subscriptionId"] == "" {
+		t.Fatalf("a = %v\nb = %v", a, b)
+	}
+	id := a["id"].(string)
+	if _, got := do(t, "GET", srv.URL+"/api/scans/"+id, ""); got["subscribers"] != float64(2) {
+		t.Errorf("subscribers = %v", got["subscribers"])
+	}
+	// A shared scan needs a subscription to cancel.
+	if code, body := do(t, "POST", srv.URL+"/api/scans/"+id+"/cancel", ""); code != http.StatusConflict {
+		t.Errorf("cancel without subscription = %d %v", code, body)
+	}
+	code, body := do(t, "POST", srv.URL+"/api/scans/"+id+"/cancel", `{"subscriptionId":"`+b["subscriptionId"].(string)+`"}`)
+	if code != http.StatusAccepted || body["detached"] != true || body["status"] != "queued" {
+		t.Fatalf("B leaving = %d %v", code, body)
+	}
+	code, body = do(t, "POST", srv.URL+"/api/scans/"+id+"/cancel", `{"subscriptionId":"`+a["subscriptionId"].(string)+`"}`)
+	if code != http.StatusAccepted || body["status"] != "cancelled" {
+		t.Fatalf("A leaving = %d %v", code, body)
+	}
+	if code, _ := do(t, "POST", srv.URL+"/api/scans/"+id+"/cancel", `{"bogus":1}`); code != http.StatusBadRequest && code != http.StatusConflict {
+		t.Errorf("bad body = %d", code)
+	}
+	// Health reports coalescing and cache stats.
+	_, health := do(t, "GET", srv.URL+"/api/health", "")
+	if sched := health["scheduler"].(map[string]any); sched["coalescedRequests"] != float64(1) {
+		t.Errorf("health = %v", sched)
+	}
+}

@@ -63,7 +63,9 @@ func (c *CRTSh) Discover(ctx context.Context, domain string) ([]string, error) {
 				return nil, fmt.Errorf("crt.sh response exceeded the size limit")
 			}
 			return ParseCRTSh(resp.Body)
-		case resp.StatusCode == 429 || resp.StatusCode >= 500:
+		case resp.StatusCode == 429:
+			lastErr = fmt.Errorf("%w: crt.sh returned HTTP 429", ErrRateLimited)
+		case resp.StatusCode >= 500:
 			lastErr = fmt.Errorf("crt.sh returned HTTP %d", resp.StatusCode)
 		default:
 			return nil, fmt.Errorf("crt.sh returned HTTP %d", resp.StatusCode)

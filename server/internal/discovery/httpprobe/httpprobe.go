@@ -7,7 +7,9 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"time"
 
+	"websitemapper/internal/cache"
 	"websitemapper/internal/discovery"
 	"websitemapper/internal/fetch"
 	"websitemapper/internal/htmlmeta"
@@ -16,6 +18,19 @@ import (
 
 // maxRedirects bounds the redirects followed from a host's root URL.
 const maxRedirects = 3
+
+// Cache holds probe results by host and target scope, shared by all scans.
+// Reachability changes quickly, so its TTL is short.
+type Cache = cache.Cache[discovery.HTTPInfo]
+
+// NewCache creates a probe cache.
+func NewCache(maxBytes int64) *Cache {
+	return cache.New[discovery.HTTPInfo](cache.Options{Name: "probe", MaxCost: maxBytes})
+}
+
+// errNotCacheable marks probe outcomes that belong to one scan (it was
+// cancelled, or its request budget ran out) rather than to the host.
+var errNotCacheable = errors.New("probe result specific to this scan")
 
 // Fetcher performs a single GET without following redirects.
 type Fetcher interface {
@@ -31,6 +46,11 @@ type Options struct {
 	// AllowPrivate probes hosts that resolve only to non-public addresses.
 	// Development only; the fetcher enforces its own policy regardless.
 	AllowPrivate bool
+	// Cache, when set, reuses probe results across scans. A fresh hit makes
+	// no request and takes no HTTP pool slot.
+	Cache *Cache
+	// TTL is how long a probe result (reachable or not) is reused.
+	TTL time.Duration
 }
 
 // Engine probes resolved hosts that have not been probed yet.
@@ -83,11 +103,34 @@ func (e *Engine) Discover(ctx context.Context, in discovery.Input, emit discover
 		if ctx.Err() != nil {
 			return
 		}
-		if info := e.probe(ctx, in.Target, h); info != nil {
+		if info := e.cachedProbe(ctx, in.Target, h); info != nil {
 			emit(discovery.Finding{Host: h, HTTP: info})
 		}
 	})
 	return ctx.Err()
+}
+
+// cachedProbe returns a fresh cached result or probes the host. The key
+// includes the target's scope because redirects are followed only within it.
+func (e *Engine) cachedProbe(ctx context.Context, t discovery.Target, host string) *discovery.HTTPInfo {
+	var scanSpecific *discovery.HTTPInfo
+	info, ci, err := e.opts.Cache.Do(ctx, host+"|"+t.Domain, func(ctx context.Context) (cache.Loaded[discovery.HTTPInfo], error) {
+		v := e.probe(ctx, t, host)
+		if v == nil || v.Skipped != "" {
+			scanSpecific = v
+			return cache.Loaded[discovery.HTTPInfo]{}, errNotCacheable
+		}
+		return cache.Loaded[discovery.HTTPInfo]{Value: *v, TTL: e.opts.TTL, Group: t.Domain,
+			Cost: 160 + cache.StringCost(v.URL, v.Redirect, v.FinalURL, v.Title, v.Server, v.ContentType, v.Error)}, nil
+	})
+	if err != nil {
+		return scanSpecific
+	}
+	if ci.Hit || ci.Shared {
+		at := ci.CreatedAt
+		info.CachedAt = &at
+	}
+	return &info
 }
 
 // probe returns nil if ctx was cancelled mid-probe, so the host stays unprobed.

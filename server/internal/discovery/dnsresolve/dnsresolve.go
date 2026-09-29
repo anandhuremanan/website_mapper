@@ -12,10 +12,28 @@ import (
 	"strings"
 	"time"
 
+	"websitemapper/internal/cache"
 	"websitemapper/internal/discovery"
 	"websitemapper/internal/fetch"
 	"websitemapper/internal/resource"
 )
+
+// Cache holds DNS answers by hostname, shared by all scans.
+//
+// Go's resolver does not report record TTLs, so answers are kept for a
+// bounded, configured time instead. Caching only affects what a scan
+// reports: every HTTP connection still resolves the name again and checks
+// the address it connects to, so the cache cannot be used to bypass the
+// non-public address guard.
+type Cache = cache.Cache[discovery.DNSInfo]
+
+// NewCache creates a DNS cache.
+func NewCache(maxBytes int64) *Cache {
+	return cache.New[discovery.DNSInfo](cache.Options{Name: "dns", MaxCost: maxBytes})
+}
+
+// errStopped means a lookup was interrupted because the scan stopped.
+var errStopped = errors.New("lookup interrupted")
 
 // Resolver looks up addresses. *net.Resolver satisfies it.
 type Resolver interface {
@@ -33,6 +51,14 @@ type Options struct {
 	Timeout time.Duration
 	// Pool bounds lookups in flight across all scans (nil: unbounded).
 	Pool *resource.Pool
+	// Cache, when set, reuses answers across scans. A fresh hit takes no
+	// Pool slot and makes no lookup.
+	Cache *Cache
+	// TTL is how long an answer is reused.
+	TTL time.Duration
+	// NegativeTTL is how long "no such host" / "no records" is reused.
+	// Other failures (timeouts, server errors) are never cached.
+	NegativeTTL time.Duration
 }
 
 // Engine resolves hosts that have not been resolved yet.
@@ -78,7 +104,7 @@ func (e *Engine) Discover(ctx context.Context, in discovery.Input, emit discover
 		if ctx.Err() != nil {
 			return
 		}
-		if info := e.resolve(ctx, h); info != nil {
+		if info := e.resolve(ctx, h, in.Target.Domain); info != nil {
 			emit(discovery.Finding{Host: h, DNS: info})
 		}
 	})
@@ -86,11 +112,39 @@ func (e *Engine) Discover(ctx context.Context, in discovery.Input, emit discover
 }
 
 // resolve returns nil if ctx ended first, leaving the host unresolved.
-func (e *Engine) resolve(ctx context.Context, host string) *discovery.DNSInfo {
+func (e *Engine) resolve(ctx context.Context, host, domain string) *discovery.DNSInfo {
+	info, ci, err := e.opts.Cache.Do(ctx, host, func(ctx context.Context) (cache.Loaded[discovery.DNSInfo], error) {
+		v, cacheable := e.lookup(ctx, host)
+		if v == nil {
+			return cache.Loaded[discovery.DNSInfo]{}, errStopped
+		}
+		l := cache.Loaded[discovery.DNSInfo]{Value: *v, Group: domain,
+			Cost: 96 + cache.StringCost(host, v.CNAME, v.Error) + cache.StringCost(v.Addresses...)}
+		switch {
+		case v.Resolved:
+			l.TTL = e.opts.TTL
+		case cacheable:
+			l.TTL = min(e.opts.NegativeTTL, e.opts.TTL)
+		}
+		return l, nil
+	})
+	if err != nil {
+		return nil
+	}
+	if ci.Hit || ci.Shared {
+		at := ci.CreatedAt
+		info.CachedAt = &at
+	}
+	return &info
+}
+
+// lookup resolves host, taking a shared pool slot. It returns nil if ctx
+// ended first; cacheable is false for transient failures.
+func (e *Engine) lookup(ctx context.Context, host string) (info *discovery.DNSInfo, cacheable bool) {
 	// Waiting for a shared slot does not count against the lookup timeout.
 	release, _, err := e.opts.Pool.Acquire(ctx)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	defer release()
 
@@ -101,15 +155,17 @@ func (e *Engine) resolve(ctx context.Context, host string) *discovery.DNSInfo {
 	addrs, err := e.resolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		if parent.Err() != nil {
-			return nil // the scan stopped; this is not a DNS answer
+			return nil, false // the scan stopped; this is not a DNS answer
 		}
-		return &discovery.DNSInfo{Resolved: false, Error: describe(err)}
+		var dnsErr *net.DNSError
+		notFound := errors.As(err, &dnsErr) && dnsErr.IsNotFound
+		return &discovery.DNSInfo{Resolved: false, Error: describe(err)}, notFound
 	}
 	if len(addrs) == 0 {
-		return &discovery.DNSInfo{Resolved: false, Error: "no A or AAAA records"}
+		return &discovery.DNSInfo{Resolved: false, Error: "no A or AAAA records"}, true
 	}
 
-	info := &discovery.DNSInfo{Resolved: true, NonPublic: true}
+	info = &discovery.DNSInfo{Resolved: true, NonPublic: true}
 	seen := map[string]bool{}
 	for _, a := range addrs {
 		ip, ok := netip.AddrFromSlice(a.IP)
@@ -134,7 +190,7 @@ func (e *Engine) resolve(ctx context.Context, host string) *discovery.DNSInfo {
 			info.CNAME = cname
 		}
 	}
-	return info
+	return info, true
 }
 
 func describe(err error) string {

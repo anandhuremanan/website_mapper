@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"websitemapper/internal/api"
+	"websitemapper/internal/cache"
 	"websitemapper/internal/config"
 	"websitemapper/internal/discovery"
 	"websitemapper/internal/discovery/dnsresolve"
@@ -58,7 +59,8 @@ func run() error {
 		dns:  resource.NewPool("dns", cfg.GlobalDNSConcurrency),
 		ct:   resource.NewPool("certificate-transparency", ctConcurrency),
 	}
-	svc := scan.NewService(store.NewMemory(store.Limits{MaxScans: cfg.MaxStoredScans, MaxURLs: cfg.MaxStoredResultURLs}), pipeline(cfg.Scan, pools, log), scan.Options{
+	caches := newCaches(cfg.Cache)
+	svc := scan.NewService(store.NewMemory(store.Limits{MaxScans: cfg.MaxStoredScans, MaxURLs: cfg.MaxStoredResultURLs}), pipeline(cfg.Scan, pools, caches, log), scan.Options{
 		MaxRunning:  cfg.MaxConcurrentScans,
 		QueueSize:   cfg.QueueSize,
 		ScanTimeout: cfg.Scan.Timeout,
@@ -68,7 +70,8 @@ func run() error {
 			MaxURLsPerHost: cfg.Scan.MaxRecordedURLsPerHost,
 			MaxURLs:        cfg.Scan.MaxRecordedURLs,
 		},
-		Pools: []*resource.Pool{pools.http, pools.dns, pools.ct},
+		Pools:  []*resource.Pool{pools.http, pools.dns, pools.ct},
+		Caches: caches.list(),
 	}, log)
 	svc.Start(context.Background())
 	log.Info("scan scheduler ready", "event", "scheduler_started", "max_concurrent_scans", cfg.MaxConcurrentScans,
@@ -117,6 +120,40 @@ func run() error {
 
 type sharedPools struct{ http, dns, ct *resource.Pool }
 
+// sharedCaches hold reusable discovery data for all scans. They sit inside
+// the engines, in front of the network work, so a hit takes no pool slot
+// and no request budget; a miss uses the pools like any other request.
+type sharedCaches struct {
+	cert  *subdomains.Cache
+	dns   *dnsresolve.Cache
+	probe *httpprobe.Cache
+	page  *htmlcrawl.Cache
+	ttl   config.CacheConfig
+}
+
+// newCaches splits the memory budget between the layers. Pages dominate
+// (each holds its outgoing references); certificate answers, DNS answers
+// and probe results are small. A zero budget disables caching (nil caches
+// always load).
+func newCaches(cfg config.CacheConfig) sharedCaches {
+	c := sharedCaches{ttl: cfg}
+	if cfg.MaxBytes <= 0 {
+		return c
+	}
+	c.page = htmlcrawl.NewCache(cfg.MaxBytes * 70 / 100)
+	c.cert = subdomains.NewCache(cfg.MaxBytes * 10 / 100)
+	c.dns = dnsresolve.NewCache(cfg.MaxBytes * 10 / 100)
+	c.probe = httpprobe.NewCache(cfg.MaxBytes * 10 / 100)
+	return c
+}
+
+func (c sharedCaches) list() []interface{ Stats() cache.Stats } {
+	if c.page == nil {
+		return nil
+	}
+	return []interface{ Stats() cache.Stats }{c.cert, c.dns, c.probe, c.page}
+}
+
 // pipeline defines the scan's stages, in order:
 //
 //  1. passive discovery of hostnames (Certificate Transparency)
@@ -132,7 +169,7 @@ type sharedPools struct{ http, dns, ct *resource.Pool }
 // Every engine shares one HTTP client (and so one connection pool) and the
 // server-wide resource pools; per-scan concurrency settings only bound how
 // much of that shared capacity one scan can ask for at once.
-func pipeline(cfg config.ScanConfig, pools sharedPools, log *slog.Logger) []scan.Stage {
+func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log *slog.Logger) []scan.Stage {
 	client := fetch.New(fetch.Options{
 		Timeout:           cfg.RequestTimeout,
 		MaxBodyBytes:      cfg.MaxBodyBytes,
@@ -150,11 +187,16 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, log *slog.Logger) []scan
 		Concurrency: 2 * cfg.HostConcurrency,
 		Timeout:     cfg.DNSTimeout,
 		Pool:        pools.dns,
+		Cache:       caches.dns,
+		TTL:         caches.ttl.DNSTTL,
+		NegativeTTL: time.Minute,
 	})
 	probe := httpprobe.New(client, httpprobe.Options{
 		MaxHosts:     cfg.MaxProbeHosts,
 		Concurrency:  cfg.HostConcurrency,
 		AllowPrivate: cfg.AllowPrivateNetworks,
+		Cache:        caches.probe,
+		TTL:          caches.ttl.ProbeTTL,
 	})
 	crawler := htmlcrawl.New(client, htmlcrawl.Options{
 		MaxHosts:        cfg.MaxHosts,
@@ -162,6 +204,8 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, log *slog.Logger) []scan
 		MaxDepth:        cfg.MaxDepth,
 		Concurrency:     cfg.Concurrency,
 		HostConcurrency: cfg.HostConcurrency,
+		Cache:           caches.page,
+		CacheTTL:        caches.ttl.PageTTL,
 	}, log)
 
 	var stages []scan.Stage
@@ -181,7 +225,9 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, log *slog.Logger) []scan
 		// services fail often, and results are merged either way.
 		sources := []subdomains.Source{subdomains.NewCRTSh(ctClient), subdomains.NewCertSpotter(ctClient)}
 		stages = append(stages, scan.Stage{ID: "subdomains", Label: "Discovering subdomains",
-			Engines: []discovery.Engine{subdomains.New(sources, cfg.CTTimeout, log)}})
+			Engines: []discovery.Engine{subdomains.New(sources, cfg.CTTimeout, log).WithCache(subdomains.CacheOptions{
+				Cache: caches.cert, TTL: caches.ttl.CertTTL, RateLimitTTL: 15 * time.Minute, FailureTTL: 5 * time.Minute,
+			})}})
 	}
 	return append(stages,
 		scan.Stage{ID: "resolve", Label: "Resolving discovered hosts", Engines: []discovery.Engine{dns}},

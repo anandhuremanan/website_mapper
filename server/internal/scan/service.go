@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"websitemapper/internal/cache"
 	"websitemapper/internal/discovery"
 	"websitemapper/internal/resource"
 	"websitemapper/internal/results"
@@ -24,6 +25,12 @@ var (
 	ErrShuttingDown = errors.New("server is shutting down")
 	// ErrFinished is returned when cancelling a scan that already ended.
 	ErrFinished = errors.New("scan has already finished")
+	// ErrShared is returned when cancelling a scan shared by several
+	// requesters without saying which subscription to release.
+	ErrShared = errors.New("this scan is shared with other requesters; cancel it with your subscriptionId")
+	// ErrNotSubscribed is returned for an unknown or already released
+	// subscription.
+	ErrNotSubscribed = errors.New("no such active subscription for this scan")
 )
 
 // Cancellation causes, recorded on each scan's context so the scan can tell
@@ -72,6 +79,8 @@ type Options struct {
 	Limits results.Limits
 	// Pools are the shared resource pools, reported by Stats.
 	Pools []*resource.Pool
+	// Caches are the shared discovery caches, reported by Stats.
+	Caches []interface{ Stats() cache.Stats }
 }
 
 // Service creates scans and runs them in the background.
@@ -90,7 +99,9 @@ type Service struct {
 	mu      sync.Mutex
 	base    context.Context // set by Start; parent of every scan context
 	queue   []*job          // waiting scans, FIFO
-	jobs    map[string]*job // queued and running scans
+	jobs    map[string]*job // queued and running scans, by scan ID
+	active  map[string]*job // queued and running scans, by equivalence key
+	joined  int64           // requests that joined an existing scan
 	running int
 	closed  bool
 	stopped chan struct{} // closed when the service stops accepting scans
@@ -99,9 +110,25 @@ type Service struct {
 
 type job struct {
 	id     string
+	key    string
 	target discovery.Target
 	// cancel is set once the job runs.
 	cancel context.CancelCauseFunc
+	// subscribers are the active subscriptions (requesters) of this scan.
+	subscribers map[string]bool
+}
+
+// optionsVersion identifies the scan options that affect discovery. Scans
+// take no per-request options yet, so it is constant; when they do, the
+// options must become part of the equivalence key.
+const optionsVersion = "v1"
+
+// scanKey defines equivalent scans: the same normalized start URL (scheme,
+// host and path, which decide where crawling starts) with the same options.
+// "example.com" and "https://example.com/" are equivalent;
+// "www.example.com" or "http://example.com" are not.
+func scanKey(t discovery.Target) string {
+	return t.StartURL + "|" + optionsVersion
 }
 
 // NewService creates a Service that runs the given stages in order.
@@ -120,6 +147,7 @@ func NewService(repo Repository, stages []Stage, opts Options, log *slog.Logger)
 		opts:    opts,
 		log:     log,
 		jobs:    make(map[string]*job),
+		active:  make(map[string]*job),
 		stopped: make(chan struct{}),
 	}
 }
@@ -174,6 +202,7 @@ func (s *Service) stop() {
 	close(s.stopped)
 	for _, j := range s.queue {
 		delete(s.jobs, j.id)
+		s.forgetLocked(j)
 		s.markCancelledLocked(j.id, StopShutdown, "the server shut down before the scan started")
 	}
 	s.queue = nil
@@ -185,8 +214,10 @@ func (s *Service) stop() {
 	s.log.Info("scan service stopping", "event", "service_stopping", "running", s.running)
 }
 
-// Create validates the target, stores a queued scan and enqueues it. It
-// returns immediately; the scan runs when capacity is available.
+// Create validates the target and returns immediately. If an equivalent
+// scan is already queued or running, the request joins it (same scan ID, a
+// new subscription) instead of starting another. Otherwise a new scan is
+// queued and runs when capacity is available.
 func (s *Service) Create(ctx context.Context, input string) (Scan, error) {
 	target, err := discovery.ParseTarget(input)
 	if err != nil {
@@ -197,10 +228,30 @@ func (s *Service) Create(ctx context.Context, input string) (Scan, error) {
 		return Scan{}, err
 	}
 
+	token, err := newID()
+	if err != nil {
+		return Scan{}, err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return Scan{}, ErrShuttingDown
+	}
+	key := scanKey(target)
+	if j, ok := s.active[key]; ok {
+		// Join: no new job, no queue slot, no worker.
+		j.subscribers[token] = true
+		s.joined++
+		sc, err := s.viewLocked(ctx, j.id)
+		if err != nil {
+			delete(j.subscribers, token)
+			return Scan{}, err
+		}
+		sc.SubscriptionID, sc.Coalesced = token, true
+		s.log.Info("scan request joined an equivalent scan", "event", "scan_coalesced", "scan_id", j.id,
+			"target", target.StartURL, "subscribers", len(j.subscribers))
+		return sc, nil
 	}
 	if len(s.queue) >= s.opts.QueueSize {
 		return Scan{}, ErrQueueFull
@@ -220,8 +271,9 @@ func (s *Service) Create(ctx context.Context, input string) (Scan, error) {
 	if err := s.repo.Create(ctx, sc); err != nil {
 		return Scan{}, err
 	}
-	j := &job{id: id, target: target}
+	j := &job{id: id, key: key, target: target, subscribers: map[string]bool{token: true}}
 	s.jobs[id] = j
+	s.active[key] = j
 	s.queue = append(s.queue, j)
 	sc.QueuePosition = len(s.queue)
 	s.log.Info("scan queued", "event", "scan_queued", "scan_id", id, "target", target.StartURL,
@@ -230,6 +282,7 @@ func (s *Service) Create(ctx context.Context, input string) (Scan, error) {
 	if j.cancel != nil { // capacity was free: it started right away
 		sc.Status, sc.Phase, sc.QueuePosition = StatusRunning, PhaseSubdomains, 0
 	}
+	sc.SubscriptionID, sc.Subscribers = token, 1
 	return sc, nil
 }
 
@@ -260,18 +313,26 @@ func (s *Service) dispatchLocked() {
 			s.mu.Lock()
 			s.running--
 			delete(s.jobs, j.id)
+			s.forgetLocked(j)
 			s.dispatchLocked()
 			s.mu.Unlock()
 		}()
 	}
 }
 
-// Cancel stops a queued or running scan. A queued scan is removed from the
-// queue immediately. A running scan is interrupted: its in-flight requests
-// and lookups are cancelled, it releases its shared resources, and it saves
-// the partial results collected so far; its status becomes "cancelled"
-// shortly after Cancel returns.
-func (s *Service) Cancel(ctx context.Context, id string) (Scan, error) {
+// Cancel releases a subscription to a queued or running scan.
+//
+// A scan can be shared by several requesters (see Create). subscription
+// names the requester's subscription; releasing it detaches that requester
+// only, and the scan continues while other subscriptions remain. When the
+// last subscription is released the scan itself is cancelled, since nobody
+// is waiting for it any more: a queued scan is removed from the queue
+// immediately; a running scan is interrupted, releases its shared
+// resources, and saves the partial results collected so far.
+//
+// An empty subscription cancels an unshared scan (the behaviour before
+// scans could be shared) and returns ErrShared if others share it.
+func (s *Service) Cancel(ctx context.Context, id, subscription string) (Scan, error) {
 	s.mu.Lock()
 	j, ok := s.jobs[id]
 	if !ok {
@@ -282,6 +343,26 @@ func (s *Service) Cancel(ctx context.Context, id string) (Scan, error) {
 		}
 		return sc, ErrFinished
 	}
+	switch {
+	case subscription == "" && len(j.subscribers) > 1:
+		s.mu.Unlock()
+		return Scan{}, ErrShared
+	case subscription == "":
+		clear(j.subscribers)
+	case !j.subscribers[subscription]:
+		s.mu.Unlock()
+		return Scan{}, ErrNotSubscribed
+	default:
+		delete(j.subscribers, subscription)
+	}
+	if n := len(j.subscribers); n > 0 {
+		sc, err := s.viewLocked(ctx, id)
+		s.mu.Unlock()
+		sc.Detached = true
+		s.log.Info("subscriber left a shared scan", "event", "scan_unsubscribed", "scan_id", id, "subscribers", n)
+		return sc, err
+	}
+
 	if j.cancel == nil {
 		for i, q := range s.queue {
 			if q == j {
@@ -290,6 +371,7 @@ func (s *Service) Cancel(ctx context.Context, id string) (Scan, error) {
 			}
 		}
 		delete(s.jobs, id)
+		s.forgetLocked(j)
 		s.markCancelledLocked(id, StopCancel, "")
 		s.mu.Unlock()
 		s.log.Info("scan cancelled while queued", "event", "scan_cancelled", "scan_id", id)
@@ -299,6 +381,13 @@ func (s *Service) Cancel(ctx context.Context, id string) (Scan, error) {
 	s.mu.Unlock()
 	s.log.Info("scan cancellation requested", "event", "scan_cancel_requested", "scan_id", id)
 	return s.repo.Get(ctx, id)
+}
+
+// forgetLocked stops new requests from joining j. Caller holds mu.
+func (s *Service) forgetLocked(j *job) {
+	if s.active[j.key] == j {
+		delete(s.active, j.key)
+	}
 }
 
 // markCancelledLocked records a scan that was cancelled before it ran.
@@ -318,18 +407,30 @@ func (s *Service) markCancelledLocked(id, reason, msg string) {
 	_ = s.repo.Update(context.Background(), sc)
 }
 
-// Get returns a scan's current status, with its queue position if queued.
+// Get returns a scan's current status, with its queue position if queued
+// and its subscriber count while it is active.
 func (s *Service) Get(ctx context.Context, id string) (Scan, error) {
-	sc, err := s.repo.Get(ctx, id)
-	if err != nil || sc.Status != StatusQueued {
-		return sc, err
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i, j := range s.queue {
-		if j.id == id {
-			sc.QueuePosition = i + 1
-			break
+	return s.viewLocked(ctx, id)
+}
+
+// viewLocked reads a scan and adds the scheduler's live details. Caller
+// holds mu.
+func (s *Service) viewLocked(ctx context.Context, id string) (Scan, error) {
+	sc, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return sc, err
+	}
+	if j, ok := s.jobs[id]; ok && !sc.Status.Finished() {
+		sc.Subscribers = len(j.subscribers)
+		if sc.Status == StatusQueued {
+			for i, q := range s.queue {
+				if q == j {
+					sc.QueuePosition = i + 1
+					break
+				}
+			}
 		}
 	}
 	return sc, nil
@@ -347,15 +448,23 @@ type Stats struct {
 	MaxRunning int              `json:"maxRunning"`
 	QueueSize  int              `json:"queueSize"`
 	Pools      []resource.Stats `json:"pools"`
+	// CoalescedRequests counts scan requests that joined an equivalent
+	// active scan instead of starting a new one.
+	CoalescedRequests int64         `json:"coalescedRequests"`
+	Caches            []cache.Stats `json:"caches"`
 }
 
 // Stats returns a snapshot of the scheduler and resource pools.
 func (s *Service) Stats() Stats {
 	s.mu.Lock()
-	st := Stats{Running: s.running, Queued: len(s.queue), MaxRunning: s.opts.MaxRunning, QueueSize: s.opts.QueueSize}
+	st := Stats{Running: s.running, Queued: len(s.queue), MaxRunning: s.opts.MaxRunning, QueueSize: s.opts.QueueSize,
+		CoalescedRequests: s.joined, Caches: []cache.Stats{}}
 	s.mu.Unlock()
 	for _, p := range s.opts.Pools {
 		st.Pools = append(st.Pools, p.Stats())
+	}
+	for _, c := range s.opts.Caches {
+		st.Caches = append(st.Caches, c.Stats())
 	}
 	return st
 }

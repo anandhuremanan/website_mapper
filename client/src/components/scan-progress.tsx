@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 import { cancelScan } from "@/lib/api";
 import type { Phase, Scan, StepStatus } from "@/lib/types";
@@ -46,12 +47,14 @@ export function ScanProgress({ scan }: { scan: Scan }) {
   const active = scan.status === "queued" || scan.status === "running";
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
+  const [detached, setDetached] = useState(false);
 
   async function onCancel() {
     setCancelling(true);
     setCancelError(null);
     try {
-      await cancelScan(scan.id);
+      const res = await cancelScan(scan.id);
+      if (res.detached) setDetached(true);
     } catch (err) {
       setCancelError(err instanceof Error ? err.message : String(err));
       setCancelling(false);
@@ -63,7 +66,7 @@ export function ScanProgress({ scan }: { scan: Scan }) {
       <div>
         <div className="flex items-baseline justify-between gap-4">
           <h1 className="font-mono text-2xl font-semibold tracking-tight">{scan.domain}</h1>
-          {active && (
+          {active && !detached && (
             <button
               type="button"
               onClick={onCancel}
@@ -86,6 +89,20 @@ export function ScanProgress({ scan }: { scan: Scan }) {
           </div>
         )}
         {scan.error && <p className="mt-2 text-sm text-danger">{scan.error}</p>}
+        {active && !detached && (scan.subscribers ?? 1) > 1 && (
+          <p className="mt-2 text-sm text-muted">
+            Someone else requested the same scan, so you are sharing one scan instead of starting
+            another.
+          </p>
+        )}
+        {detached && (
+          <p className="mt-2 text-sm text-muted">
+            You left this scan. It keeps running because others are waiting for it.{" "}
+            <Link href="/" className="text-accent hover:underline">
+              Start a new scan
+            </Link>
+          </p>
+        )}
         {cancelError && <p className="mt-2 text-sm text-danger">{cancelError}</p>}
       </div>
 

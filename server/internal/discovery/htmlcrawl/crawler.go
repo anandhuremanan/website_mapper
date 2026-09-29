@@ -4,13 +4,12 @@ package htmlcrawl
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/url"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"websitemapper/internal/classify"
 	"websitemapper/internal/discovery"
@@ -40,6 +39,10 @@ type Options struct {
 	Concurrency int
 	// HostConcurrency is the number of hosts crawled in parallel.
 	HostConcurrency int
+	// Cache, when set, reuses fetched-page metadata across scans.
+	Cache *Cache
+	// CacheTTL is how long a fetched page's metadata is reused.
+	CacheTTL time.Duration
 }
 
 // Crawler is the HTML discovery engine.
@@ -192,7 +195,7 @@ func (c *Crawler) crawlHost(ctx context.Context, t discovery.Target, h discovery
 		}
 	}
 	c.log.Debug("host crawled", "host", h.Name, "requests", run.fetched.Load())
-	return &discovery.CrawlInfo{Requests: int(run.fetched.Load()), LimitReached: run.exhausted.Load()}
+	return &discovery.CrawlInfo{Requests: int(run.fetched.Load()), FromCache: int(run.cached.Load()), LimitReached: run.exhausted.Load()}
 }
 
 // crawl is the state of one host's crawl.
@@ -206,7 +209,8 @@ type crawl struct {
 	seen map[string]bool
 
 	budget    int64
-	fetched   atomic.Int64
+	fetched   atomic.Int64 // requests made
+	cached    atomic.Int64 // pages reused from the cache
 	exhausted atomic.Bool
 	// stopped is set when the scan's request budget runs out.
 	stopped atomic.Bool
@@ -271,74 +275,86 @@ func (r *crawl) level(ctx context.Context, items []item, follow bool) []item {
 }
 
 // visit fetches one page (following in-scope redirects) and returns the
-// crawlable links it contains.
+// crawlable links it contains. Pages may come from the shared page cache;
+// they count against the host's page budget either way, so a cached crawl
+// covers the same pages, but cached pages make no request.
 func (r *crawl) visit(ctx context.Context, it item) []item {
 	cur, source, hint, from := it.url, it.source, it.hint, it.from
 	for hop := 0; hop <= maxRedirects; hop++ {
 		if !r.takeBudget() {
 			return nil
 		}
-		r.fetched.Add(1)
-		resp, err := r.fetcher.Get(ctx, cur)
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return nil
-			}
-			if errors.Is(err, resource.ErrBudgetExhausted) {
-				r.fetched.Add(-1)
-				r.exhausted.Store(true)
-				r.stopped.Store(true)
-				return nil
-			}
-			r.log.Debug("fetch failed", "url", cur, "error", err)
-			r.emit(discovery.Finding{URL: cur, Source: source, Hint: hint, From: from, Error: err.Error()})
+		p := r.getPage(ctx, cur)
+		switch {
+		case p.budgetStop:
+			r.exhausted.Store(true)
+			r.stopped.Store(true)
+			return nil
+		case ctx.Err() != nil:
+			return nil
+		case p.cachedAt.IsZero():
+			r.fetched.Add(1)
+		default:
+			r.cached.Add(1)
+		}
+		if p.Err != "" {
+			r.log.Debug("fetch failed", "url", cur, "error", p.Err)
+			r.emit(discovery.Finding{URL: cur, Source: source, Hint: hint, From: from, Error: p.Err, CachedAt: p.cachedAt})
 			return nil
 		}
 
-		f := discovery.Finding{URL: cur, Source: source, Hint: hint, From: from, Response: metadata(resp)}
-		if resp.IsRedirect() {
-			f.Response.Redirect = resp.Location
+		// A page from the cache was not contacted by this scan, so neither
+		// the page nor its host counts as newly observed.
+		f := discovery.Finding{URL: cur, Source: source, Hint: hint, From: from, Response: p.response(), CachedAt: p.cachedAt}
+		if p.Status >= 300 && p.Status < 400 && p.Location != "" {
+			f.Response.Redirect = p.Location
 			r.emit(f)
-			r.emit(discovery.Finding{URL: resp.Location, Source: discovery.SourceRedirect, Hint: discovery.HintRedirect, From: cur})
+			r.emit(discovery.Finding{URL: p.Location, Source: discovery.SourceRedirect, Hint: discovery.HintRedirect, From: cur, CachedAt: p.cachedAt})
 			// Redirects to other hosts are recorded (registering the host)
 			// but followed only within this host's own crawl.
-			if discovery.HostOf(resp.Location) != r.host {
+			if discovery.HostOf(p.Location) != r.host {
 				return nil
 			}
 			// A redirect to the same canonical URL (e.g. adding a trailing
 			// slash) is followed even though that URL is already "seen".
-			same := sameKey(cur, resp.Location)
-			if !same && !r.markSeen(resp.Location) {
+			same := sameKey(cur, p.Location)
+			if !same && !r.markSeen(p.Location) {
 				return nil
 			}
-			cur, source, hint, from = resp.Location, discovery.SourceRedirect, discovery.HintRedirect, cur
+			cur, source, hint, from = p.Location, discovery.SourceRedirect, discovery.HintRedirect, cur
 			continue
 		}
-
-		var links []item
-		if isHTML(resp) {
-			pageURL, _ := url.Parse(cur)
-			p := extract(pageURL, resp.Body)
-			f.Response.Title = p.Title
-			f.Response.Generator = p.Generator
-			links = r.references(cur, p.Refs)
-		}
+		links := r.references(cur, p.references(), p.cachedAt)
 		r.emit(f)
 		return links
 	}
 	return nil
 }
 
+// response is the metadata reported for a page.
+func (p pageResult) response() *discovery.Response {
+	resp := &discovery.Response{
+		Status: p.Status, ContentType: p.ContentType, Server: p.Server, PoweredBy: p.PoweredBy,
+		Title: p.Title, Generator: p.Generator,
+	}
+	if !p.cachedAt.IsZero() {
+		at := p.cachedAt
+		resp.CachedAt = &at
+	}
+	return resp
+}
+
 // references emits every in-scope reference and returns those on this host
 // worth crawling. References to other in-scope hosts register those hosts.
-func (r *crawl) references(pageURL string, refs []reference) []item {
+// cachedAt is set when the page came from the cache.
+func (r *crawl) references(pageURL string, refs []reference, cachedAt time.Time) []item {
 	var links []item
 	for _, ref := range refs {
 		u := ref.URL.String()
 		if !r.target.InScope(ref.URL.Hostname()) {
 			continue
 		}
-		r.emit(discovery.Finding{URL: u, Source: discovery.SourceHTML, Hint: ref.Hint, Method: ref.Method, From: pageURL})
+		r.emit(discovery.Finding{URL: u, Source: discovery.SourceHTML, Hint: ref.Hint, Method: ref.Method, From: pageURL, CachedAt: cachedAt})
 		if ref.URL.Hostname() == r.host && crawlable(ref) && r.markSeen(u) {
 			links = append(links, item{url: u, source: discovery.SourceHTML, hint: ref.Hint, from: pageURL})
 		}
@@ -366,13 +382,4 @@ func sameKey(a, b string) bool {
 func isHTML(resp *fetch.Response) bool {
 	return resp.StatusCode >= 200 && resp.StatusCode < 300 &&
 		(resp.ContentType == "text/html" || resp.ContentType == "application/xhtml+xml")
-}
-
-func metadata(resp *fetch.Response) *discovery.Response {
-	return &discovery.Response{
-		Status:      resp.StatusCode,
-		ContentType: resp.ContentType,
-		Server:      strings.TrimSpace(resp.Header.Get("Server")),
-		PoweredBy:   strings.TrimSpace(resp.Header.Get("X-Powered-By")),
-	}
 }

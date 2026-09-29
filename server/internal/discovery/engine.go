@@ -12,7 +12,10 @@
 //   - URLs: routes and resources, each belonging to one host
 package discovery
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Source identifies how a URL or host was discovered. Sources are shown to
 // users as provenance, so every discovery carries one.
@@ -75,6 +78,11 @@ type Finding struct {
 	DNS   *DNSInfo
 	HTTP  *HTTPInfo
 	Crawl *CrawlInfo
+
+	// CachedAt is set when the discovery was reused from the shared cache:
+	// it is when the original observation was made. Zero means it was made
+	// by this scan.
+	CachedAt time.Time
 }
 
 // Response is HTTP metadata observed while fetching a URL.
@@ -87,6 +95,9 @@ type Response struct {
 	PoweredBy   string
 	// Generator is the content of <meta name="generator">, if present.
 	Generator string
+	// CachedAt is set when this response was reused from the page cache
+	// instead of being requested again; it is when it was fetched.
+	CachedAt *time.Time
 }
 
 // DNSInfo is the result of resolving a host. Values are immutable once emitted.
@@ -100,6 +111,9 @@ type DNSInfo struct {
 	Error     string `json:"error,omitempty"`
 	// Skipped explains why resolution was not attempted.
 	Skipped string `json:"skipped,omitempty"`
+	// CachedAt is set when the answer came from the DNS cache; it is when
+	// the lookup was made.
+	CachedAt *time.Time `json:"cachedAt,omitempty"`
 }
 
 // HTTPInfo is the result of probing a host's root URL. Values are immutable
@@ -120,6 +134,9 @@ type HTTPInfo struct {
 	Error       string `json:"error,omitempty"`
 	// Skipped explains why the host was not probed.
 	Skipped string `json:"skipped,omitempty"`
+	// CachedAt is set when the result came from the probe cache; it is when
+	// the host was probed.
+	CachedAt *time.Time `json:"cachedAt,omitempty"`
 }
 
 // CrawlInfo summarizes the crawl of one host. Values are immutable once emitted.
@@ -127,6 +144,9 @@ type CrawlInfo struct {
 	Requests int `json:"requests"`
 	// LimitReached is true when the per-host request budget ran out.
 	LimitReached bool `json:"limitReached,omitempty"`
+	// FromCache counts pages reused from the page cache instead of being
+	// requested (not included in Requests).
+	FromCache int `json:"fromCache,omitempty"`
 	// Skipped explains why the host was not crawled.
 	Skipped string `json:"skipped,omitempty"`
 }

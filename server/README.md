@@ -43,6 +43,7 @@ internal/api          REST handlers (net/http ServeMux)
 internal/scan         scan model, scheduler (queue, cancellation, shutdown),
                       stage pipeline, Repository interface
 internal/resource     shared resource pools with fair sharing; per-scan accounts
+internal/cache        bounded TTL cache with single-flight loading (shared discovery cache)
 internal/store        in-memory Repository (swap for PostgreSQL later)
 internal/discovery    Engine interface, Finding, State, Target/scope
   subdomains          passive hostname discovery; Source providers: crt.sh, Cert Spotter
@@ -180,6 +181,97 @@ downloaded.
 
 `GET /api/health` shows the scheduler and each pool's live use.
 
+### Shared discovery cache
+
+Scans reuse discovery work done by earlier or concurrent scans. The cache
+holds reusable *pieces* of discovery, never whole scan results. Each scan
+still builds its own result, combining cached and newly observed data.
+
+| Layer | Key | Holds | TTL (default) |
+| --- | --- | --- | --- |
+| certificate | provider + domain | in-scope hostnames from one CT provider, or its failure | `CACHE_CERT_TTL` (6 h); rate limited 15 min; other failures 5 min |
+| dns | hostname | addresses, CNAME, non-public flag, or NXDOMAIN | `CACHE_DNS_TTL` (5 min); NXDOMAIN 1 min; timeouts never |
+| probe | hostname + target scope | reachable?, status, redirect, final URL, title, server | `CACHE_PROBE_TTL` (2 min), reachable or not |
+| page | URL | status, content type, title, redirect, and every link/asset reference | `CACHE_PAGE_TTL` (15 min) |
+
+- **What is never cached:** response bodies, asset contents, and outcomes
+  that belong to one scan rather than to the data (cancellation, a spent
+  request budget). Transient network failures of pages and DNS timeouts are
+  never cached either.
+- **Why these TTLs:** certificates change slowly and Cert Spotter allows
+  about 10 unauthenticated requests per hour, so 6 hours. DNS records
+  commonly use a TTL of about 5 minutes; Go's resolver does not expose the
+  real TTL, so a bounded one is used instead. Reachability changes fastest,
+  so probes get the shortest TTL.
+- **DNS caching is safe for SSRF protection:** the cache only affects what a
+  scan reports. Every HTTP connection still resolves the name again and
+  checks the actual address it connects to.
+- **Cache hits skip the pools.** Each layer wraps exactly the step that costs
+  network: a certificate hit contacts no provider, and a DNS, probe or page
+  hit takes no pool slot and uses none of the scan's request budget. A miss
+  goes through the Phase 1 pools like any request. There is no second
+  concurrency system.
+- **Single-flight.** When several scans miss the same key at once (for
+  example two scans of the same domain started together), one of them does
+  the lookup and the others wait for its answer. If that load fails for a
+  reason specific to its scan, the waiters load for themselves.
+- **Crawling from the cache covers the same pages.** Cached pages count
+  against the host's page budget exactly as fetched pages do, so a warm crawl
+  maps the same URLs; `crawl.fromCache` counts them separately from
+  `crawl.requests`.
+- **Provenance.** Observations reused from the cache carry `cachedAt` (when
+  they were actually made): on DNS and probe results, on verified URLs, and
+  as `fromCache` on hosts known only from cached data. `counts.cache`
+  totals what was reused; everything else was newly observed.
+
+**Memory.** `CACHE_MAX_MB` (64 MB) bounds the whole cache: 70% pages, 10%
+each for certificates, DNS and probes. Entries are charged their estimated
+size, including the cache's own per-entry bookkeeping; measured real heap is
+0.84-0.97x the estimate. Within a layer, the least recently used entries are
+evicted first. One domain may use at most a quarter of a layer and evicts its
+own oldest entries beyond that, so one enormous domain cannot push the others
+out. A single entry larger than a quarter of its layer is not stored.
+`CACHE_MAX_MB=0` disables caching.
+
+### Scan coalescing
+
+An equivalent scan is one with the same normalized start URL and options
+(scans take no per-request options yet). `example.com` and
+`https://example.com/` are equivalent; `www.example.com`,
+`http://example.com` or `example.com/docs` are not, because they start
+crawling elsewhere.
+
+- A request for a scan equivalent to one that is **queued or running** joins
+  it: it gets the same scan ID and its own `subscriptionId`, and adds no job,
+  no worker and no queue slot (it works even when the queue is full). All
+  subscribers read the same status and results. Finished scans are never
+  joined; a new request starts a new scan, which reuses the cache.
+- **Cancellation is per subscriber.** `POST /api/scans/{id}/cancel` with
+  `{"subscriptionId": "..."}` releases that subscription only; the response
+  has `"detached": true` while others remain. When the **last** subscription
+  is released the scan itself is cancelled (removed from the queue, or
+  interrupted with partial results kept), since nobody is waiting for it. A
+  cancel without a subscription works only for an unshared scan and returns
+  `409` for a shared one, so an older client cannot cancel other people's
+  scan. Closing the browser does not release a subscription.
+
+### Memory on a shared server
+
+Website Mapper shares its VPS with other services (FileDrop), so its memory
+is bounded by configuration rather than by what the machine has:
+
+| Part | Bound (defaults) | Approximate memory |
+| --- | --- | --- |
+| discovery cache | `CACHE_MAX_MB=64` | ~64 MB |
+| running scans | `MAX_CONCURRENT_SCANS=3` x `SCAN_MAX_RECORDED_URLS=50000` | up to ~50 MB each |
+| stored results | `MAX_STORED_RESULT_URLS=500000` | up to ~300 MB |
+
+With Go's garbage collector the process can briefly use up to about twice
+its live heap. On a small VPS lower `MAX_STORED_RESULT_URLS` first, since
+stored results are the largest part; setting the Go runtime's
+`GOMEMLIMIT` (for example `GOMEMLIMIT=600MiB`) also makes the collector work
+harder before the process grows.
+
 ### Design decisions (Phase 1 review)
 
 Reviewed and deliberately left as they are:
@@ -281,7 +373,10 @@ All responses are JSON. Errors look like `{"error": "message"}`.
 ```
 
 `peak` is the highest number of slots ever in use at once; it never exceeds
-`capacity`.
+`capacity`. The scheduler also reports `coalescedRequests` and, per cache
+layer, `hits`, `misses`, `coalesced` (misses that waited for another
+caller's lookup), `evictions`, `expired`, `rejected`, `entries` and
+`costBytes` / `maxCostBytes`.
 
 ### `POST /api/scans`
 
@@ -296,6 +391,9 @@ Request:
 Response `202 Accepted` (with a `Location` header) contains the scan status
 object described below. It returns immediately: `"status": "running"` if
 capacity was free, otherwise `"status": "queued"` with a `queuePosition`.
+It also contains `subscriptionId` (keep it to cancel), and
+`"coalesced": true` when the request joined an equivalent scan that was
+already queued or running (see Scan coalescing).
 
 Errors: `400` for an invalid target or body, and `503` with `Retry-After`
 when the queue is full or the server is shutting down.
@@ -345,6 +443,9 @@ Returns the scan status. Poll this every 1–2 seconds while a scan runs.
 ```
 
 - `status`: `queued` | `running` | `completed` | `failed` | `cancelled`
+- `subscribers`: how many requesters share the scan while it is active.
+- `counts.cache`: observations reused from the shared cache (`hosts` known
+  only from cached data, `dns`, `probes`, verified `pages`).
 - `queuePosition`: 1-based, only while `queued`.
 - `phase`: `queued` | `discovering_subdomains` | `resolving_hosts` |
   `probing_hosts` | `crawling_hosts` | `finalizing` | `done`.
@@ -377,11 +478,18 @@ Returns the scan status. Poll this every 1–2 seconds while a scan runs.
 
 ### `POST /api/scans/{id}/cancel`
 
-Cancels a queued or running scan and returns `202` with its status. A queued
-scan is `cancelled` immediately and never runs. A running scan stops within
-moments, releases its share of the server, and saves the results collected
-so far; its status becomes `cancelled` shortly after the response. `409` if
-the scan already finished, `404` if it does not exist.
+Body (optional): `{"subscriptionId": "..."}` from the create response.
+
+Releases the subscription and returns `202` with the scan status. If other
+requesters still share the scan, the response has `"detached": true` and the
+scan continues. Otherwise the scan is cancelled: a queued scan is
+`cancelled` immediately and never runs; a running scan stops within moments,
+releases its share of the server, and saves the results collected so far
+(its status becomes `cancelled` shortly after the response).
+
+`409` if the scan already finished, if it is shared and no `subscriptionId`
+was given, or if the subscription is unknown or already released. `404` if
+the scan does not exist.
 
 ### `GET /api/scans/{id}/results`
 

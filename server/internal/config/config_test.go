@@ -27,6 +27,9 @@ func TestLoadDefaults(t *testing.T) {
 	if !cfg.Scan.CTEnabled || cfg.Scan.MaxHosts != 500 || cfg.Scan.MaxURLs != 500 || cfg.Scan.MaxRequests != 50000 {
 		t.Errorf("host defaults = %+v", cfg.Scan)
 	}
+	if cfg.Cache.MaxBytes != 64<<20 || cfg.Cache.CertTTL != 6*time.Hour || cfg.Cache.ProbeTTL != 2*time.Minute {
+		t.Errorf("cache defaults = %+v", cfg.Cache)
+	}
 	if cfg.MaxConcurrentScans != 3 || cfg.GlobalHTTPConcurrency != 32 || cfg.GlobalDNSConcurrency != 16 || cfg.Scan.Timeout != 30*time.Minute {
 		t.Errorf("resource defaults = %+v", cfg)
 	}

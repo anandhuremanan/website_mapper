@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"websitemapper/internal/classify"
 	"websitemapper/internal/discovery"
@@ -338,6 +339,54 @@ func TestAggregatorIncrementalCountsFollowReclassification(t *testing.T) {
 		t.Errorf("after fetch: %+v", c)
 	}
 	if rc := a.Result().Counts(); rc != c {
+		t.Errorf("result counts %+v != live %+v", rc, c)
+	}
+}
+
+func TestAggregatorCacheProvenance(t *testing.T) {
+	a := newAgg(t)
+	past := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	// cached-only host, host seen both ways, host seen only live.
+	a.Add(discovery.Finding{Host: "old.example.com", Source: discovery.SourceCT, CachedAt: past})
+	a.Add(discovery.Finding{Host: "both.example.com", Source: discovery.SourceCT, CachedAt: past})
+	a.Add(discovery.Finding{URL: "https://both.example.com/x", Source: discovery.SourceHTML, Hint: discovery.HintLink})
+	a.Add(discovery.Finding{Host: "new.example.com", Source: discovery.SourceCT})
+	a.Add(discovery.Finding{Host: "old.example.com", DNS: &discovery.DNSInfo{Resolved: true, CachedAt: &past}})
+	a.Add(discovery.Finding{Host: "old.example.com", HTTP: &discovery.HTTPInfo{Reachable: true, Status: 200, CachedAt: &past}})
+
+	// URL states: an asset only referenced, a failed request, a verified
+	// page from the cache, and a cached response replaced by a live one.
+	a.Add(discovery.Finding{URL: "https://new.example.com/app.js", Source: discovery.SourceHTML, Hint: discovery.HintScript})
+	a.Add(discovery.Finding{URL: "https://new.example.com/down", Source: discovery.SourceHTML, Error: "timeout"})
+	a.Add(discovery.Finding{URL: "https://new.example.com/cached", Source: discovery.SourceHTML,
+		Response: &discovery.Response{Status: 200, ContentType: "text/html", CachedAt: &past}})
+	a.Add(discovery.Finding{URL: "https://new.example.com/both", Source: discovery.SourceHTML,
+		Response: &discovery.Response{Status: 200, ContentType: "text/html", CachedAt: &past}})
+	a.Add(discovery.Finding{URL: "https://new.example.com/both", Source: discovery.SourceHTML,
+		Response: &discovery.Response{Status: 200, ContentType: "text/html", Title: "live"}})
+
+	res := a.Result()
+	if h := findHost(t, res, "old.example.com"); !h.FromCache || h.DNS.CachedAt == nil || h.HTTP.CachedAt == nil {
+		t.Errorf("old = %+v", h)
+	}
+	if findHost(t, res, "both.example.com").FromCache || findHost(t, res, "new.example.com").FromCache {
+		t.Error("hosts seen by this scan must not be marked as from cache")
+	}
+	states := map[string]URLState{}
+	cachedAt := map[string]bool{}
+	for _, u := range findHost(t, res, "new.example.com").URLs {
+		states[u.Path], cachedAt[u.Path] = u.State, u.CachedAt != nil
+	}
+	want := map[string]URLState{"/app.js": URLDiscovered, "/down": URLFetched, "/cached": URLVerified, "/both": URLVerified}
+	if !reflect.DeepEqual(states, want) || !cachedAt["/cached"] || cachedAt["/both"] {
+		t.Errorf("states = %v, cachedAt = %v", states, cachedAt)
+	}
+
+	c := a.Counts()
+	if c.Cache != (CacheCounts{Hosts: 1, DNS: 1, Probes: 1, Pages: 1}) || c.URLsFetched != 2 || c.URLsFailed != 1 {
+		t.Errorf("counts = %+v", c)
+	}
+	if rc := res.Counts(); rc != c {
 		t.Errorf("result counts %+v != live %+v", rc, c)
 	}
 }

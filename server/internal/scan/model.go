@@ -119,6 +119,17 @@ type Scan struct {
 	Phase Phase `json:"phase"`
 	// QueuePosition is the 1-based position while queued.
 	QueuePosition int `json:"queuePosition,omitempty"`
+	// Subscribers is how many requesters currently share this active scan.
+	Subscribers int `json:"subscribers,omitempty"`
+	// SubscriptionID identifies the requester's subscription. It is set
+	// only in create responses; pass it when cancelling a shared scan.
+	SubscriptionID string `json:"subscriptionId,omitempty"`
+	// Coalesced is set in a create response that joined an equivalent scan
+	// already queued or running, instead of starting a new one.
+	Coalesced bool `json:"coalesced,omitempty"`
+	// Detached is set in a cancel response when only the requester's
+	// subscription was released; the scan continues for the others.
+	Detached bool `json:"detached,omitempty"`
 	// Progress is the current phase's progress, when it is measured in hosts.
 	Progress *PhaseProgress `json:"progress,omitempty"`
 	// StopReason is set when the scan ended before finishing its work.
