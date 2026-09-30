@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -16,9 +17,11 @@ import (
 	"websitemapper/internal/cache"
 	"websitemapper/internal/config"
 	"websitemapper/internal/discovery"
+	"websitemapper/internal/discovery/archive"
 	"websitemapper/internal/discovery/dnsresolve"
 	"websitemapper/internal/discovery/htmlcrawl"
 	"websitemapper/internal/discovery/httpprobe"
+	"websitemapper/internal/discovery/sitemap"
 	"websitemapper/internal/discovery/subdomains"
 	"websitemapper/internal/fetch"
 	"websitemapper/internal/resource"
@@ -58,25 +61,34 @@ func run() error {
 		http: resource.NewPool("http", cfg.GlobalHTTPConcurrency),
 		dns:  resource.NewPool("dns", cfg.GlobalDNSConcurrency),
 		ct:   resource.NewPool("certificate-transparency", ctConcurrency),
+		// archive.org asks for moderate use of its index.
+		archive: resource.NewPool("archive", 2),
+		// Every byte any scan downloads, including certificate-log answers.
+		bandwidth: resource.NewBandwidth(cfg.GlobalDownloadBytesPerSec),
 	}
 	caches := newCaches(cfg.Cache)
+	defaultMode, _ := scan.ParseMode(cfg.Scan.DefaultMode, scan.ModeLight)
 	svc := scan.NewService(store.NewMemory(store.Limits{MaxScans: cfg.MaxStoredScans, MaxURLs: cfg.MaxStoredResultURLs}), pipeline(cfg.Scan, pools, caches, log), scan.Options{
-		MaxRunning:  cfg.MaxConcurrentScans,
-		QueueSize:   cfg.QueueSize,
-		ScanTimeout: cfg.Scan.Timeout,
-		MaxRequests: cfg.Scan.MaxRequests,
+		DefaultMode:      defaultMode,
+		MaxRunning:       cfg.MaxConcurrentScans,
+		QueueSize:        cfg.QueueSize,
+		ScanTimeout:      cfg.Scan.Timeout,
+		MaxRequests:      cfg.Scan.MaxRequests,
+		MaxDownloadBytes: cfg.Scan.MaxDownloadBytes,
+		Bandwidth:        pools.bandwidth,
 		Limits: results.Limits{
 			MaxHosts:       cfg.Scan.MaxDiscoveredHosts,
 			MaxURLsPerHost: cfg.Scan.MaxRecordedURLsPerHost,
 			MaxURLs:        cfg.Scan.MaxRecordedURLs,
 		},
-		Pools:  []*resource.Pool{pools.http, pools.dns, pools.ct},
+		Pools:  []*resource.Pool{pools.http, pools.dns, pools.ct, pools.archive},
 		Caches: caches.list(),
 	}, log)
 	svc.Start(context.Background())
 	log.Info("scan scheduler ready", "event", "scheduler_started", "max_concurrent_scans", cfg.MaxConcurrentScans,
 		"queue_size", cfg.QueueSize, "global_http", cfg.GlobalHTTPConcurrency, "global_dns", cfg.GlobalDNSConcurrency,
-		"scan_timeout", cfg.Scan.Timeout)
+		"scan_timeout", cfg.Scan.Timeout, "download_kbps", cfg.GlobalDownloadBytesPerSec>>10,
+		"gomaxprocs", runtime.GOMAXPROCS(0))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -118,32 +130,39 @@ func run() error {
 	return err
 }
 
-type sharedPools struct{ http, dns, ct *resource.Pool }
+type sharedPools struct {
+	http, dns, ct, archive *resource.Pool
+	bandwidth              *resource.Bandwidth
+}
 
 // sharedCaches hold reusable discovery data for all scans. They sit inside
 // the engines, in front of the network work, so a hit takes no pool slot
 // and no request budget; a miss uses the pools like any other request.
 type sharedCaches struct {
-	cert  *subdomains.Cache
-	dns   *dnsresolve.Cache
-	probe *httpprobe.Cache
-	page  *htmlcrawl.Cache
-	ttl   config.CacheConfig
+	cert    *subdomains.Cache
+	archive *archive.Cache
+	dns     *dnsresolve.Cache
+	probe   *httpprobe.Cache
+	sitemap *sitemap.Cache
+	page    *htmlcrawl.Cache
+	ttl     config.CacheConfig
 }
 
 // newCaches splits the memory budget between the layers. Pages dominate
-// (each holds its outgoing references); certificate answers, DNS answers
-// and probe results are small. A zero budget disables caching (nil caches
-// always load).
+// (each holds its outgoing references); archive listings are large but one
+// per domain; certificate answers, DNS answers and probe results are small.
+// A zero budget disables caching (nil caches always load).
 func newCaches(cfg config.CacheConfig) sharedCaches {
 	c := sharedCaches{ttl: cfg}
 	if cfg.MaxBytes <= 0 {
 		return c
 	}
-	c.page = htmlcrawl.NewCache(cfg.MaxBytes * 70 / 100)
-	c.cert = subdomains.NewCache(cfg.MaxBytes * 10 / 100)
+	c.page = htmlcrawl.NewCache(cfg.MaxBytes * 50 / 100)
+	c.archive = archive.NewCache(cfg.MaxBytes * 20 / 100)
+	c.sitemap = sitemap.NewCache(cfg.MaxBytes * 10 / 100)
 	c.dns = dnsresolve.NewCache(cfg.MaxBytes * 10 / 100)
-	c.probe = httpprobe.NewCache(cfg.MaxBytes * 10 / 100)
+	c.probe = httpprobe.NewCache(cfg.MaxBytes * 5 / 100)
+	c.cert = subdomains.NewCache(cfg.MaxBytes * 5 / 100)
 	return c
 }
 
@@ -151,16 +170,18 @@ func (c sharedCaches) list() []interface{ Stats() cache.Stats } {
 	if c.page == nil {
 		return nil
 	}
-	return []interface{ Stats() cache.Stats }{c.cert, c.dns, c.probe, c.page}
+	return []interface{ Stats() cache.Stats }{c.cert, c.archive, c.dns, c.probe, c.sitemap, c.page}
 }
 
 // pipeline defines the scan's stages, in order:
 //
 //  1. passive discovery of hostnames (Certificate Transparency)
-//  2. DNS resolution of every known host
-//  3. HTTP(S) probing of resolved hosts
-//  4. crawling of reachable hosts, which may reveal more hosts
-//  5. resolving, probing and crawling hosts first found in step 4
+//  2. passive discovery of routes and hostnames (web archive)
+//  3. DNS resolution of every known host
+//  4. HTTP(S) probing of resolved hosts (light, full)
+//  5. robots.txt and sitemaps of reachable hosts (light, full)
+//  6. crawling of reachable hosts, which may reveal more hosts (full)
+//  7. the same steps for hosts first found in 5 or 6 (light, full)
 //
 // Host engines only process hosts they have not seen, so the same engine
 // instances are reused in the follow-up stage. Future engines (robots.txt,
@@ -177,6 +198,7 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log
 		RequestsPerSecond: cfg.RequestsPerSecond,
 		AllowPrivate:      cfg.AllowPrivateNetworks,
 		Pool:              pools.http,
+		Bandwidth:         pools.bandwidth,
 		// The crawler parses only HTML and the probe only reads HTML titles;
 		// other responses are classified from their status and headers.
 		ReadBody: fetch.HTMLOnly,
@@ -208,6 +230,21 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log
 		CacheTTL:        caches.ttl.PageTTL,
 	}, log)
 
+	sitemaps := sitemap.New(client.WithBodies(fetch.TextAndXML, 4<<20), sitemap.Options{
+		MaxHosts:        cfg.MaxProbeHosts,
+		MaxFilesPerHost: cfg.SitemapMaxFiles,
+		MaxURLsPerHost:  cfg.SitemapMaxURLs,
+		Concurrency:     cfg.HostConcurrency,
+		Cache:           caches.sitemap,
+		TTL:             caches.ttl.PageTTL,
+	})
+
+	// Which stages run depends on the scan mode:
+	//   passive: certificate logs, web archive, DNS (never contacts the site)
+	//   light:   + one probe and robots.txt/sitemaps per live host
+	//   full:    + crawling pages
+	all := []scan.Mode(nil)
+	lightAndFull := []scan.Mode{scan.ModeLight, scan.ModeFull}
 	var stages []scan.Stage
 	if cfg.CTEnabled {
 		// crt.sh is slow and returns large responses for busy domains, so it
@@ -220,19 +257,37 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log
 			UserAgent:         cfg.UserAgent,
 			RequestsPerSecond: 1,
 			Pool:              pools.ct,
+			Bandwidth:         pools.bandwidth,
 		})
 		// Two independent Certificate Transparency providers: public CT
 		// services fail often, and results are merged either way.
 		sources := []subdomains.Source{subdomains.NewCRTSh(ctClient), subdomains.NewCertSpotter(ctClient)}
-		stages = append(stages, scan.Stage{ID: "subdomains", Label: "Discovering subdomains",
+		stages = append(stages, scan.Stage{ID: "subdomains", Label: "Discovering subdomains", Modes: all,
 			Engines: []discovery.Engine{subdomains.New(sources, cfg.CTTimeout, log).WithCache(subdomains.CacheOptions{
 				Cache: caches.cert, TTL: caches.ttl.CertTTL, RateLimitTTL: 15 * time.Minute, FailureTTL: 5 * time.Minute,
 			})}})
 	}
+	if cfg.ArchiveEnabled {
+		archiveClient := fetch.New(fetch.Options{
+			Timeout:      cfg.CTTimeout,
+			MaxBodyBytes: 16 << 20,
+			UserAgent:    cfg.UserAgent,
+			Pool:         pools.archive,
+			Bandwidth:    pools.bandwidth,
+		})
+		stages = append(stages, scan.Stage{ID: "archive", Label: "Searching web archives", Modes: all,
+			Engines: []discovery.Engine{archive.New(archiveClient, archive.Options{
+				MaxURLs: cfg.ArchiveMaxURLs, Cache: caches.archive, TTL: caches.ttl.ArchiveTTL, FailureTTL: 5 * time.Minute,
+			})}})
+	}
 	return append(stages,
-		scan.Stage{ID: "resolve", Label: "Resolving discovered hosts", Engines: []discovery.Engine{dns}},
-		scan.Stage{ID: "probe", Label: "Probing hosts", Engines: []discovery.Engine{probe}},
-		scan.Stage{ID: "crawl", Label: "Crawling reachable hosts", Engines: []discovery.Engine{crawler}},
-		scan.Stage{ID: "follow-up", Label: "Checking hosts found while crawling", Engines: []discovery.Engine{dns, probe, crawler}},
+		scan.Stage{ID: "resolve", Label: "Resolving discovered hosts", Modes: all, Engines: []discovery.Engine{dns}},
+		scan.Stage{ID: "probe", Label: "Checking which hosts are live", Modes: lightAndFull, Engines: []discovery.Engine{probe}},
+		scan.Stage{ID: "sitemaps", Label: "Reading robots.txt and sitemaps", Modes: lightAndFull, Engines: []discovery.Engine{sitemaps}},
+		scan.Stage{ID: "crawl", Label: "Crawling reachable hosts", Modes: []scan.Mode{scan.ModeFull}, Engines: []discovery.Engine{crawler}},
+		scan.Stage{ID: "follow-up", Label: "Checking hosts found in sitemaps", Modes: []scan.Mode{scan.ModeLight},
+			Engines: []discovery.Engine{dns, probe, sitemaps}},
+		scan.Stage{ID: "follow-up", Label: "Checking hosts found while crawling", Modes: []scan.Mode{scan.ModeFull},
+			Engines: []discovery.Engine{dns, probe, sitemaps, crawler}},
 	)
 }

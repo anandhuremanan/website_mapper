@@ -26,12 +26,43 @@ func (s Status) Finished() bool {
 	return s == StatusCompleted || s == StatusFailed || s == StatusCancelled
 }
 
+// Mode chooses how deep a scan goes. Every mode lists subdomains; they
+// differ in how routes are found and how much the scanner contacts the site.
+type Mode string
+
+const (
+	// ModePassive never contacts the site: certificate logs, a web archive
+	// and DNS only. Routes are historical (archived) and unverified.
+	ModePassive Mode = "passive"
+	// ModeLight adds, per live host, one probe and its robots.txt and
+	// sitemaps: a few requests per host, current routes without crawling.
+	ModeLight Mode = "light"
+	// ModeFull also crawls pages, following links (the most requests).
+	ModeFull Mode = "full"
+)
+
+// ErrInvalidMode is returned for an unknown scan mode.
+var ErrInvalidMode = errors.New(`mode must be "passive", "light" or "full"`)
+
+// ParseMode validates a mode; "" means def.
+func ParseMode(s string, def Mode) (Mode, error) {
+	switch m := Mode(s); m {
+	case "":
+		return def, nil
+	case ModePassive, ModeLight, ModeFull:
+		return m, nil
+	}
+	return "", ErrInvalidMode
+}
+
 // Phase is what a scan is doing right now, for progress display.
 type Phase string
 
 const (
 	PhaseQueued     Phase = "queued"
 	PhaseSubdomains Phase = "discovering_subdomains"
+	PhaseArchive    Phase = "searching_archives"
+	PhaseSitemaps   Phase = "reading_sitemaps"
 	PhaseResolving  Phase = "resolving_hosts"
 	PhaseProbing    Phase = "probing_hosts"
 	PhaseCrawling   Phase = "crawling_hosts"
@@ -53,6 +84,7 @@ const (
 	LimitCrawl          = "crawl_limit_reached"
 	LimitURLBudget      = "url_budget_reached"
 	LimitRequestBudget  = "request_budget_reached"
+	LimitDownload       = "download_budget_reached"
 	LimitGlobalResource = "global_resource_wait"
 	// LimitDiscoveryRounds: hosts found in the final crawl round were
 	// recorded but not resolved, probed or crawled.
@@ -76,6 +108,10 @@ type PhaseProgress struct {
 type Resources struct {
 	Requests    int `json:"requests"`
 	MaxRequests int `json:"maxRequests,omitempty"`
+	// DownloadedBytes counts response bytes read (bodies are read only for
+	// HTML) plus an allowance for headers.
+	DownloadedBytes  int64 `json:"downloadedBytes"`
+	MaxDownloadBytes int64 `json:"maxDownloadBytes,omitempty"`
 	// Pools reports, per shared pool, how often this scan had to wait.
 	Pools map[string]PoolUsage `json:"pools,omitempty"`
 }
@@ -110,6 +146,7 @@ type Scan struct {
 	Target     string     `json:"target"`
 	Domain     string     `json:"domain"`
 	StartURL   string     `json:"startUrl"`
+	Mode       Mode       `json:"mode"`
 	Status     Status     `json:"status"`
 	CreatedAt  time.Time  `json:"createdAt"`
 	StartedAt  *time.Time `json:"startedAt,omitempty"`
@@ -180,6 +217,7 @@ type Result struct {
 
 // Domain describes the scanned target.
 type Domain struct {
+	Mode       Mode      `json:"mode"`
 	Target     string    `json:"target"`
 	Canonical  string    `json:"canonical"`
 	StartURL   string    `json:"startUrl"`

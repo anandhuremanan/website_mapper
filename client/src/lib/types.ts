@@ -2,9 +2,14 @@
 
 export type ScanStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type StepStatus = "pending" | "running" | "done" | "failed" | "skipped" | "stopped";
+/** How deep a scan goes; see server/README.md. */
+export type ScanMode = "passive" | "light" | "full";
+
 export type Phase =
   | "queued"
   | "discovering_subdomains"
+  | "searching_archives"
+  | "reading_sitemaps"
   | "resolving_hosts"
   | "probing_hosts"
   | "crawling_hosts"
@@ -25,7 +30,8 @@ export type Source =
   | "robots"
   | "certificate-transparency"
   | "redirect"
-  | "host";
+  | "host"
+  | "archive";
 
 export type UrlType = "page" | "api" | "asset" | "unknown";
 export type AssetKind =
@@ -75,6 +81,7 @@ export interface LimitNotice {
     | "crawl_limit_reached"
     | "url_budget_reached"
     | "request_budget_reached"
+    | "download_budget_reached"
     | "global_resource_wait"
     | "discovery_round_limit";
   message: string;
@@ -100,6 +107,7 @@ export interface Scan {
   target: string;
   domain: string;
   startUrl: string;
+  mode: ScanMode;
   status: ScanStatus;
   createdAt: string;
   startedAt?: string;
@@ -123,6 +131,8 @@ export interface Scan {
   resources: {
     requests: number;
     maxRequests?: number;
+    downloadedBytes?: number;
+    maxDownloadBytes?: number;
     /** Per shared pool: operations, how many waited, and the average wait. */
     pools?: Record<string, { operations: number; delayed: number; avgWaitMs: number }>;
   };
@@ -170,6 +180,14 @@ export interface CrawlInfo {
   skipped?: string;
 }
 
+export interface SitemapInfo {
+  robotsStatus?: number;
+  files: number;
+  urls: number;
+  limitReached?: boolean;
+  skipped?: string;
+}
+
 export interface Host {
   hostname: string;
   state: HostState;
@@ -180,6 +198,7 @@ export interface Host {
   dns?: DnsInfo;
   http?: HttpInfo;
   crawl?: CrawlInfo;
+  sitemap?: SitemapInfo;
   counts: { urls: number; pages: number; apis: number; assets: number };
   urls: DiscoveredUrl[];
   /** URLs seen on this host but not recorded (per-host limit). */
@@ -207,6 +226,8 @@ export interface DiscoveredUrl {
   state: "discovered" | "fetched" | "verified";
   /** Set when the response was reused from the page cache. */
   cachedAt?: string;
+  /** What a web archive recorded (historical; the URL was not requested). */
+  archived?: { firstSeen: string; contentType?: string };
 }
 
 export interface Technology {
@@ -222,6 +243,7 @@ export interface ScanResult {
   /** Hostnames discovered after the host limit; not listed. */
   hostsOmitted?: number;
   domain: {
+    mode: ScanMode;
     target: string;
     canonical: string;
     startUrl: string;

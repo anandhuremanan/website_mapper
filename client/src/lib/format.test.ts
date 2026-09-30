@@ -13,6 +13,16 @@ function host(partial: Partial<Host>): Host {
   };
 }
 
+describe("hostStatus in passive scans", () => {
+  it("does not claim a host failed HTTP when it was never contacted", () => {
+    const st = hostStatus(
+      host({ state: "resolved", dns: { resolved: true, addresses: ["93.184.216.34"] } }),
+    );
+    expect(st.label).toBe("resolves");
+    expect(st.detail).toContain("Not contacted");
+  });
+});
+
 describe("hostStatus", () => {
   it("describes a reachable host with status, scheme and redirect", () => {
     const st = hostStatus(

@@ -11,10 +11,18 @@ const MAX_CHILDREN = 100;
 
 /**
  * A browsable map of the site: hosts, with their discovered paths as a tree.
+ *
+ * Selecting a path shows its details in a side panel on wide screens. On
+ * narrow screens the layout is a single column, where that panel would end
+ * up below every host's tree, far from the tapped row, so details open
+ * inline under the selected path instead.
  */
 export function SiteMap({ hosts }: { hosts: Host[] }) {
   const [includeAssets, setIncludeAssets] = useState(false);
   const [selected, setSelected] = useState<DiscoveredUrl | null>(null);
+  // Selecting the open entry again closes it.
+  const toggle = (u: DiscoveredUrl) => setSelected((cur) => (cur?.url === u.url ? null : u));
+  const close = () => setSelected(null);
 
   const trees = useMemo(() => {
     const urls = allUrls(hosts);
@@ -47,7 +55,7 @@ export function SiteMap({ hosts }: { hosts: Host[] }) {
                   </span>
                 </h3>
                 {tree && (
-                  <Branch node={tree} depth={0} selected={selected} onSelect={setSelected} />
+                  <Branch node={tree} depth={0} selected={selected} onSelect={toggle} onClose={close} />
                 )}
               </section>
             );
@@ -61,7 +69,7 @@ export function SiteMap({ hosts }: { hosts: Host[] }) {
           )}
         </div>
 
-        <aside className="lg:sticky lg:top-4 lg:self-start">
+        <aside className="hidden lg:sticky lg:top-4 lg:block lg:self-start">
           <div className="rounded-md border border-border bg-surface p-4">
             {selected ? (
               <UrlDetail url={selected} />
@@ -80,13 +88,16 @@ interface BranchProps {
   depth: number;
   selected: DiscoveredUrl | null;
   onSelect: (u: DiscoveredUrl) => void;
+  onClose: () => void;
 }
 
-function Branch({ node, depth, selected, onSelect }: BranchProps) {
+function Branch({ node, depth, selected, onSelect, onClose }: BranchProps) {
   const [expanded, setExpanded] = useState(depth < 1);
   const [showAll, setShowAll] = useState(false);
   const hasChildren = node.children.length > 0;
   const children = showAll ? node.children : node.children.slice(0, MAX_CHILDREN);
+  const selectedHere = node.urls.find((u) => u.url === selected?.url);
+  const label = depth === 0 ? "/" : node.name;
 
   return (
     <div className="text-sm">
@@ -104,14 +115,27 @@ function Branch({ node, depth, selected, onSelect }: BranchProps) {
         ) : (
           <span className="w-4" />
         )}
-        <span className="font-mono">{depth === 0 ? "/" : node.name}</span>
+        {node.urls.length > 0 ? (
+          // The path itself is the obvious thing to tap, especially on phones.
+          <button
+            type="button"
+            onClick={() => onSelect(node.urls[0])}
+            aria-expanded={selectedHere !== undefined}
+            className="break-all text-left font-mono hover:underline"
+          >
+            {label}
+          </button>
+        ) : (
+          <span className="break-all font-mono">{label}</span>
+        )}
         {hasChildren && <span className="text-xs text-muted">({node.total})</span>}
         {node.urls.map((u) => (
           <button
             key={u.url}
             type="button"
             onClick={() => onSelect(u)}
-            className={`ml-2 flex items-center gap-1.5 rounded px-1.5 py-px text-xs hover:bg-subtle ${
+            aria-expanded={selected?.url === u.url}
+            className={`ml-2 flex shrink-0 items-center gap-1.5 rounded px-1.5 py-px text-xs hover:bg-subtle ${
               selected?.url === u.url ? "bg-subtle ring-1 ring-border" : ""
             }`}
             title={u.url}
@@ -124,10 +148,27 @@ function Branch({ node, depth, selected, onSelect }: BranchProps) {
           </button>
         ))}
       </div>
+      {selectedHere && (
+        <div className="my-2 ml-5 rounded-md border border-border bg-surface p-3 lg:hidden">
+          <div className="mb-2 flex justify-end">
+            <button type="button" onClick={onClose} className="text-xs text-muted hover:text-fg">
+              Close
+            </button>
+          </div>
+          <UrlDetail url={selectedHere} />
+        </div>
+      )}
       {expanded && hasChildren && (
         <div className="ml-2 border-l border-border pl-3">
           {children.map((c) => (
-            <Branch key={c.path} node={c} depth={depth + 1} selected={selected} onSelect={onSelect} />
+            <Branch
+              key={c.path}
+              node={c}
+              depth={depth + 1}
+              selected={selected}
+              onSelect={onSelect}
+              onClose={onClose}
+            />
           ))}
           {node.children.length > children.length && (
             <button

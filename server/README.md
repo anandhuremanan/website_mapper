@@ -60,20 +60,54 @@ internal/htmlmeta     <title> extraction
 internal/config       environment configuration
 ```
 
+### Scan modes
+
+Every scan lists subdomains. The mode decides how routes are found and how
+much the scanner contacts the site (`"mode"` in `POST /api/scans`, default
+`SCAN_DEFAULT_MODE=light`):
+
+| Mode | Contacts the site? | Routes come from |
+| --- | --- | --- |
+| `passive` | never | the web archive (historical; may no longer exist) |
+| `light` | one probe plus robots.txt and sitemaps per live host | archive + sitemaps |
+| `full` | also crawls pages, following links | archive + sitemaps + links |
+
+Measured cold (nothing cached) with the deployment profile:
+
+| Site | Mode | Time | Requests | Downloaded | Hosts (live) | URLs |
+| --- | --- | --- | --- | --- | --- | --- |
+| imanandhu.in | passive | 3.7 s | 4 | 0.05 MB | 15 (not checked) | 2 |
+| imanandhu.in | light | 13.1 s | 35 | 0.16 MB | 15 (11) | 12 |
+| imanandhu.in | full | 65.6 s* | 67 | 0.57 MB | 15 (11) | 160 |
+| python.org | passive | 17.8 s | 6 | 0.11 MB | 48 (not checked) | 1,089 |
+| python.org | light | 52.8 s | 186 | 5.3 MB | 74 (54) | 2,496 |
+| python.org | full | 142.9 s | 4,677 | 28.0 MB | 78 (54) | 13,427 |
+
+\* 59 s of it waiting for crt.sh; the scanner's own work took about 7 s.
+
+Small sites are barely archived, so passive mode finds few routes for them;
+large sites are well archived. Archived URLs are never requested, also not
+in full mode: crawling them would mean requesting possibly dead URLs just to
+verify them. They are shown as discovered, with when the archive first
+captured them and the content type it recorded.
+
 ### Pipeline
 
 The scan runs an ordered list of stages, defined in `pipeline()` in
-[cmd/server/main.go](cmd/server/main.go). Each stage is one progress step.
+[cmd/server/main.go](cmd/server/main.go). Each stage is one progress step;
+a scan runs only the stages of its mode.
 
-| Step | Engines | What happens |
-| --- | --- | --- |
-| Validating target | (built in) | Input parsed and scope derived when the scan is created |
-| Discovering subdomains | `subdomains` | Certificate Transparency via crt.sh and Cert Spotter, run concurrently and merged |
-| Resolving discovered hosts | `dns` | A/AAAA/CNAME lookup for every known host |
-| Probing hosts | `http` | `GET https://host/`, falling back to `http://host/`, on resolved public hosts |
-| Crawling reachable hosts | `html` | BFS crawl per reachable host |
-| Checking hosts found while crawling | `dns`, `http`, `html` | The same engines again, for hosts first seen in links or redirects |
-| Finalizing results | (built in) | Aggregate and store |
+| Step | Modes | Engines | What happens |
+| --- | --- | --- | --- |
+| Validating target | all | (built in) | Input parsed and scope derived when the scan is created |
+| Discovering subdomains | all | `subdomains` | Certificate Transparency via crt.sh and Cert Spotter, run concurrently and merged |
+| Searching web archives | all | `archive` | One Wayback Machine CDX query for the domain and all subdomains: URLs archived with HTTP 200, first capture, content type |
+| Resolving discovered hosts | all | `dns` | A/AAAA/CNAME lookup for every known host |
+| Checking which hosts are live | light, full | `http` | `GET https://host/`, falling back to `http://host/`, on resolved public hosts |
+| Reading robots.txt and sitemaps | light, full | `sitemap` | `Sitemap:` lines of robots.txt (never `Disallow`), else `/sitemap.xml`; sitemap indexes, `.xml.gz` and text sitemaps; listed URLs are not requested |
+| Crawling reachable hosts | full | `html` | BFS crawl per reachable host, seeded from sitemaps |
+| Checking hosts found in sitemaps / while crawling | light / full | `dns`, `http`, `sitemap` (+ `html`) | The same engines again, for hosts first seen in sitemaps, links or redirects |
+| Finalizing results | all | (built in) | Aggregate and store |
 
 Before the first stage, the entered host and the apex domain are added as
 hosts, so they are always resolved, probed and crawled.
@@ -193,6 +227,8 @@ still builds its own result, combining cached and newly observed data.
 | dns | hostname | addresses, CNAME, non-public flag, or NXDOMAIN | `CACHE_DNS_TTL` (5 min); NXDOMAIN 1 min; timeouts never |
 | probe | hostname + target scope | reachable?, status, redirect, final URL, title, server | `CACHE_PROBE_TTL` (2 min), reachable or not |
 | page | URL | status, content type, title, redirect, and every link/asset reference | `CACHE_PAGE_TTL` (15 min) |
+| archive | domain | archived URLs with first capture and content type | `CACHE_ARCHIVE_TTL` (24 h); failures 5 min |
+| sitemap | URL | a robots.txt's sitemap list or a sitemap's URLs | `CACHE_PAGE_TTL` (15 min) |
 
 - **What is never cached:** response bodies, asset contents, and outcomes
   that belong to one scan rather than to the data (cancellation, a spent
@@ -224,8 +260,8 @@ still builds its own result, combining cached and newly observed data.
   as `fromCache` on hosts known only from cached data. `counts.cache`
   totals what was reused; everything else was newly observed.
 
-**Memory.** `CACHE_MAX_MB` (64 MB) bounds the whole cache: 70% pages, 10%
-each for certificates, DNS and probes. Entries are charged their estimated
+**Memory.** `CACHE_MAX_MB` (64 MB) bounds the whole cache: 50% pages, 20%
+archive listings, 10% sitemaps, 10% DNS, 5% probes and 5% certificates. Entries are charged their estimated
 size, including the cache's own per-entry bookkeeping; measured real heap is
 0.84-0.97x the estimate. Within a layer, the least recently used entries are
 evicted first. One domain may use at most a quarter of a layer and evicts its
@@ -266,11 +302,75 @@ is bounded by configuration rather than by what the machine has:
 | running scans | `MAX_CONCURRENT_SCANS=3` x `SCAN_MAX_RECORDED_URLS=50000` | up to ~50 MB each |
 | stored results | `MAX_STORED_RESULT_URLS=500000` | up to ~300 MB |
 
+These are the development defaults. For a small server use the deployment
+profile below, which keeps the live heap around 100-165 MB.
+
 With Go's garbage collector the process can briefly use up to about twice
 its live heap. On a small VPS lower `MAX_STORED_RESULT_URLS` first, since
 stored results are the largest part; setting the Go runtime's
 `GOMEMLIMIT` (for example `GOMEMLIMIT=600MiB`) also makes the collector work
 harder before the process grows.
+
+### Deploying on a small shared server
+
+[deploy/websitemapper.env](deploy/websitemapper.env) is a profile for a
+2 vCPU / 2 GiB VPS that also runs other services, and
+[deploy/websitemapper.service](deploy/websitemapper.service) is a systemd
+unit with install steps. Protection works in two layers:
+
+1. **The application's own limits** (the profile) keep normal use small.
+2. **Kernel limits** (cgroup v2, via the unit) are a hard backstop: above
+   `MemoryHigh=400M` this service is throttled and reclaimed, at
+   `MemoryMax=512M` only this service is OOM-killed and restarted, and
+   `CPUQuota=60%` / `CPUWeight=20` / `Nice=10` make other services win the
+   CPU whenever the machine is busy. Go 1.23 does not read cgroup CPU limits,
+   so the profile also sets `GOMAXPROCS=1`, and `GOMEMLIMIT=300MiB` makes the
+   garbage collector work harder before the process grows.
+
+**Bandwidth.** `GLOBAL_DOWNLOAD_KBPS` caps what all scans download together,
+counted in bytes on the wire (the scanner requests gzip and decompresses
+itself, so compressed pages count at their compressed size, which is what
+the network carries and the provider bills). It is enforced as bodies are
+read: the remote server is slowed by TCP flow control. A rate is also a
+monthly ceiling: 512 KB/s is at most 1.3 TB in 30 days even if scans never
+stopped. `SCAN_MAX_DOWNLOAD_MB` caps each scan. Certificate-log answers
+count too. Responses to browsers are gzipped, and only the scan status
+(about 2 KB) is polled while a scan runs.
+
+Measured with this profile, running python.org and go.dev at the same time
+and then imanandhu.in:
+
+| | Measured | Limit |
+| --- | --- | --- |
+| peak heap | 101 MB | `GOMEMLIMIT` 300 MiB |
+| peak memory from the OS | 139 MB | `MemoryHigh` 400 MB |
+| CPU | 6.7% of one core (average) | `GOMAXPROCS=1`, `CPUQuota=60%` |
+| download (on the wire) | 381 KB/s average, 561 KB/s peak over 10 s (one-second burst) | 512 KB/s |
+| python.org results sent to a browser | 5.63 MB, 0.36 MB gzipped | |
+| scan time | python.org 187 s, go.dev 175 s (in parallel), imanandhu.in 15 s | |
+
+What sets scan time, in order:
+
+1. **Politeness per host:** at most `SCAN_REQUESTS_PER_SECOND` (5) requests
+   per second to one host, so a host crawled to `SCAN_MAX_URLS` (300) takes
+   at least 60 s. Large sites have many such hosts; `SCAN_HOST_CONCURRENCY`
+   crawls several at once. Lower `SCAN_MAX_URLS` for faster, shallower maps.
+2. **The download cap:** sites that do not compress (go.dev served about
+   48 MB) use it up while others share it.
+3. **HTTP slots:** each slot is held for a response's full duration (often
+   0.5 s or more), so `GLOBAL_HTTP_CONCURRENCY` bounds requests per second.
+   Slots are cheap for the server (memory is bounded by
+   `SCAN_MAX_BODY_BYTES` per slot, bandwidth by the cap). An earlier profile
+   with 12 slots made python.org take 325 s instead of 187 s.
+
+`/api/health` shows live memory (`process`), bandwidth used and per-pool use,
+for monitoring.
+
+The API listens on all interfaces on `SERVER_PORT`; on a public server keep
+it behind the Next.js client or a reverse proxy and block the port in the
+firewall. If the Next.js client runs on the same machine, give it its own
+limits too (for example `NODE_OPTIONS=--max-old-space-size=256` and a
+similar systemd unit).
 
 ### Design decisions (Phase 1 review)
 
@@ -383,10 +483,12 @@ caller's lookup), `evictions`, `expired`, `rejected`, `entries` and
 Request:
 
 ```json
-{ "target": "example.com" }
+{ "target": "example.com", "mode": "light" }
 ```
 
 `target` can be a bare domain or a URL such as `https://www.example.com/docs`.
+`mode` is `passive`, `light` or `full` (see Scan modes); it may be omitted.
+Scans in different modes never coalesce.
 
 Response `202 Accepted` (with a `Location` header) contains the scan status
 object described below. It returns immediately: `"status": "running"` if

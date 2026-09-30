@@ -53,7 +53,8 @@ type urlEntry struct {
 	from    []string
 	resp    *discovery.Response
 	err     string
-	cls     classify.Result // cached; recomputed when hints or resp change
+	archive *discovery.ArchiveInfo
+	cls     classify.Result // cached; recomputed when hints, resp or archive change
 }
 
 type hostEntry struct {
@@ -66,6 +67,7 @@ type hostEntry struct {
 	dns                  *discovery.DNSInfo
 	http                 *discovery.HTTPInfo
 	crawl                *discovery.CrawlInfo
+	sitemap              *discovery.SitemapInfo
 }
 
 // NewAggregator creates an Aggregator scoped to target.
@@ -133,6 +135,10 @@ func (a *Aggregator) Add(f discovery.Finding) {
 	}
 	if f.Method != "" {
 		e.methods.add(f.Method)
+	}
+	if f.Archive != nil && (e.archive == nil || f.Archive.FirstSeen.Before(e.archive.FirstSeen)) {
+		e.archive = f.Archive
+		reclassify = true
 	}
 	if f.From != "" && len(e.from) < maxDiscoveredFrom && !contains(e.from, f.From) {
 		e.from = append(e.from, f.From)
@@ -202,6 +208,9 @@ func (a *Aggregator) addHost(f discovery.Finding) {
 	if f.Crawl != nil {
 		e.crawl = f.Crawl
 	}
+	if f.Sitemap != nil {
+		e.sitemap = f.Sitemap
+	}
 }
 
 // hostLocked returns the entry for host, creating it if the host limit
@@ -234,18 +243,24 @@ func (a *Aggregator) Hosts() []discovery.HostView {
 	defer a.mu.Unlock()
 	out := make([]discovery.HostView, 0, len(a.hosts))
 	for name, h := range a.hosts {
-		out = append(out, discovery.HostView{Name: name, Sources: h.sources.sorted(), DNS: h.dns, HTTP: h.http, Crawl: h.crawl})
+		out = append(out, discovery.HostView{Name: name, Sources: h.sources.sorted(), DNS: h.dns, HTTP: h.http, Crawl: h.crawl, Sitemap: h.sitemap})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
-// PageURLs implements discovery.State: page URLs not fetched yet.
+// PageURLs implements discovery.State: page URLs not fetched yet, found on
+// the live site (links, sitemaps). URLs known only from a web archive are
+// left out: crawling them would mean requesting possibly dead URLs just to
+// verify them.
 func (a *Aggregator) PageURLs() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	var out []string
 	for key, e := range a.urls {
+		if e.archiveOnly() {
+			continue
+		}
 		if e.resp == nil && e.err == "" && e.cls.Type == classify.TypePage {
 			out = append(out, key)
 		}
@@ -395,6 +410,7 @@ func (a *Aggregator) Result() Result {
 			DNS:       h.dns,
 			HTTP:      h.http,
 			Crawl:     h.crawl,
+			Sitemap:   h.sitemap,
 			URLs:      urls,
 			Omitted:   h.omitted,
 		}
@@ -432,6 +448,7 @@ func buildURL(key string, e *urlEntry) URL {
 		Error:          e.err,
 		Fetched:        e.resp != nil || e.err != "",
 		State:          URLDiscovered,
+		Archived:       e.archive,
 	}
 	switch {
 	case e.resp != nil:
@@ -451,8 +468,17 @@ func buildURL(key string, e *urlEntry) URL {
 	return out
 }
 
+// archiveOnly reports whether the URL is known only from a web archive.
+func (e *urlEntry) archiveOnly() bool {
+	_, archived := e.sources[discovery.SourceArchive]
+	return archived && len(e.sources) == 1
+}
+
 func classifyEntry(e *urlEntry) classify.Result {
 	in := classify.Input{Path: e.u.Path, Hints: e.hints.sorted()}
+	if e.archive != nil {
+		in.ArchivedContentType = e.archive.ContentType
+	}
 	if e.resp != nil {
 		in.Status, in.ContentType = e.resp.Status, e.resp.ContentType
 	}

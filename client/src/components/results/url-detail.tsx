@@ -28,6 +28,17 @@ export function UrlDetail({ url }: { url: DiscoveredUrl }) {
           </span>
         )}
       </Row>
+      {url.archived && (
+        <Row label="Web archive">
+          First archived {new Date(url.archived.firstSeen).toLocaleDateString()}
+          {url.archived.contentType && (
+            <span className="font-mono"> as {url.archived.contentType}</span>
+          )}
+          <span className="block text-muted">
+            Historical record: the page may no longer exist.
+          </span>
+        </Row>
+      )}
       {url.error && (
         <Row label="Error">
           <span className="break-all text-warn">{url.error}</span>

@@ -3,10 +3,33 @@
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import { createScan } from "@/lib/api";
+import type { ScanMode } from "@/lib/types";
+
+const modes: { id: ScanMode; label: string; detail: string }[] = [
+  {
+    id: "passive",
+    label: "Passive",
+    detail:
+      "Certificate logs, web archives and DNS. Never contacts the site. Archived routes may be out of date.",
+  },
+  {
+    id: "light",
+    label: "Standard",
+    detail:
+      "Adds a check of each live host and its robots.txt and sitemaps. A few requests per host.",
+  },
+  {
+    id: "full",
+    label: "Full crawl",
+    detail:
+      "Follows links on live hosts to discover routes that aren't listed in sitemaps. Makes significantly more requests and takes longer.",
+  },
+];
 
 export function ScanForm() {
   const router = useRouter();
   const [target, setTarget] = useState("");
+  const [mode, setMode] = useState<ScanMode>("light");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -19,7 +42,7 @@ export function ScanForm() {
     setSubmitting(true);
     setError(null);
     try {
-      const scan = await createScan(target.trim());
+      const scan = await createScan(target.trim(), mode);
       router.push(`/scans/${scan.id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
@@ -55,6 +78,28 @@ export function ScanForm() {
           {submitting ? "Starting…" : "Map website"}
         </button>
       </div>
+      <fieldset className="space-y-2 pt-1">
+        <legend className="mb-2 text-sm font-medium">Scan Mode</legend>
+        {modes.map((m) => (
+          <label
+            key={m.id}
+            className="flex cursor-pointer items-start gap-2 text-sm"
+          >
+            <input
+              type="radio"
+              name="mode"
+              value={m.id}
+              checked={mode === m.id}
+              onChange={() => setMode(m.id)}
+              className="mt-1"
+            />
+            <span>
+              <span className="font-medium">{m.label}</span>
+              <span className="block text-muted">{m.detail}</span>
+            </span>
+          </label>
+        ))}
+      </fieldset>
       {error && (
         <p role="alert" className="text-sm text-danger">
           {error}

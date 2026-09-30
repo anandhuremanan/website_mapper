@@ -35,6 +35,11 @@ func TestClassify(t *testing.T) {
 		{"redirect target", Input{Path: "/home", Hints: []discovery.Hint{discovery.HintRedirect}}, TypePage, "", "redirect"},
 		{"form", Input{Path: "/contact", Hints: []discovery.Hint{discovery.HintForm}}, TypeUnknown, "", "Form"},
 		{"nothing", Input{Path: "/x"}, TypeUnknown, "", "Not enough"},
+		{"archived html", Input{Path: "/about", Hints: []discovery.Hint{discovery.HintArchive}, ArchivedContentType: "text/html"}, TypePage, "", "Archived as text/html"},
+		{"archived json", Input{Path: "/data", ArchivedContentType: "application/json"}, TypeAPI, "", "not requested"},
+		{"live beats archive", Input{Path: "/x", Status: 200, ContentType: "application/json", ArchivedContentType: "text/html"}, TypeAPI, "", "Responded with"},
+		{"archive unknown type", Input{Path: "/x", Hints: []discovery.Hint{discovery.HintArchive}, ArchivedContentType: "warc/revisit"}, TypeUnknown, "", "web archive"},
+		{"sitemap", Input{Path: "/blog/post", Hints: []discovery.Hint{discovery.HintSitemap}}, TypePage, "", "sitemap"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

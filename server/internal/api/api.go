@@ -7,7 +7,11 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
+	"runtime"
+	"runtime/debug"
+	"strings"
 	"time"
 
 	"websitemapper/internal/discovery"
@@ -16,7 +20,7 @@ import (
 
 // Scans is the subset of the scan service the API needs.
 type Scans interface {
-	Create(ctx context.Context, input string) (scan.Scan, error)
+	Create(ctx context.Context, req scan.CreateRequest) (scan.Scan, error)
 	Get(ctx context.Context, id string) (scan.Scan, error)
 	Result(ctx context.Context, id string) (scan.Result, error)
 	Cancel(ctx context.Context, id, subscription string) (scan.Scan, error)
@@ -47,11 +51,39 @@ func NewHandler(scans Scans, log *slog.Logger) http.Handler {
 }
 
 func (h *handler) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "scheduler": h.scans.Stats()})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "scheduler": h.scans.Stats(), "process": readProcessStats()})
+}
+
+// processStats shows how much of the machine the server is using, for
+// operating it next to other services.
+type processStats struct {
+	// HeapMB is live heap memory; SysMB is everything obtained from the OS.
+	HeapMB     float64 `json:"heapMB"`
+	SysMB      float64 `json:"sysMB"`
+	Goroutines int     `json:"goroutines"`
+	GOMAXPROCS int     `json:"gomaxprocs"`
+	// MemoryLimitMB is GOMEMLIMIT, if set.
+	MemoryLimitMB int64  `json:"memoryLimitMB,omitempty"`
+	NumGC         uint32 `json:"numGC"`
+}
+
+func readProcessStats() processStats {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	st := processStats{
+		HeapMB: float64(m.HeapAlloc) / (1 << 20), SysMB: float64(m.Sys) / (1 << 20),
+		Goroutines: runtime.NumGoroutine(), GOMAXPROCS: runtime.GOMAXPROCS(0), NumGC: m.NumGC,
+	}
+	if limit := debug.SetMemoryLimit(-1); limit != math.MaxInt64 {
+		st.MemoryLimitMB = limit >> 20
+	}
+	return st
 }
 
 type createRequest struct {
 	Target string `json:"target"`
+	// Mode is "passive", "light" or "full"; empty means the default.
+	Mode string `json:"mode"`
 }
 
 func (h *handler) createScan(w http.ResponseWriter, r *http.Request) {
@@ -63,9 +95,9 @@ func (h *handler) createScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sc, err := h.scans.Create(r.Context(), req.Target)
+	sc, err := h.scans.Create(r.Context(), scan.CreateRequest{Target: req.Target, Mode: scan.Mode(req.Mode)})
 	switch {
-	case errors.Is(err, discovery.ErrInvalidTarget):
+	case errors.Is(err, discovery.ErrInvalidTarget), errors.Is(err, scan.ErrInvalidMode):
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	case errors.Is(err, scan.ErrQueueFull), errors.Is(err, scan.ErrShuttingDown):
@@ -171,6 +203,12 @@ func (h *handler) middleware(next http.Handler) http.Handler {
 				"status", rec.status, "duration", time.Since(start).Round(time.Microsecond))
 		}()
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			gz := newGzipWriter(rec)
+			defer gz.Close()
+			next.ServeHTTP(gz, r)
+			return
+		}
 		next.ServeHTTP(rec, r)
 	})
 }

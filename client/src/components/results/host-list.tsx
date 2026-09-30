@@ -67,7 +67,7 @@ type Section = "routes" | "apis" | "assets";
 
 export function HostDetail({ host }: { host: Host }) {
   const st = hostStatus(host);
-  const { dns, http, crawl } = host;
+  const { dns, http, crawl, sitemap } = host;
   const [section, setSection] = useState<Section>("routes");
 
   const groups: Record<Section, typeof host.urls> = {
@@ -144,6 +144,22 @@ export function HostDetail({ host }: { host: Host }) {
           )}
         </Row>
 
+        {sitemap && (
+          <Row label="Sitemaps">
+            {sitemap.skipped ? (
+              <span className="text-muted">Not read: {sitemap.skipped}</span>
+            ) : (
+              <span>
+                {plural(sitemap.urls, "URL")} from {plural(sitemap.files, "sitemap")}
+                <span className="text-muted">
+                  {" "}
+                  · robots.txt {sitemap.robotsStatus === 200 ? "found" : "not found"}
+                  {sitemap.limitReached && " · per-host sitemap limit reached"}
+                </span>
+              </span>
+            )}
+          </Row>
+        )}
         {crawl && (
           <Row label="Crawl">
             {crawl.skipped ? (

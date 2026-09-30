@@ -9,6 +9,7 @@
 package fetch
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -38,12 +39,23 @@ type Options struct {
 	// Pool bounds requests in flight across every scan using this client.
 	// Nil means unbounded (tests only).
 	Pool *resource.Pool
+	// Bandwidth paces the bytes read by every client sharing it (nil:
+	// unlimited). Bodies count as they are read; each response also counts
+	// headerBytes for request and response headers.
+	Bandwidth *resource.Bandwidth
 	// ReadBody decides, by media type, whether a response body is read.
 	// Bodies that are not read are never downloaded beyond what the
 	// connection has already buffered. Nil reads textual types (HTML, JSON,
 	// XML, JavaScript, text).
 	ReadBody func(mediaType string) bool
 }
+
+// headerBytes approximates the request and response headers of one
+// exchange, which are transferred even when the body is not read.
+const headerBytes = 1024
+
+// readChunk is how much of a body is read between bandwidth checks.
+const readChunk = 32 << 10
 
 // HTMLOnly reads only HTML bodies: enough for crawling and page titles,
 // without downloading JSON, XML, feeds or scripts that are only classified.
@@ -101,6 +113,10 @@ func New(opts Options) *Client {
 		MaxIdleConnsPerHost:   4,
 		MaxIdleConns:          idleConns(opts.Pool),
 		IdleConnTimeout:       60 * time.Second,
+		// Get asks for gzip and decompresses itself, so that bandwidth is
+		// measured in bytes on the wire (what the network carries and the
+		// provider bills), not in decompressed bytes.
+		DisableCompression: true,
 	}
 	return &Client{
 		http: &http.Client{
@@ -162,6 +178,7 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*Response, error) {
 	}
 	req.Header.Set("User-Agent", c.opts.UserAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Encoding", "gzip")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -180,18 +197,82 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*Response, error) {
 			out.Location = ref.String()
 		}
 	}
+	acct := resource.FromContext(ctx)
+	if err := c.account(ctx, acct, headerBytes); err != nil {
+		return nil, err
+	}
 	if c.opts.ReadBody(out.ContentType) {
-		body, err := io.ReadAll(io.LimitReader(resp.Body, c.opts.MaxBodyBytes+1))
+		body, truncated, err := c.readBody(ctx, acct, resp)
 		if err != nil {
-			return nil, fmt.Errorf("reading body: %w", err)
+			return nil, err
 		}
-		if int64(len(body)) > c.opts.MaxBodyBytes {
-			body = body[:c.opts.MaxBodyBytes]
-			out.Truncated = true
-		}
-		out.Body = body
+		out.Body, out.Truncated = body, truncated
 	}
 	return out, nil
+}
+
+// account charges n transferred bytes to the scan's download budget and the
+// shared bandwidth limit.
+func (c *Client) account(ctx context.Context, acct *resource.Account, n int) error {
+	if err := acct.TakeBytes(n); err != nil {
+		return err
+	}
+	return c.opts.Bandwidth.Wait(ctx, n)
+}
+
+// readBody reads up to MaxBodyBytes of (decompressed) body. Bytes are
+// charged as they arrive from the network, before decompression, and each
+// chunk is paced by the bandwidth limit before more is read, so the limit
+// slows the transfer itself. MaxBodyBytes applies to the decompressed size,
+// which also bounds a response that decompresses to something huge.
+func (c *Client) readBody(ctx context.Context, acct *resource.Account, resp *http.Response) ([]byte, bool, error) {
+	var r io.Reader = &meteredReader{ctx: ctx, c: c, acct: acct, r: resp.Body}
+	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("Content-Encoding")), "gzip") {
+		zr, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, false, fmt.Errorf("reading gzip body: %w", err)
+		}
+		defer zr.Close()
+		r = zr
+	}
+	limit := c.opts.MaxBodyBytes
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		var budget *budgetError
+		if errors.As(err, &budget) {
+			return nil, false, budget.err
+		}
+		return nil, false, fmt.Errorf("reading body: %w", err)
+	}
+	if int64(len(body)) > limit {
+		return body[:limit], true, nil
+	}
+	return body, false, nil
+}
+
+// meteredReader charges every byte read from the network to the scan's
+// download budget and the shared bandwidth limit.
+type meteredReader struct {
+	ctx  context.Context
+	c    *Client
+	acct *resource.Account
+	r    io.Reader
+}
+
+// budgetError carries a budget or cancellation error through readers that
+// would otherwise wrap it.
+type budgetError struct{ err error }
+
+func (e *budgetError) Error() string { return e.err.Error() }
+
+func (m *meteredReader) Read(p []byte) (int, error) {
+	n, err := m.r.Read(p[:min(len(p), readChunk)])
+	if n > 0 {
+		if aerr := m.c.account(m.ctx, m.acct, n); aerr != nil {
+			return n, &budgetError{aerr}
+		}
+	}
+	return n, err
 }
 
 func mediaType(header string) string {
@@ -274,4 +355,24 @@ func IsPublicAddr(ip netip.Addr) bool {
 		}
 	}
 	return true
+}
+
+// WithBodies returns a client that reads bodies of the given kinds, up to
+// maxBytes, and otherwise shares everything with c: its connections,
+// per-host rate limit, pool and bandwidth limit. Used for robots.txt and
+// sitemaps, which are text and XML rather than HTML.
+func (c *Client) WithBodies(read func(mediaType string) bool, maxBytes int64) *Client {
+	cp := *c
+	cp.opts.ReadBody = read
+	if maxBytes > 0 {
+		cp.opts.MaxBodyBytes = maxBytes
+	}
+	return &cp
+}
+
+// TextAndXML reads plain text, XML and gzip bodies (robots.txt, sitemaps
+// and compressed .xml.gz sitemaps).
+func TextAndXML(mediaType string) bool {
+	return mediaType == "" || strings.HasPrefix(mediaType, "text/") || strings.Contains(mediaType, "xml") ||
+		strings.Contains(mediaType, "gzip")
 }

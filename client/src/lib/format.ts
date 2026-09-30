@@ -1,4 +1,4 @@
-import type { AssetKind, DiscoveredUrl, Host, Source, UrlType } from "./types";
+import type { AssetKind, DiscoveredUrl, Host, ScanMode, Source, UrlType } from "./types";
 
 export const sourceLabels: Record<Source, string> = {
   target: "Entered by you",
@@ -9,6 +9,13 @@ export const sourceLabels: Record<Source, string> = {
   "certificate-transparency": "Certificate Transparency",
   redirect: "Redirect",
   host: "Discovered host",
+  archive: "Web archive",
+};
+
+export const modeLabels: Record<ScanMode, string> = {
+  passive: "Passive",
+  light: "Standard",
+  full: "Full crawl",
 };
 
 export function sourceLabel(s: string): string {
@@ -86,6 +93,15 @@ export function hostStatus(h: Host): HostStatus {
         tone: "text-warn",
         label: "private address",
         detail: "Resolves only to private or reserved addresses, so it was not contacted.",
+      };
+    }
+    if (!http) {
+      // Passive scans never contact hosts, so there is no HTTP answer to report.
+      return {
+        icon: "✓",
+        tone: "text-muted",
+        label: "resolves",
+        detail: "Resolves in DNS. Not contacted: this scan did not visit hosts.",
       };
     }
     if (http?.skipped) {

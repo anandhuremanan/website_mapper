@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -73,7 +74,7 @@ func waitStatus(t *testing.T, svc *scan.Service, id string, want scan.Status) sc
 
 func mustCreate(t *testing.T, svc *scan.Service, target string) scan.Scan {
 	t.Helper()
-	sc, err := svc.Create(context.Background(), target)
+	sc, err := svc.Create(context.Background(), scan.CreateRequest{Target: target})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,9 +112,8 @@ func TestSchedulerRunsUpToLimitAndQueuesTheRest(t *testing.T) {
 	for _, id := range []string{a.ID, b.ID, c.ID, d.ID} {
 		waitStatus(t, svc, id, scan.StatusCompleted)
 	}
-	if st := svc.Stats(); st.Running != 0 || st.Queued != 0 {
-		t.Errorf("stats after = %+v", st)
-	}
+	// Slots are released just after the final status is written.
+	waitFor(t, func() bool { st := svc.Stats(); return st.Running == 0 && st.Queued == 0 })
 }
 
 func TestCancelQueuedScan(t *testing.T) {
@@ -185,9 +185,8 @@ func TestTimeoutReleasesCapacity(t *testing.T) {
 			t.Errorf("scan = %+v", sc)
 		}
 	}
-	if st := svc.Stats(); st.Running != 0 {
-		t.Errorf("running = %d", st.Running)
-	}
+	// The slot is released just after the final status is written.
+	waitFor(t, func() bool { return svc.Stats().Running == 0 })
 }
 
 func TestQueueIsBounded(t *testing.T) {
@@ -197,7 +196,7 @@ func TestQueueIsBounded(t *testing.T) {
 	mustCreate(t, svc, "a.com") // running
 	mustCreate(t, svc, "b.com") // queued #1
 	mustCreate(t, svc, "c.com") // queued #2
-	if _, err := svc.Create(context.Background(), "d.com"); !errors.Is(err, scan.ErrQueueFull) {
+	if _, err := svc.Create(context.Background(), scan.CreateRequest{Target: "d.com"}); !errors.Is(err, scan.ErrQueueFull) {
 		t.Errorf("err = %v, want ErrQueueFull", err)
 	}
 }
@@ -518,7 +517,7 @@ func TestShutdownCancelsQueuedAndRunningScans(t *testing.T) {
 	if rb.Status != scan.StatusCancelled || rb.StopReason != scan.StopShutdown || g.didStart("b.com") {
 		t.Errorf("queued scan = %s / %q", rb.Status, rb.StopReason)
 	}
-	if _, err := svc.Create(context.Background(), "c.com"); !errors.Is(err, scan.ErrShuttingDown) {
+	if _, err := svc.Create(context.Background(), scan.CreateRequest{Target: "c.com"}); !errors.Is(err, scan.ErrShuttingDown) {
 		t.Errorf("create after shutdown err = %v", err)
 	}
 	svc.Wait() // must not block
@@ -532,5 +531,26 @@ func waitFor(t *testing.T, cond func() bool) {
 			t.Fatal("condition not reached")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestDownloadBudgetIsEnforcedAndReported(t *testing.T) {
+	page := strings.Repeat("x", 20<<10)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(page))
+	}))
+	defer srv.Close()
+	client := fetch.New(fetch.Options{AllowPrivate: true})
+	eng := &httpWorkEngine{client: client, url: srv.URL, workers: 1, requests: 100}
+	svc := startService(t, []scan.Stage{stage("crawl", eng)}, scan.Options{MaxDownloadBytes: 100 << 10})
+	sc := waitStatus(t, svc, mustCreate(t, svc, "a.com").ID, scan.StatusCompleted)
+	r := sc.Resources
+	if !hasLimit(sc.Limits, scan.LimitDownload) || hasLimit(sc.Limits, scan.LimitRequestBudget) || r.MaxDownloadBytes != 100<<10 {
+		t.Errorf("limits = %+v resources = %+v", sc.Limits, r)
+	}
+	// The scan stopped right after crossing the budget.
+	if r.DownloadedBytes <= 100<<10 || r.DownloadedBytes > 130<<10 || r.Requests > 6 {
+		t.Errorf("downloaded %d bytes in %d requests", r.DownloadedBytes, r.Requests)
 	}
 }

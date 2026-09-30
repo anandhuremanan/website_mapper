@@ -31,6 +31,9 @@ type Config struct {
 	GlobalHTTPConcurrency int
 	// GlobalDNSConcurrency bounds DNS lookups in flight across all scans.
 	GlobalDNSConcurrency int
+	// GlobalDownloadBytesPerSec caps the bytes all scans download together
+	// (0: unlimited). It also caps monthly transfer: rate x ~2.6M seconds.
+	GlobalDownloadBytesPerSec int64
 
 	Cache CacheConfig
 
@@ -44,20 +47,34 @@ type CacheConfig struct {
 	MaxBytes int64
 	// CertTTL, DNSTTL, ProbeTTL and PageTTL are how long each layer's
 	// entries are reused.
-	CertTTL  time.Duration
-	DNSTTL   time.Duration
-	ProbeTTL time.Duration
-	PageTTL  time.Duration
+	CertTTL    time.Duration
+	DNSTTL     time.Duration
+	ProbeTTL   time.Duration
+	PageTTL    time.Duration
+	ArchiveTTL time.Duration
 }
 
 // ScanConfig controls how a single scan behaves.
 type ScanConfig struct {
+	// DefaultMode is the scan mode used when a request does not choose one:
+	// "passive", "light" or "full".
+	DefaultMode string
+	// ArchiveEnabled turns web archive route discovery on or off.
+	ArchiveEnabled bool
+	// ArchiveMaxURLs bounds the URLs listed from the web archive per scan.
+	ArchiveMaxURLs int
+	// SitemapMaxURLs and SitemapMaxFiles bound what is read from one host's
+	// sitemaps.
+	SitemapMaxURLs  int
+	SitemapMaxFiles int
 	// RequestTimeout is the timeout for a single outbound HTTP request.
 	RequestTimeout time.Duration
 	// Timeout is the overall time budget for one scan.
 	Timeout time.Duration
 	// MaxRequests bounds one scan's outbound HTTP requests.
 	MaxRequests int
+	// MaxDownloadBytes bounds the bytes one scan downloads.
+	MaxDownloadBytes int64
 	// MaxDiscoveredHosts bounds the hostnames one scan records.
 	MaxDiscoveredHosts int
 	// MaxRecordedURLs bounds the URLs one scan records.
@@ -106,25 +123,34 @@ func Load() (Config, error) {
 func LoadFrom(getenv func(string) string) (Config, error) {
 	p := parser{getenv: getenv}
 	cfg := Config{
-		Port:                  p.str("SERVER_PORT", "8080"),
-		LogLevel:              p.level("LOG_LEVEL", slog.LevelInfo),
-		MaxConcurrentScans:    p.int("MAX_CONCURRENT_SCANS", 3, 1),
-		QueueSize:             p.int("SCAN_QUEUE_SIZE", 100, 1),
-		MaxStoredScans:        p.int("MAX_STORED_SCANS", 100, 1),
-		MaxStoredResultURLs:   p.int("MAX_STORED_RESULT_URLS", 500000, 1),
-		GlobalHTTPConcurrency: p.int("GLOBAL_HTTP_CONCURRENCY", 32, 1),
-		GlobalDNSConcurrency:  p.int("GLOBAL_DNS_CONCURRENCY", 16, 1),
+		Port:                      p.str("SERVER_PORT", "8080"),
+		LogLevel:                  p.level("LOG_LEVEL", slog.LevelInfo),
+		MaxConcurrentScans:        p.int("MAX_CONCURRENT_SCANS", 3, 1),
+		QueueSize:                 p.int("SCAN_QUEUE_SIZE", 100, 1),
+		MaxStoredScans:            p.int("MAX_STORED_SCANS", 100, 1),
+		MaxStoredResultURLs:       p.int("MAX_STORED_RESULT_URLS", 500000, 1),
+		GlobalHTTPConcurrency:     p.int("GLOBAL_HTTP_CONCURRENCY", 32, 1),
+		GlobalDNSConcurrency:      p.int("GLOBAL_DNS_CONCURRENCY", 16, 1),
+		GlobalDownloadBytesPerSec: int64(p.int("GLOBAL_DOWNLOAD_KBPS", 1024, 0)) << 10,
 		Cache: CacheConfig{
 			MaxBytes: int64(p.int("CACHE_MAX_MB", 64, 0)) << 20,
 			CertTTL:  p.duration("CACHE_CERT_TTL", 6*time.Hour),
 			DNSTTL:   p.duration("CACHE_DNS_TTL", 5*time.Minute),
 			ProbeTTL: p.duration("CACHE_PROBE_TTL", 2*time.Minute),
 			PageTTL:  p.duration("CACHE_PAGE_TTL", 15*time.Minute),
+			// Archives change slowly and archive.org asks for moderate use.
+			ArchiveTTL: p.duration("CACHE_ARCHIVE_TTL", 24*time.Hour),
 		},
 		Scan: ScanConfig{
+			DefaultMode:            p.oneOf("SCAN_DEFAULT_MODE", "light", "passive", "light", "full"),
+			ArchiveEnabled:         p.bool("SCAN_ARCHIVE_ENABLED", true),
+			ArchiveMaxURLs:         p.int("SCAN_ARCHIVE_MAX_URLS", 5000, 1),
+			SitemapMaxURLs:         p.int("SCAN_SITEMAP_MAX_URLS", 2000, 1),
+			SitemapMaxFiles:        p.int("SCAN_SITEMAP_MAX_FILES", 5, 1),
 			RequestTimeout:         p.duration("SCAN_REQUEST_TIMEOUT", 10*time.Second),
 			Timeout:                p.duration("SCAN_TIMEOUT", 30*time.Minute),
 			MaxRequests:            p.int("SCAN_MAX_REQUESTS", 50000, 1),
+			MaxDownloadBytes:       int64(p.int("SCAN_MAX_DOWNLOAD_MB", 500, 1)) << 20,
 			MaxDiscoveredHosts:     p.int("SCAN_MAX_DISCOVERED_HOSTS", 10000, 1),
 			MaxRecordedURLs:        p.int("SCAN_MAX_RECORDED_URLS", 50000, 1),
 			MaxDepth:               p.int("SCAN_MAX_DEPTH", 3, 0),
@@ -173,6 +199,17 @@ func (p *parser) int(key string, def, min int) int {
 		return def
 	}
 	return n
+}
+
+func (p *parser) oneOf(key, def string, allowed ...string) string {
+	v := p.str(key, def)
+	for _, a := range allowed {
+		if v == a {
+			return v
+		}
+	}
+	p.errs = append(p.errs, fmt.Sprintf("%s must be one of %s", key, strings.Join(allowed, ", ")))
+	return def
 }
 
 func (p *parser) float(key string, def float64) float64 {

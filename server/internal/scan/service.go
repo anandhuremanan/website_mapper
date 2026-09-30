@@ -60,10 +60,34 @@ type Stage struct {
 	ID      string
 	Label   string
 	Engines []discovery.Engine
+	// Modes are the scan modes the stage runs in; empty means every mode.
+	Modes []Mode
+}
+
+// runsIn reports whether the stage is part of a scan in mode m.
+func (st Stage) runsIn(m Mode) bool {
+	if len(st.Modes) == 0 {
+		return true
+	}
+	for _, x := range st.Modes {
+		if x == m {
+			return true
+		}
+	}
+	return false
+}
+
+// CreateRequest is a request to scan a target.
+type CreateRequest struct {
+	Target string
+	// Mode is the scan depth; empty means the service's default.
+	Mode Mode
 }
 
 // Options configures a Service.
 type Options struct {
+	// DefaultMode is used when a request does not choose a mode.
+	DefaultMode Mode
 	// MaxRunning is the number of scans that run at the same time. Further
 	// scans wait in the queue.
 	MaxRunning int
@@ -75,10 +99,14 @@ type Options struct {
 	ProgressInterval time.Duration
 	// MaxRequests bounds each scan's outbound HTTP requests (0: no limit).
 	MaxRequests int
+	// MaxDownloadBytes bounds the bytes each scan downloads (0: no limit).
+	MaxDownloadBytes int64
 	// Limits bound each scan's recorded results.
 	Limits results.Limits
 	// Pools are the shared resource pools, reported by Stats.
 	Pools []*resource.Pool
+	// Bandwidth is the shared download limiter, reported by Stats.
+	Bandwidth *resource.Bandwidth
 	// Caches are the shared discovery caches, reported by Stats.
 	Caches []interface{ Stats() cache.Stats }
 }
@@ -112,6 +140,8 @@ type job struct {
 	id     string
 	key    string
 	target discovery.Target
+	mode   Mode
+	stages []Stage // the pipeline's stages that run in mode
 	// cancel is set once the job runs.
 	cancel context.CancelCauseFunc
 	// subscribers are the active subscriptions (requesters) of this scan.
@@ -124,15 +154,18 @@ type job struct {
 const optionsVersion = "v1"
 
 // scanKey defines equivalent scans: the same normalized start URL (scheme,
-// host and path, which decide where crawling starts) with the same options.
-// "example.com" and "https://example.com/" are equivalent;
-// "www.example.com" or "http://example.com" are not.
-func scanKey(t discovery.Target) string {
-	return t.StartURL + "|" + optionsVersion
+// host and path, which decide where crawling starts) with the same mode and
+// options. "example.com" and "https://example.com/" are equivalent;
+// "www.example.com", "http://example.com" or another mode are not.
+func scanKey(t discovery.Target, m Mode) string {
+	return t.StartURL + "|" + string(m) + "|" + optionsVersion
 }
 
 // NewService creates a Service that runs the given stages in order.
 func NewService(repo Repository, stages []Stage, opts Options, log *slog.Logger) *Service {
+	if opts.DefaultMode == "" {
+		opts.DefaultMode = ModeLight
+	}
 	opts.MaxRunning = max(opts.MaxRunning, 1)
 	opts.QueueSize = max(opts.QueueSize, 1)
 	if opts.ScanTimeout <= 0 {
@@ -218,8 +251,12 @@ func (s *Service) stop() {
 // scan is already queued or running, the request joins it (same scan ID, a
 // new subscription) instead of starting another. Otherwise a new scan is
 // queued and runs when capacity is available.
-func (s *Service) Create(ctx context.Context, input string) (Scan, error) {
-	target, err := discovery.ParseTarget(input)
+func (s *Service) Create(ctx context.Context, req CreateRequest) (Scan, error) {
+	target, err := discovery.ParseTarget(req.Target)
+	if err != nil {
+		return Scan{}, err
+	}
+	mode, err := ParseMode(string(req.Mode), s.opts.DefaultMode)
 	if err != nil {
 		return Scan{}, err
 	}
@@ -238,7 +275,7 @@ func (s *Service) Create(ctx context.Context, input string) (Scan, error) {
 	if s.closed {
 		return Scan{}, ErrShuttingDown
 	}
-	key := scanKey(target)
+	key := scanKey(target, mode)
 	if j, ok := s.active[key]; ok {
 		// Join: no new job, no queue slot, no worker.
 		j.subscribers[token] = true
@@ -264,14 +301,15 @@ func (s *Service) Create(ctx context.Context, input string) (Scan, error) {
 		Status:    StatusQueued,
 		Phase:     PhaseQueued,
 		CreatedAt: time.Now().UTC(),
-		Steps:     s.initialSteps(),
+		Mode:      mode,
+		Steps:     initialSteps(s.stagesFor(mode)),
 		Errors:    []EngineError{},
 		Limits:    []LimitNotice{},
 	}
 	if err := s.repo.Create(ctx, sc); err != nil {
 		return Scan{}, err
 	}
-	j := &job{id: id, key: key, target: target, subscribers: map[string]bool{token: true}}
+	j := &job{id: id, key: key, target: target, mode: mode, stages: s.stagesFor(mode), subscribers: map[string]bool{token: true}}
 	s.jobs[id] = j
 	s.active[key] = j
 	s.queue = append(s.queue, j)
@@ -450,15 +488,16 @@ type Stats struct {
 	Pools      []resource.Stats `json:"pools"`
 	// CoalescedRequests counts scan requests that joined an equivalent
 	// active scan instead of starting a new one.
-	CoalescedRequests int64         `json:"coalescedRequests"`
-	Caches            []cache.Stats `json:"caches"`
+	CoalescedRequests int64                   `json:"coalescedRequests"`
+	Caches            []cache.Stats           `json:"caches"`
+	Bandwidth         resource.BandwidthStats `json:"bandwidth"`
 }
 
 // Stats returns a snapshot of the scheduler and resource pools.
 func (s *Service) Stats() Stats {
 	s.mu.Lock()
 	st := Stats{Running: s.running, Queued: len(s.queue), MaxRunning: s.opts.MaxRunning, QueueSize: s.opts.QueueSize,
-		CoalescedRequests: s.joined, Caches: []cache.Stats{}}
+		CoalescedRequests: s.joined, Caches: []cache.Stats{}, Bandwidth: s.opts.Bandwidth.Stats()}
 	s.mu.Unlock()
 	for _, p := range s.opts.Pools {
 		st.Pools = append(st.Pools, p.Stats())
@@ -471,10 +510,21 @@ func (s *Service) Stats() Stats {
 
 // initialSteps lists progress steps: target validation (already done when
 // the scan is created), one step per stage, and finalization.
-func (s *Service) initialSteps() []Step {
-	steps := make([]Step, 0, len(s.stages)+2)
-	steps = append(steps, Step{ID: validateStep, Label: "Validating target", Status: StepDone})
+// stagesFor returns the pipeline's stages that run in mode m.
+func (s *Service) stagesFor(m Mode) []Stage {
+	var out []Stage
 	for _, st := range s.stages {
+		if st.runsIn(m) {
+			out = append(out, st)
+		}
+	}
+	return out
+}
+
+func initialSteps(stages []Stage) []Step {
+	steps := make([]Step, 0, len(stages)+2)
+	steps = append(steps, Step{ID: validateStep, Label: "Validating target", Status: StepDone})
+	for _, st := range stages {
 		steps = append(steps, Step{ID: st.ID, Label: st.Label, Status: StepPending})
 	}
 	return append(steps, Step{ID: finalizeStep, Label: "Finalizing results", Status: StepPending})
@@ -500,7 +550,7 @@ func (s *Service) run(ctx context.Context, j *job) {
 		}
 	}()
 
-	acct := resource.NewAccount(j.id, s.opts.MaxRequests)
+	acct := resource.NewAccount(j.id, s.opts.MaxRequests).WithDownloadBudget(s.opts.MaxDownloadBytes)
 	ctx = resource.WithAccount(ctx, acct)
 	ctx, cancel := context.WithTimeoutCause(ctx, s.opts.ScanTimeout, errTimeout)
 	defer cancel()
@@ -525,7 +575,7 @@ func (s *Service) run(ctx context.Context, j *job) {
 	stopProgress := s.trackProgress(tr, agg, acct, &phase)
 
 	runs, failed := 0, 0
-	for i, st := range s.stages {
+	for i, st := range j.stages {
 		step := i + 1 // step 0 is validation
 		if ctx.Err() != nil {
 			tr.update(func(sc *Scan) { sc.Steps[step].Status = StepSkipped })
@@ -580,7 +630,7 @@ func (s *Service) run(ctx context.Context, j *job) {
 	}
 	stopProgress()
 
-	finalIdx := len(s.stages) + 1
+	finalIdx := len(j.stages) + 1
 	tr.update(func(sc *Scan) {
 		sc.Steps[finalIdx].Status = StepRunning
 		sc.Phase, sc.Progress = PhaseFinalizing, nil
@@ -608,6 +658,7 @@ func (s *Service) run(ctx context.Context, j *job) {
 		Status:     finished.Status,
 		StopReason: stop,
 		Domain: Domain{
+			Mode:       finished.Mode,
 			Target:     finished.Target,
 			Canonical:  finished.Domain,
 			StartURL:   finished.StartURL,
@@ -662,8 +713,11 @@ func (s *Service) limitNotices(c results.Counts, acct *resource.Account, stop st
 	if stop == StopTimeout {
 		add(LimitScanTimeout, "The scan reached its time limit (%s) and stopped; results are partial.", s.opts.ScanTimeout)
 	}
-	if acct.Exhausted() {
+	if acct.RequestsExhausted() {
 		add(LimitRequestBudget, "The scan used its budget of %d requests; remaining probing and crawling was skipped.", acct.MaxRequests())
+	}
+	if acct.DownloadExhausted() {
+		add(LimitDownload, "The scan downloaded its limit of %d MB; remaining probing and crawling was skipped.", acct.MaxBytes()>>20)
 	}
 	if l.HostsOmitted > 0 {
 		add(LimitHostBudget, "%d more hostnames were discovered after the limit of %d hosts per scan; they are not listed.",
@@ -743,6 +797,10 @@ func phaseFor(engine string) Phase {
 		return PhaseResolving
 	case "http":
 		return PhaseProbing
+	case "archive":
+		return PhaseArchive
+	case "sitemap":
+		return PhaseSitemaps
 	case "html":
 		return PhaseCrawling
 	}
@@ -767,7 +825,8 @@ func phaseProgress(p Phase, c results.Counts) *PhaseProgress {
 }
 
 func resources(acct *resource.Account) Resources {
-	r := Resources{Requests: acct.Requests(), MaxRequests: acct.MaxRequests()}
+	r := Resources{Requests: acct.Requests(), MaxRequests: acct.MaxRequests(),
+		DownloadedBytes: acct.Bytes(), MaxDownloadBytes: acct.MaxBytes()}
 	if usage := acct.Usage(); len(usage) > 0 {
 		r.Pools = map[string]PoolUsage{}
 		for name, u := range usage {

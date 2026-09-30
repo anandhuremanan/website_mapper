@@ -16,6 +16,8 @@ const stepIcon: Record<StepStatus, { icon: string; className: string }> = {
 
 const phaseLabel: Partial<Record<Phase, string>> = {
   discovering_subdomains: "Discovering subdomains",
+  searching_archives: "Searching web archives",
+  reading_sitemaps: "Reading robots.txt and sitemaps",
   resolving_hosts: "Resolving hosts",
   probing_hosts: "Probing hosts",
   crawling_hosts: "Crawling hosts",

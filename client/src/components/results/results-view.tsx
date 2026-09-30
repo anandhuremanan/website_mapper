@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { allUrls, formatDuration, hostStatus, plural, sourceLabel } from "@/lib/format";
+import { allUrls, formatDuration, hostStatus, modeLabels, plural, sourceLabel } from "@/lib/format";
 import type { Scan, ScanResult } from "@/lib/types";
 import { HostList } from "./host-list";
 import { SiteMap } from "./site-map";
@@ -55,7 +55,8 @@ export function ResultsView({ scan, result }: { scan: Scan; result: ScanResult }
           {plural(counts.assets, "asset")}
         </p>
         <p className="text-xs text-muted">
-          Started from <span className="font-mono">{domain.startUrl}</span> ·{" "}
+          {modeLabels[domain.mode] ?? domain.mode} scan from{" "}
+          <span className="font-mono">{domain.startUrl}</span> ·{" "}
           {new Date(domain.scannedAt).toLocaleString()} · took {formatDuration(domain.durationMs)}
         </p>
       </header>

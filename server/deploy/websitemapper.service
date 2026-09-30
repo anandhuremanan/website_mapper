@@ -1,0 +1,65 @@
+# systemd unit for the Website Mapper API on a shared server.
+#
+# The limits below are enforced by the kernel (cgroup v2, the default on
+# Ubuntu 24.04), independently of the application's own limits. If anything
+# goes wrong, only this service is throttled or restarted; other services on
+# the machine keep their memory and CPU.
+#
+# Install:
+#   sudo useradd --system --no-create-home websitemapper
+#   sudo install -m 0755 server /usr/local/bin/websitemapper
+#   sudo install -D -m 0644 deploy/websitemapper.env /etc/websitemapper/websitemapper.env
+#   sudo install -m 0644 deploy/websitemapper.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now websitemapper
+# Check:
+#   systemctl status websitemapper
+#   systemd-cgtop            # live CPU/memory per service
+#   curl -s localhost:8080/api/health
+
+[Unit]
+Description=Website Mapper API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=websitemapper
+EnvironmentFile=/etc/websitemapper/websitemapper.env
+ExecStart=/usr/local/bin/websitemapper
+Restart=on-failure
+RestartSec=5
+# Scans get 15 s to stop and save partial results (see shutdownGrace).
+TimeoutStopSec=20
+
+# --- Memory -------------------------------------------------------------------
+# Above MemoryHigh the kernel reclaims and throttles this service; at
+# MemoryMax only this service is OOM-killed (and restarted), never others.
+MemoryHigh=400M
+MemoryMax=512M
+MemorySwapMax=0
+
+# --- CPU ------------------------------------------------------------------------
+# At most 60% of one CPU, and lower priority than other services when the
+# machine is busy (default CPUWeight is 100).
+CPUQuota=60%
+CPUWeight=20
+Nice=10
+IOWeight=20
+
+# --- Other bounds ----------------------------------------------------------------
+TasksMax=512
+LimitNOFILE=4096
+
+# --- Hardening (no disk writes needed: everything is in memory) -----------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

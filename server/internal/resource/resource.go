@@ -29,9 +29,12 @@ var ErrBudgetExhausted = errors.New("scan request limit reached")
 type Account struct {
 	id          string
 	maxRequests int64
+	maxBytes    int64
 
 	requests  atomic.Int64
-	exhausted atomic.Bool
+	bytes     atomic.Int64
+	exhausted atomic.Bool // request budget
+	bytesOut  atomic.Bool // download budget
 
 	mu    sync.Mutex
 	usage map[string]*Usage // per pool name
@@ -52,6 +55,51 @@ func NewAccount(id string, maxRequests int) *Account {
 	return &Account{id: id, maxRequests: int64(maxRequests), usage: map[string]*Usage{}}
 }
 
+// WithDownloadBudget limits the bytes the scan may download (0: unlimited).
+func (a *Account) WithDownloadBudget(maxBytes int64) *Account {
+	a.maxBytes = maxBytes
+	return a
+}
+
+// TakeBytes charges n downloaded bytes. It returns ErrDownloadBudget once
+// the budget is used up; the bytes are still counted.
+func (a *Account) TakeBytes(n int) error {
+	if a == nil {
+		return nil
+	}
+	if total := a.bytes.Add(int64(n)); a.maxBytes > 0 && total > a.maxBytes {
+		a.bytesOut.Store(true)
+		return ErrDownloadBudget
+	}
+	return nil
+}
+
+// Bytes returns the bytes downloaded so far.
+func (a *Account) Bytes() int64 {
+	if a == nil {
+		return 0
+	}
+	return a.bytes.Load()
+}
+
+// MaxBytes returns the download budget (0: unlimited).
+func (a *Account) MaxBytes() int64 {
+	if a == nil {
+		return 0
+	}
+	return a.maxBytes
+}
+
+// DownloadExhausted reports whether the download budget ran out.
+func (a *Account) DownloadExhausted() bool {
+	return a != nil && a.bytesOut.Load()
+}
+
+// RequestsExhausted reports whether the request budget ran out.
+func (a *Account) RequestsExhausted() bool {
+	return a != nil && a.exhausted.Load()
+}
+
 // ID identifies the scan.
 func (a *Account) ID() string {
 	if a == nil {
@@ -64,6 +112,9 @@ func (a *Account) ID() string {
 func (a *Account) TakeRequest() error {
 	if a == nil {
 		return nil
+	}
+	if a.bytesOut.Load() {
+		return ErrDownloadBudget
 	}
 	if n := a.requests.Add(1); a.maxRequests > 0 && n > a.maxRequests {
 		a.requests.Add(-1)
@@ -89,9 +140,10 @@ func (a *Account) MaxRequests() int {
 	return int(a.maxRequests)
 }
 
-// Exhausted reports whether a request was refused because the budget ran out.
+// Exhausted reports whether the scan ran out of its request or download
+// budget, after which it makes no more requests.
 func (a *Account) Exhausted() bool {
-	return a != nil && a.exhausted.Load()
+	return a != nil && (a.exhausted.Load() || a.bytesOut.Load())
 }
 
 // Usage returns the account's use of each pool, by pool name.

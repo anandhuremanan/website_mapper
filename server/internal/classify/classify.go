@@ -42,6 +42,9 @@ type Input struct {
 	Hints       []discovery.Hint
 	Status      int
 	ContentType string
+	// ArchivedContentType is the content type a web archive recorded. It is
+	// weaker evidence than a live response: the URL was not requested.
+	ArchivedContentType string
 }
 
 // Result is a classification with the evidence behind it.
@@ -116,6 +119,14 @@ func Classify(in Input) Result {
 		}
 	}
 
+	// 1b. What a web archive captured: observed, but historical.
+	if in.ArchivedContentType != "" {
+		if r, ok := byContentType(in.ArchivedContentType); ok {
+			r.Evidence = "Archived as " + strings.ToLower(in.ArchivedContentType) + " by the web archive (not requested)"
+			return r
+		}
+	}
+
 	// 2. How the URL was referenced (<script src>, <link rel=stylesheet>, ...).
 	for _, h := range []discovery.Hint{
 		discovery.HintScript, discovery.HintStylesheet, discovery.HintFont,
@@ -147,6 +158,10 @@ func Classify(in Input) Result {
 		return Result{Type: TypePage, Evidence: "Linked from HTML"}
 	case hints[discovery.HintRedirect]:
 		return Result{Type: TypePage, Evidence: "Target of a redirect"}
+	case hints[discovery.HintSitemap]:
+		return Result{Type: TypePage, Evidence: "Listed in a sitemap"}
+	case hints[discovery.HintArchive]:
+		return Result{Type: TypeUnknown, Evidence: "Listed by the web archive; content type unknown"}
 	}
 	if hints[discovery.HintForm] {
 		return Result{Type: TypeUnknown, Evidence: "Form submission target (not requested)"}

@@ -43,12 +43,13 @@ type Host struct {
 	// FromCache is true when every discovery of this host was reused from
 	// the shared cache (e.g. an earlier scan's certificate lookup) rather
 	// than made by this scan.
-	FromCache bool                 `json:"fromCache,omitempty"`
-	DNS       *discovery.DNSInfo   `json:"dns,omitempty"`
-	HTTP      *discovery.HTTPInfo  `json:"http,omitempty"`
-	Crawl     *discovery.CrawlInfo `json:"crawl,omitempty"`
-	Counts    HostCounts           `json:"counts"`
-	URLs      []URL                `json:"urls"`
+	FromCache bool                   `json:"fromCache,omitempty"`
+	DNS       *discovery.DNSInfo     `json:"dns,omitempty"`
+	HTTP      *discovery.HTTPInfo    `json:"http,omitempty"`
+	Crawl     *discovery.CrawlInfo   `json:"crawl,omitempty"`
+	Sitemap   *discovery.SitemapInfo `json:"sitemap,omitempty"`
+	Counts    HostCounts             `json:"counts"`
+	URLs      []URL                  `json:"urls"`
 	// Omitted counts URLs seen on this host but not recorded because the
 	// per-host URL limit was reached.
 	Omitted int `json:"urlsOmitted,omitempty"`
@@ -91,6 +92,9 @@ type URL struct {
 	// CachedAt is set when the response was reused from the page cache; it
 	// is when the page was actually fetched.
 	CachedAt *time.Time `json:"cachedAt,omitempty"`
+	// Archived is what a web archive recorded about the URL (historical;
+	// the URL may no longer exist).
+	Archived *discovery.ArchiveInfo `json:"archived,omitempty"`
 }
 
 // URLState distinguishes discovering a URL from requesting it.

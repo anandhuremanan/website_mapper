@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -197,5 +198,47 @@ func TestCoalescedScansAndSubscriptionCancel(t *testing.T) {
 	_, health := do(t, "GET", srv.URL+"/api/health", "")
 	if sched := health["scheduler"].(map[string]any); sched["coalescedRequests"] != float64(1) {
 		t.Errorf("health = %v", sched)
+	}
+}
+
+func TestResponsesAreGzipped(t *testing.T) {
+	srv := newServer(t, false)
+	req, _ := http.NewRequest("GET", srv.URL+"/api/health", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	// A Transport with compression disabled shows the raw encoding.
+	resp, err := (&http.Transport{DisableCompression: true}).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("Content-Encoding = %q", resp.Header.Get("Content-Encoding"))
+	}
+	zr, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(zr).Decode(&body); err != nil || body["status"] != "ok" || body["process"] == nil {
+		t.Errorf("decoded %v, %v", body, err)
+	}
+	// Clients that do not ask for gzip get plain JSON.
+	code, plain := do(t, "GET", srv.URL+"/api/health", "")
+	if code != 200 || plain["status"] != "ok" {
+		t.Errorf("plain = %d %v", code, plain)
+	}
+}
+
+func TestCreateScanMode(t *testing.T) {
+	srv := newServer(t, false)
+	code, body := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com","mode":"passive"}`)
+	if code != http.StatusAccepted || body["mode"] != "passive" {
+		t.Errorf("passive = %d %v", code, body)
+	}
+	if code, body := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com"}`); body["mode"] != "light" {
+		t.Errorf("default = %d %v", code, body["mode"])
+	}
+	if code, body := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com","mode":"deep"}`); code != http.StatusBadRequest {
+		t.Errorf("invalid mode = %d %v", code, body)
 	}
 }

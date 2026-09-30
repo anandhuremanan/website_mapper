@@ -29,6 +29,9 @@ const (
 	SourceRobots     Source = "robots"
 	SourceCT         Source = "certificate-transparency"
 	SourceRedirect   Source = "redirect"
+	// SourceArchive: listed by a public web archive (the Wayback Machine).
+	// The scanner did not request the URL; it may no longer exist.
+	SourceArchive Source = "archive"
 	// SourceHost marks a host's root URL, requested because the host itself
 	// was discovered. It is URL provenance only, never host provenance.
 	SourceHost Source = "host"
@@ -50,6 +53,8 @@ const (
 	HintManifest   Hint = "manifest"   // web app manifest
 	HintRedirect   Hint = "redirect"   // Location header target
 	HintEntry      Hint = "entry"      // a URL a crawl starts from
+	HintSitemap    Hint = "sitemap"    // a <loc> in a sitemap
+	HintArchive    Hint = "archive"    // listed by a web archive
 )
 
 // Finding is a single raw observation reported by an engine. It is either
@@ -75,14 +80,27 @@ type Finding struct {
 	Error string
 
 	// Host observations. Each replaces any earlier value for the host.
-	DNS   *DNSInfo
-	HTTP  *HTTPInfo
-	Crawl *CrawlInfo
+	DNS     *DNSInfo
+	HTTP    *HTTPInfo
+	Crawl   *CrawlInfo
+	Sitemap *SitemapInfo
+
+	// Archive is set for URLs listed by a web archive.
+	Archive *ArchiveInfo
 
 	// CachedAt is set when the discovery was reused from the shared cache:
 	// it is when the original observation was made. Zero means it was made
 	// by this scan.
 	CachedAt time.Time
+}
+
+// ArchiveInfo is what a web archive recorded about a URL. It is historical:
+// the scanner did not request the URL.
+type ArchiveInfo struct {
+	// FirstSeen is when the archive first captured the URL successfully.
+	FirstSeen time.Time `json:"firstSeen"`
+	// ContentType is the content type the archive captured.
+	ContentType string `json:"contentType,omitempty"`
 }
 
 // Response is HTTP metadata observed while fetching a URL.
@@ -177,6 +195,22 @@ const (
 	SkipRequestLimit = "scan request limit reached"
 )
 
+// SitemapInfo summarizes a host's robots.txt and sitemaps. Values are
+// immutable once emitted.
+type SitemapInfo struct {
+	// RobotsStatus is the HTTP status of /robots.txt (0 if not requested).
+	RobotsStatus int `json:"robotsStatus,omitempty"`
+	// Files is how many sitemap files were read; URLs how many page URLs
+	// they listed (within scope and limits).
+	Files int `json:"files"`
+	URLs  int `json:"urls"`
+	// LimitReached is true when more sitemap files or URLs existed than
+	// the per-host limits allow.
+	LimitReached bool `json:"limitReached,omitempty"`
+	// Skipped explains why the host's sitemaps were not read.
+	Skipped string `json:"skipped,omitempty"`
+}
+
 // HostView is a read-only snapshot of what is known about a host.
 type HostView struct {
 	Name    string
@@ -184,6 +218,7 @@ type HostView struct {
 	DNS     *DNSInfo
 	HTTP    *HTTPInfo
 	Crawl   *CrawlInfo
+	Sitemap *SitemapInfo
 }
 
 // Reachable reports whether the host answered HTTP.

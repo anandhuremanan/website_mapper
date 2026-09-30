@@ -1,4 +1,4 @@
-import type { Scan, ScanResult } from "./types";
+import type { Scan, ScanMode, ScanResult } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -50,10 +50,10 @@ function subscriptionFor(scanId: string): string | null {
   }
 }
 
-export async function createScan(target: string): Promise<Scan> {
+export async function createScan(target: string, mode: ScanMode): Promise<Scan> {
   const scan = await request<Scan>("/api/scans", {
     method: "POST",
-    body: JSON.stringify({ target }),
+    body: JSON.stringify({ target, mode }),
   });
   rememberSubscription(scan);
   return scan;

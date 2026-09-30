@@ -116,7 +116,7 @@ func TestScanPipeline(t *testing.T) {
 		stage("crawl", crawl),
 	}, scan.Options{})
 
-	sc, err := svc.Create(context.Background(), "https://Example.com")
+	sc, err := svc.Create(context.Background(), scan.CreateRequest{Target: "https://Example.com"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestScanPipeline(t *testing.T) {
 func TestScanSeedsEnteredHostAndApex(t *testing.T) {
 	e := &fakeEngine{name: "noop"}
 	svc := startService(t, []scan.Stage{stage("s", e)}, scan.Options{})
-	sc, _ := svc.Create(context.Background(), "https://www.example.com/docs")
+	sc, _ := svc.Create(context.Background(), scan.CreateRequest{Target: "https://www.example.com/docs"})
 	waitFinished(t, svc, sc.ID)
 	if got := e.sawHosts[0]; !reflect.DeepEqual(got, []string{"example.com", "www.example.com"}) {
 		t.Errorf("seeded hosts = %v", got)
@@ -199,7 +199,7 @@ func TestScanFailsWhenEveryEngineFails(t *testing.T) {
 		stage("a", &fakeEngine{name: "a", err: errors.New("down")}),
 		stage("b", &fakeEngine{name: "b", err: errors.New("down")}),
 	}, scan.Options{})
-	sc, err := svc.Create(context.Background(), "example.com")
+	sc, err := svc.Create(context.Background(), scan.CreateRequest{Target: "example.com"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestScanTimeoutKeepsPartialResults(t *testing.T) {
 	}}
 	next := &fakeEngine{name: "js"}
 	svc := startService(t, []scan.Stage{stage("crawl", slow), stage("js", next)}, scan.Options{ScanTimeout: 50 * time.Millisecond})
-	sc, _ := svc.Create(context.Background(), "example.com")
+	sc, _ := svc.Create(context.Background(), scan.CreateRequest{Target: "example.com"})
 	sc = waitFinished(t, svc, sc.ID)
 	if sc.Status != scan.StatusCompleted || sc.StopReason != scan.StopTimeout {
 		t.Errorf("status = %s stop = %q (%s), want completed with scan_timeout", sc.Status, sc.StopReason, sc.Error)
@@ -251,7 +251,7 @@ func hasLimit(ls []scan.LimitNotice, code string) bool {
 
 func TestCreateRejectsInvalidTarget(t *testing.T) {
 	svc := startService(t, nil, scan.Options{})
-	if _, err := svc.Create(context.Background(), "http://127.0.0.1"); !errors.Is(err, discovery.ErrInvalidTarget) {
+	if _, err := svc.Create(context.Background(), scan.CreateRequest{Target: "http://127.0.0.1"}); !errors.Is(err, discovery.ErrInvalidTarget) {
 		t.Errorf("err = %v", err)
 	}
 }
@@ -259,10 +259,10 @@ func TestCreateRejectsInvalidTarget(t *testing.T) {
 func TestCreateQueueFull(t *testing.T) {
 	// No workers started, queue of 1.
 	svc := scan.NewService(store.NewMemory(store.Limits{MaxScans: 10}), nil, scan.Options{QueueSize: 1}, quiet)
-	if _, err := svc.Create(context.Background(), "example.com"); err != nil {
+	if _, err := svc.Create(context.Background(), scan.CreateRequest{Target: "example.com"}); err != nil {
 		t.Fatal(err)
 	}
-	sc, err := svc.Create(context.Background(), "example.org")
+	sc, err := svc.Create(context.Background(), scan.CreateRequest{Target: "example.org"})
 	if !errors.Is(err, scan.ErrQueueFull) {
 		t.Errorf("err = %v, want ErrQueueFull", err)
 	}
