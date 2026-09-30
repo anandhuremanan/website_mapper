@@ -1,4 +1,4 @@
-# Contributing to Website Mapper
+# Contributing to Web Scanner
 
 Thanks for your interest! Bug reports, fixes, documentation and new
 discovery sources are all welcome.
@@ -10,7 +10,7 @@ to find a first issue.
 
 ## Ground rules
 
-Website Mapper is a **discovery** tool, not a security scanner. Contributions
+Web Scanner is a **discovery** tool, not a security scanner. Contributions
 must keep it polite and passive:
 
 - only ordinary `GET` requests to in-scope hosts, at a limited rate;
@@ -49,7 +49,8 @@ See [server/.env.example](server/.env.example) for all of them.
 
 ## Checks
 
-Run these before opening a pull request. CI runs the same commands.
+Run these before opening a pull request. GitHub Actions runs the server
+checks; the client is built and deployed by Vercel.
 
 ```sh
 cd server

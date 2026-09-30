@@ -1,4 +1,4 @@
-# Website Mapper — server
+# Web Scanner — server
 
 Go HTTP API that runs passive discovery scans against a public domain. It
 finds the domain's hosts, checks which ones resolve and answer HTTP(S),
@@ -295,7 +295,7 @@ crawling elsewhere.
 
 ### Memory on a shared server
 
-Website Mapper shares its VPS with other services (FileDrop), so its memory
+Web Scanner shares its VPS with other services (FileDrop), so its memory
 is bounded by configuration rather than by what the machine has:
 
 | Part | Bound (defaults) | Approximate memory |

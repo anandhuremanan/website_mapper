@@ -1,10 +1,17 @@
 name: CI
 
+# Checks the Go API only; the web client is built and deployed by Vercel.
 on:
   pull_request:
+    paths:
+      - "server/**"
+      - ".github/workflows/ci.yml"
   push:
     branches:
       - main
+    paths:
+      - "server/**"
+      - ".github/workflows/ci.yml"
 
 permissions:
   contents: read
@@ -53,36 +60,3 @@ jobs:
 
       - name: Build
         run: go build -o /dev/null ./cmd/server
-
-  client:
-    name: Client
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: client
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: client/package-lock.json
-
-      - name: Install
-        run: npm ci
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Test
-        run: npm test
-
-      - name: Build
-        run: npm run build

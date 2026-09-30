@@ -1,6 +1,6 @@
 # Architecture
 
-This document is for people who want to understand or change Website Mapper.
+This document is for people who want to understand or change Web Scanner.
 It explains how the pieces fit together, why they are built the way they
 are, and where to start when adding something. For running and deploying
 the project see the [README](README.md); for the HTTP API and every setting
@@ -30,7 +30,7 @@ see [server/README.md](server/README.md).
 
 ## What the system does
 
-Given a domain, Website Mapper lists what is publicly discoverable about it:
+Given a domain, Web Scanner lists what is publicly discoverable about it:
 its **hosts** (the domain and its subdomains) and the **URLs** on each host
 (pages, API-like endpoints, assets). Every result records **how it was
 found** (its provenance), because the product's promise is "here is what we
@@ -499,7 +499,7 @@ cd client && npm run typecheck && npm run lint && npm test && npm run build
 
 ## Why is it built like this?
 
-If some of this looks like more machinery than a website mapper needs, here
+If some of this looks like more machinery than a web scanner needs, here
 is the constraint behind each part:
 
 | Part | Why it exists |

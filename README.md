@@ -1,8 +1,8 @@
-# Website Mapper
+# Web Scanner
 
 > Enter a domain. Understand what exists on the public internet.
 
-Website Mapper lists what is publicly discoverable about a website: its
+Web Scanner lists what is publicly discoverable about a website: its
 **subdomains** and the **routes** on each of them (pages, API-like endpoints
 and assets), with **how every result was found**. It answers the question
 "I own this domain; what can someone discover about it from the outside?"
@@ -80,6 +80,7 @@ The API is a single static Go binary with no database.
 - [.github/workflows/deploy.yml](.github/workflows/deploy.yml) tests, builds
   and deploys the API over SSH on pushes to `main`. It needs the repository
   secrets `VPS_HOST`, `VPS_SSH_PORT`, `VPS_USER` and `VPS_DEPLOY_KEY`.
+- The web client (`client/`) is built and deployed by Vercel.
 
 Keep the API port closed to the internet and serve it through the client or
 a reverse proxy. Everything is kept in memory, so a restart clears scans and

@@ -1,4 +1,4 @@
-# systemd unit for the Website Mapper API on a shared server.
+# systemd unit for the Web Scanner API on a shared server.
 #
 # The limits below are enforced by the kernel (cgroup v2, the default on
 # Ubuntu 24.04), independently of the application's own limits. If anything
@@ -17,7 +17,7 @@
 #   curl -s localhost:8080/api/health
 
 [Unit]
-Description=Website Mapper API
+Description=Web Scanner API
 After=network-online.target
 Wants=network-online.target
 

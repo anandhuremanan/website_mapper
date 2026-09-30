@@ -1,4 +1,4 @@
-// Command server runs the Website Mapper HTTP API.
+// Command server runs the Web Scanner HTTP API.
 package main
 
 import (

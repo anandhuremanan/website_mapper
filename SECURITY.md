@@ -14,7 +14,7 @@ time for a fix before disclosing publicly.
 
 ## What counts as a vulnerability
 
-Website Mapper makes outbound requests on behalf of users, so issues that
+Web Scanner makes outbound requests on behalf of users, so issues that
 make it misbehave toward other systems are the most important, for example:
 
 - reaching private, loopback, link-local or cloud metadata addresses
@@ -37,7 +37,7 @@ Only the latest code on the `main` branch is supported.
 
 ## Reporting abuse
 
-If a Website Mapper instance is sending unwanted traffic to your site,
+If a Web Scanner instance is sending unwanted traffic to your site,
 contact whoever operates that instance. The scanner identifies itself with
 the `User-Agent` configured by its operator (`SCAN_USER_AGENT`). For the
 instance run by the maintainer, use the contact above.
