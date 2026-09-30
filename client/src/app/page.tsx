@@ -3,7 +3,7 @@ import { ScanForm } from "@/components/scan-form";
 export default function Home() {
   return (
     <div className="mx-auto max-w-xl pt-12">
-      <h1 className="text-3xl font-semibold tracking-tight">Website Mapper</h1>
+      <h1 className="text-3xl font-semibold tracking-tight">Web Scanner</h1>
       <p className="mt-2 text-muted">
         Understand what is publicly discoverable about your website.
       </p>

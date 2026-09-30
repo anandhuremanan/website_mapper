@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Website Mapper",
+  title: "Web Scanner",
   description: "Understand what is publicly discoverable about your website.",
 };
 
@@ -28,7 +28,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
         <header className="border-b border-border">
           <div className="mx-auto flex h-12 max-w-5xl items-center px-4">
             <Link href="/" className="text-sm font-semibold tracking-tight">
-              Website Mapper
+              Web Scanner
             </Link>
           </div>
         </header>
