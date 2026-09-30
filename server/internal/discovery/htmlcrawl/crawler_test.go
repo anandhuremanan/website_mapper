@@ -32,8 +32,11 @@ func (s *fakeSite) Get(_ context.Context, u string) (*fetch.Response, error) {
 	defer s.mu.Unlock()
 	s.requested = append(s.requested, u)
 	if r, ok := s.pages[u]; ok {
-		r.URL = u
-		return r, nil
+		// Return a copy: concurrent requests must not share one response,
+		// just as the real client builds a new response per request.
+		cp := *r
+		cp.URL = u
+		return &cp, nil
 	}
 	return nil, errors.New("connection refused")
 }

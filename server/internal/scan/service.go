@@ -53,9 +53,9 @@ const (
 // Stage is one ordered phase of a scan, shown as one progress step. Its
 // engines run one after another, each seeing everything found so far.
 //
-// The pipeline is an ordered list of stages, so new engines (robots.txt,
-// sitemap, JavaScript analysis, ...) are added by inserting them into a
-// stage or adding a stage, without changing the service.
+// The pipeline is an ordered list of stages, so new engines (for example
+// JavaScript analysis) are added by inserting them into a stage or adding a
+// stage, without changing the service.
 type Stage struct {
 	ID      string
 	Label   string

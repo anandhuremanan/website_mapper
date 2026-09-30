@@ -26,11 +26,14 @@ func (f *fakeHosts) Get(_ context.Context, u string) (*fetch.Response, error) {
 	defer f.mu.Unlock()
 	f.requested = append(f.requested, u)
 	if r, ok := f.responses[u]; ok {
-		r.URL = u
-		if r.Header == nil {
-			r.Header = http.Header{}
+		// Return a copy: concurrent probes must not share one response,
+		// just as the real client builds a new response per request.
+		cp := *r
+		cp.URL = u
+		if cp.Header == nil {
+			cp.Header = http.Header{}
 		}
-		return r, nil
+		return &cp, nil
 	}
 	return nil, fmt.Errorf("Get %q: dial tcp: connection refused", u)
 }

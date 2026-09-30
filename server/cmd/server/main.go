@@ -184,8 +184,8 @@ func (c sharedCaches) list() []interface{ Stats() cache.Stats } {
 //  7. the same steps for hosts first found in 5 or 6 (light, full)
 //
 // Host engines only process hosts they have not seen, so the same engine
-// instances are reused in the follow-up stage. Future engines (robots.txt,
-// sitemap, JavaScript analysis) slot in as engines or stages here.
+// instances are reused in the follow-up stage. New engines (for example
+// JavaScript analysis) slot in as engines or stages here.
 //
 // Every engine shares one HTTP client (and so one connection pool) and the
 // server-wide resource pools; per-scan concurrency settings only bound how

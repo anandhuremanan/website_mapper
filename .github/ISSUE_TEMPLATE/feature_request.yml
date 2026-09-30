@@ -1,0 +1,19 @@
+name: Feature request
+description: Suggest an improvement or a new discovery source.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Website Mapper is a passive discovery tool. Ideas that involve form submission, path guessing, brute forcing or vulnerability scanning are out of scope (see CONTRIBUTING.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like to happen?
+      description: If it is a new data source, say where the data comes from and how many requests it needs.

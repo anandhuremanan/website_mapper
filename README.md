@@ -2,19 +2,49 @@
 
 > Enter a domain. Understand what exists on the public internet.
 
-Website Mapper builds a map of what is publicly discoverable about a website:
-its hosts, pages, API-like endpoints, assets and technologies. For each result
-it shows how the result was found. The scanner is passive and low-impact. It
-is not a vulnerability scanner.
+Website Mapper lists what is publicly discoverable about a website: its
+**subdomains** and the **routes** on each of them (pages, API-like endpoints
+and assets), with **how every result was found**. It answers the question
+"I own this domain; what can someone discover about it from the outside?"
 
-```text
-server/   Go API, scan orchestration and discovery engines  → server/README.md
-client/   Next.js web UI                                     → client/README.md
-```
+It is a passive discovery tool, not a vulnerability scanner: it reads public
+sources, sends ordinary `GET` requests at a polite rate, and never submits
+forms, guesses paths or brute-forces names.
 
-## Run locally
+[![CI](https://github.com/anandhuremanan/website_mapper/actions/workflows/ci.yml/badge.svg)](https://github.com/anandhuremanan/website_mapper/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-You need Go 1.23+ and Node.js 20.9+. Use two terminals:
+## Features
+
+- **Subdomains from certificate logs** (crt.sh and Cert Spotter), checked in
+  DNS; names that no longer resolve stay visible.
+- **Routes from several sources:** a public web archive (without contacting
+  the site), robots.txt and sitemaps, and optionally a crawl of each live
+  host.
+- **Provenance for everything:** each host and URL says where it came from,
+  whether the scanner requested it, and why it is classified as a page, API
+  or asset.
+- **Three scan depths:** passive, standard and full crawl (below).
+- **Built for small servers:** global limits on concurrent work, fair sharing
+  between users, a bandwidth cap, per-scan budgets, a bounded shared cache
+  and a queue. Identical scans started at the same time are merged into one.
+  Limits that shaped a result are always reported.
+
+## Scan modes
+
+| Mode | Contacts the site? | Routes come from |
+| --- | --- | --- |
+| Passive | never | the web archive (may be out of date) |
+| Standard *(default)* | one check per live host, plus its robots.txt and sitemaps | archive + sitemaps |
+| Full crawl | also follows links on every live host | archive + sitemaps + links |
+
+Measured examples (cold, on a small server): python.org takes about 18 s
+passive (6 requests), 53 s standard (186 requests) and 143 s as a full crawl
+(4,677 requests). See [server/README.md](server/README.md#scan-modes).
+
+## Quick start
+
+You need **Go 1.23+** and **Node.js 20.9+**. Use two terminals:
 
 ```sh
 # 1. API on :8080
@@ -28,7 +58,7 @@ npm run dev
 ```
 
 Open http://localhost:3000 and enter a domain you own or have permission to
-inspect.
+inspect. No configuration is needed; every setting has a default.
 
 ## Test and build
 
@@ -36,3 +66,44 @@ inspect.
 cd server && gofmt -l . && go vet ./... && go test ./... && go build -o bin/server ./cmd/server
 cd client && npm run typecheck && npm run lint && npm test && npm run build
 ```
+
+## Deploying
+
+The API is a single static Go binary with no database.
+
+- [server/deploy/websitemapper.env](server/deploy/websitemapper.env) is a
+  settings profile for a small VPS (2 vCPU / 2 GiB) shared with other
+  services.
+- [server/deploy/websitemapper.service](server/deploy/websitemapper.service)
+  is a systemd unit with hard memory and CPU limits, so the scanner can never
+  starve other services.
+- [.github/workflows/deploy.yml](.github/workflows/deploy.yml) tests, builds
+  and deploys the API over SSH on pushes to `main`. It needs the repository
+  secrets `VPS_HOST`, `VPS_SSH_PORT`, `VPS_USER` and `VPS_DEPLOY_KEY`.
+
+Keep the API port closed to the internet and serve it through the client or
+a reverse proxy. Everything is kept in memory, so a restart clears scans and
+the cache. Memory, CPU and bandwidth behaviour are described in
+[server/README.md](server/README.md#deploying-on-a-small-shared-server).
+
+## Documentation
+
+| Document | For |
+| --- | --- |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | how it works and why, for contributors |
+| [server/README.md](server/README.md) | the HTTP API, every setting, resource limits, caching |
+| [client/README.md](client/README.md) | the web UI |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | setup, checks and how to contribute |
+| [SECURITY.md](SECURITY.md) | reporting vulnerabilities |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | community guidelines |
+
+## Responsible use
+
+Only scan domains you own or have permission to inspect. Passive mode never
+contacts the site; the other modes make a limited number of ordinary
+requests, identified by the configured `User-Agent`, at no more than 5
+requests per second per host by default.
+
+## License
+
+[MIT](LICENSE) © [Anandhu Remanan](https://imanandhu.in)

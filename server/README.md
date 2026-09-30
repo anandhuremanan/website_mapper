@@ -47,8 +47,10 @@ internal/cache        bounded TTL cache with single-flight loading (shared disco
 internal/store        in-memory Repository (swap for PostgreSQL later)
 internal/discovery    Engine interface, Finding, State, Target/scope
   subdomains          passive hostname discovery; Source providers: crt.sh, Cert Spotter
+  archive             archived URLs from the Wayback Machine CDX index
   dnsresolve          resolves hosts (injectable Resolver)
   httpprobe           checks https:// then http:// on resolved hosts
+  sitemap             robots.txt Sitemap: lines and XML/text sitemaps
   htmlcrawl           crawls reachable hosts, each with its own budget
 internal/results      Aggregator: merges findings into hosts → URLs, implements State
 internal/normalize    URL and hostname canonicalization (deduplication keys)
@@ -372,7 +374,7 @@ firewall. If the Next.js client runs on the same machine, give it its own
 limits too (for example `NODE_OPTIONS=--max-old-space-size=256` and a
 similar systemd unit).
 
-### Design decisions (Phase 1 review)
+### Design notes
 
 Reviewed and deliberately left as they are:
 
@@ -407,8 +409,8 @@ Reviewed and deliberately left as they are:
 - **Certificate providers are isolated.** Each has its own deadline
   (`SCAN_CT_TIMEOUT`, retries included); hosts from a provider that answered
   are always kept, and a failed provider is recorded as a partial error.
-  Caching provider answers across scans belongs to the shared-cache
-  milestone.
+  Answers (and brief failures) are cached across scans; see Shared
+  discovery cache.
 - **Shutdown** is covered by unit tests. A real SIGINT/SIGTERM end-to-end test
   is still to be run on Linux or macOS, since Windows cannot deliver the
   signal to a background process.

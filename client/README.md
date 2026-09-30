@@ -22,8 +22,10 @@ npm run build && npm start
 ```text
 src/app/page.tsx                 home: enter a domain
 src/app/scans/[id]/page.tsx      progress while running, results when finished
-src/components/scan-form.tsx
+src/components/scan-form.tsx     target and scan mode
 src/components/scan-progress.tsx
+src/components/site-header.tsx   top bar (hidden on the home page)
+src/components/site-footer.tsx   credits, source and license links
 src/components/results/          overview, hosts (DNS/HTTP/crawl + routes per host), map, URL lists
 src/lib/api.ts, types.ts         typed API client mirroring server/README.md
 src/lib/use-scan.ts              polls scan status every 1.5 s, then loads results
