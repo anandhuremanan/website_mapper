@@ -2,7 +2,6 @@ package results
 
 import (
 	"fmt"
-	"runtime"
 	"testing"
 
 	"websitemapper/internal/discovery"
@@ -13,7 +12,7 @@ import (
 // from HTML (a quarter of them fetched, with metadata).
 func buildLargeScan(hosts, urlsPerHost int) *Aggregator {
 	tgt, _ := discovery.ParseTarget("example.com")
-	a := NewAggregator(tgt, Limits{})
+	a := NewAggregator(tgt, Limits{}, newMemURLs())
 	for h := 0; h < hosts; h++ {
 		name := fmt.Sprintf("host-%05d.example.com", h)
 		a.Add(discovery.Finding{Host: name, Source: discovery.SourceCT})
@@ -33,41 +32,6 @@ func buildLargeScan(hosts, urlsPerHost int) *Aggregator {
 		}
 	}
 	return a
-}
-
-func heapAlloc() uint64 {
-	runtime.GC()
-	runtime.GC()
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	return m.HeapAlloc
-}
-
-// TestMemoryPerURL reports the heap cost of a large scan while it runs
-// (aggregator) and after it finishes (stored Result). Run with -v.
-func TestMemoryPerURL(t *testing.T) {
-	if testing.Short() {
-		t.Skip("memory measurement")
-	}
-	for _, size := range []struct{ hosts, perHost int }{{100, 500}, {1000, 50}, {10000, 0}} {
-		before := heapAlloc()
-		a := buildLargeScan(size.hosts, size.perHost)
-		aggBytes := heapAlloc() - before
-
-		res := a.Result()
-		a = nil
-		resBytes := heapAlloc() - before
-		urls := size.hosts * size.perHost
-		per := func(b uint64) string {
-			if urls == 0 {
-				return fmt.Sprintf("%d B/host", b/uint64(size.hosts))
-			}
-			return fmt.Sprintf("%d B/URL", b/uint64(urls))
-		}
-		t.Logf("%5d hosts x %3d URLs: aggregator %6.1f MB (%s), stored result %6.1f MB (%s)",
-			size.hosts, size.perHost, float64(aggBytes)/1e6, per(aggBytes), float64(resBytes)/1e6, per(resBytes))
-		runtime.KeepAlive(res)
-	}
 }
 
 // BenchmarkCounts measures one progress tick on a large scan.

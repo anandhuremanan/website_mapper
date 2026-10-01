@@ -13,6 +13,7 @@ import (
 	"websitemapper/internal/discovery"
 	"websitemapper/internal/scan"
 	"websitemapper/internal/store"
+	"websitemapper/internal/store/storetest"
 )
 
 // fakeEngine emits fixed findings, then optionally fails or blocks. It
@@ -52,7 +53,7 @@ var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 func startService(t *testing.T, stages []scan.Stage, opts scan.Options) *scan.Service {
 	t.Helper()
-	repo := store.NewMemory(store.Limits{MaxScans: 100})
+	repo := storetest.New(t, store.Options{MaxScans: 100})
 	if opts.MaxRunning == 0 {
 		opts.MaxRunning = 1
 	}
@@ -258,7 +259,7 @@ func TestCreateRejectsInvalidTarget(t *testing.T) {
 
 func TestCreateQueueFull(t *testing.T) {
 	// No workers started, queue of 1.
-	svc := scan.NewService(store.NewMemory(store.Limits{MaxScans: 10}), nil, scan.Options{QueueSize: 1}, quiet)
+	svc := scan.NewService(storetest.New(t, store.Options{MaxScans: 10}), nil, scan.Options{QueueSize: 1}, quiet)
 	if _, err := svc.Create(context.Background(), scan.CreateRequest{Target: "example.com"}); err != nil {
 		t.Fatal(err)
 	}

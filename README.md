@@ -44,7 +44,7 @@ passive (6 requests), 53 s standard (186 requests) and 143 s as a full crawl
 
 ## Quick start
 
-You need **Go 1.23+** and **Node.js 20.9+**. Use two terminals:
+You need **Go 1.26+** and **Node.js 20.9+**. Use two terminals:
 
 ```sh
 # 1. API on :8080
@@ -69,7 +69,9 @@ cd client && npm run typecheck && npm run lint && npm test && npm run build
 
 ## Deploying
 
-The API is a single static Go binary with no database.
+The API is a single static Go binary. It keeps scans and results in its own
+data directory (one SQLite file per scan), so there is no database server to
+run.
 
 - [server/deploy/websitemapper.env](server/deploy/websitemapper.env) is a
   settings profile for a small VPS (2 vCPU / 2 GiB) shared with other
@@ -83,8 +85,9 @@ The API is a single static Go binary with no database.
 - The web client (`client/`) is built and deployed by Vercel.
 
 Keep the API port closed to the internet and serve it through the client or
-a reverse proxy. Everything is kept in memory, so a restart clears scans and
-the cache. Memory, CPU and bandwidth behaviour are described in
+a reverse proxy. Finished scans survive a restart and are removed after a
+week or when the disk budget is reached; the discovery cache is in memory
+and starts empty. Memory, CPU, disk and bandwidth behaviour are described in
 [server/README.md](server/README.md#deploying-on-a-small-shared-server).
 
 ## Documentation

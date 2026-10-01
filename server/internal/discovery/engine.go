@@ -37,6 +37,13 @@ const (
 	SourceHost Source = "host"
 )
 
+// Sources lists every Source. Stored results record a URL's sources by
+// position in this list, so only append to it: never reorder or remove.
+var Sources = []Source{
+	SourceTarget, SourceHTML, SourceJavaScript, SourceSitemap, SourceRobots,
+	SourceCT, SourceRedirect, SourceArchive, SourceHost,
+}
+
 // Hint describes how a URL was referenced, which helps classify it before
 // (or without) fetching it.
 type Hint string
@@ -56,6 +63,13 @@ const (
 	HintSitemap    Hint = "sitemap"    // a <loc> in a sitemap
 	HintArchive    Hint = "archive"    // listed by a web archive
 )
+
+// Hints lists every Hint. Like Sources, it is append-only: stored results
+// record hints by position.
+var Hints = []Hint{
+	HintLink, HintFrame, HintForm, HintScript, HintStylesheet, HintImage, HintFont,
+	HintMedia, HintManifest, HintRedirect, HintEntry, HintSitemap, HintArchive,
+}
 
 // Finding is a single raw observation reported by an engine. It is either
 // about a URL (URL set) or about a host (URL empty, Host set).

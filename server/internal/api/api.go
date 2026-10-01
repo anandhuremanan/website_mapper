@@ -2,6 +2,8 @@
 package api
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"websitemapper/internal/discovery"
+	"websitemapper/internal/results"
 	"websitemapper/internal/scan"
 )
 
@@ -22,7 +25,7 @@ import (
 type Scans interface {
 	Create(ctx context.Context, req scan.CreateRequest) (scan.Scan, error)
 	Get(ctx context.Context, id string) (scan.Scan, error)
-	Result(ctx context.Context, id string) (scan.Result, error)
+	OpenResult(ctx context.Context, id string) (scan.ResultReader, error)
 	Cancel(ctx context.Context, id, subscription string) (scan.Scan, error)
 	Stats() scan.Stats
 }
@@ -100,7 +103,7 @@ func (h *handler) createScan(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, discovery.ErrInvalidTarget), errors.Is(err, scan.ErrInvalidMode):
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
-	case errors.Is(err, scan.ErrQueueFull), errors.Is(err, scan.ErrShuttingDown):
+	case errors.Is(err, scan.ErrQueueFull), errors.Is(err, scan.ErrShuttingDown), errors.Is(err, scan.ErrStorageFull):
 		w.Header().Set("Retry-After", "10")
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
@@ -164,9 +167,17 @@ func (h *handler) cancelScan(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) getResults(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	res, err := h.scans.Result(r.Context(), id)
+	rd, err := h.scans.OpenResult(r.Context(), id)
 	if err == nil {
-		writeJSON(w, http.StatusOK, res)
+		defer rd.Close()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		// The status line is sent, so a failure can only be logged; the
+		// client sees a truncated document.
+		if err := writeResult(r.Context(), w, rd); err != nil {
+			h.log.Warn("sending result failed", "scan_id", id, "error", err)
+		}
 		return
 	}
 	if !errors.Is(err, scan.ErrNotFound) {
@@ -184,6 +195,73 @@ func (h *handler) getResults(w http.ResponseWriter, r *http.Request) {
 		"error":  "scan has not finished yet",
 		"status": string(sc.Status),
 	})
+}
+
+// writeResult streams a result as one JSON document: the encoding of a
+// scan.Result whose hosts carry their URLs. URLs are read from the store
+// and written one at a time, so the response is never held in memory.
+func writeResult(ctx context.Context, w io.Writer, rd scan.ResultReader) error {
+	res := rd.Result()
+	bw := bufio.NewWriterSize(w, 32<<10)
+
+	// Encode everything but the hosts, then reopen the object for them.
+	// (A nil field with the same JSON name hides the embedded one.)
+	head, err := openObject(struct {
+		scan.Result
+		Hosts *struct{} `json:"hosts,omitempty"`
+	}{Result: res})
+	if err != nil {
+		return err
+	}
+	bw.Write(head)
+	bw.WriteString(`,"hosts":[`)
+	for i, host := range res.Hosts {
+		if i > 0 {
+			bw.WriteByte(',')
+		}
+		head, err := openObject(struct {
+			results.Host
+			URLs *struct{} `json:"urls,omitempty"`
+		}{Host: host})
+		if err != nil {
+			return err
+		}
+		bw.Write(head)
+		bw.WriteString(`,"urls":[`)
+		first := true
+		err = rd.URLs(ctx, host.Hostname, func(u results.URL) error {
+			b, err := json.Marshal(u)
+			if err != nil {
+				return err
+			}
+			if !first {
+				bw.WriteByte(',')
+			}
+			first = false
+			_, err = bw.Write(b)
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		bw.WriteString(`]}`)
+	}
+	bw.WriteString("]}\n")
+	return bw.Flush()
+}
+
+// openObject encodes v, a struct, without its closing brace, so that more
+// fields can follow.
+func openObject(v any) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	b = bytes.TrimSuffix(b, []byte("}"))
+	if len(b) < 2 { // "{" alone: a following ",field" would be invalid
+		return nil, errors.New("cannot extend an empty JSON object")
+	}
+	return b, nil
 }
 
 func (h *handler) middleware(next http.Handler) http.Handler {

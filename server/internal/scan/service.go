@@ -101,7 +101,7 @@ type Options struct {
 	MaxRequests int
 	// MaxDownloadBytes bounds the bytes each scan downloads (0: no limit).
 	MaxDownloadBytes int64
-	// Limits bound each scan's recorded results.
+	// Limits are safety ceilings on each scan's recorded results.
 	Limits results.Limits
 	// Pools are the shared resource pools, reported by Stats.
 	Pools []*resource.Pool
@@ -474,9 +474,32 @@ func (s *Service) viewLocked(ctx context.Context, id string) (Scan, error) {
 	return sc, nil
 }
 
-// Result returns a finished scan's result.
+// OpenResult opens a finished scan's result for reading its URLs one host
+// at a time, however many there are. The caller must close the reader.
+func (s *Service) OpenResult(ctx context.Context, id string) (ResultReader, error) {
+	return s.repo.OpenResult(ctx, id)
+}
+
+// Result returns a finished scan's result with every URL loaded into
+// memory. It suits small results and tests; use OpenResult to serve one.
 func (s *Service) Result(ctx context.Context, id string) (Result, error) {
-	return s.repo.GetResult(ctx, id)
+	r, err := s.repo.OpenResult(ctx, id)
+	if err != nil {
+		return Result{}, err
+	}
+	defer r.Close()
+	res := r.Result()
+	for i := range res.Hosts {
+		h := &res.Hosts[i]
+		err := r.URLs(ctx, h.Hostname, func(u results.URL) error {
+			h.URLs = append(h.URLs, u)
+			return nil
+		})
+		if err != nil {
+			return Result{}, err
+		}
+	}
+	return res, nil
 }
 
 // Stats describes the scheduler and shared resources.
@@ -491,6 +514,19 @@ type Stats struct {
 	CoalescedRequests int64                   `json:"coalescedRequests"`
 	Caches            []cache.Stats           `json:"caches"`
 	Bandwidth         resource.BandwidthStats `json:"bandwidth"`
+	// Storage reports the result store, if it measures itself.
+	Storage *StorageStats `json:"storage,omitempty"`
+}
+
+// StorageStats describes what the result store holds.
+type StorageStats struct {
+	Scans   int `json:"scans"`
+	Results int `json:"results"`
+	// Bytes is the disk space used by finished scans; MaxBytes its limit.
+	Bytes    int64 `json:"bytes"`
+	MaxBytes int64 `json:"maxBytes,omitempty"`
+	// FreeBytes is the free space on the store's disk, where known.
+	FreeBytes int64 `json:"freeBytes,omitempty"`
 }
 
 // Stats returns a snapshot of the scheduler and resource pools.
@@ -504,6 +540,10 @@ func (s *Service) Stats() Stats {
 	}
 	for _, c := range s.opts.Caches {
 		st.Caches = append(st.Caches, c.Stats())
+	}
+	if r, ok := s.repo.(interface{ Stats() StorageStats }); ok {
+		storage := r.Stats()
+		st.Storage = &storage
 	}
 	return st
 }
@@ -564,7 +604,20 @@ func (s *Service) run(ctx context.Context, j *job) {
 	})
 	log.Info("scan started", "event", "scan_started", "target", j.target.StartURL)
 
-	agg := results.NewAggregator(j.target, s.opts.Limits)
+	// URLs are written to the scan's store as they are found; closing it
+	// (after the result is saved, or on any early exit) releases the file.
+	urls, err := s.repo.OpenURLs(context.Background(), j.id)
+	if err != nil {
+		log.Error("opening result storage failed", "event", "result_store_failed", "error", err)
+		tr.update(func(sc *Scan) {
+			sc.Phase = PhaseDone
+			finish(sc, started, StatusFailed, "the server could not open storage for this scan's results")
+		})
+		return
+	}
+	defer urls.Close()
+
+	agg := results.NewAggregator(j.target, s.opts.Limits, urls)
 	// Every scan starts from the entered host and the apex domain, whether
 	// or not any engine finds them.
 	for _, h := range j.target.Hosts() {
@@ -638,20 +691,23 @@ func (s *Service) run(ctx context.Context, j *job) {
 
 	status, stop, msg := s.outcome(ctx, runs, failed)
 	res := agg.Result()
-	counts := res.Counts()
+	counts := agg.Counts()
+	if err := agg.Err(); err != nil {
+		log.Error("recording results failed", "event", "result_store_failed", "error", err)
+		status, msg = StatusFailed, "the server could not store all of this scan's results; they are incomplete"
+	}
 	limits := s.limitNotices(counts, acct, stop, true)
 
-	var finished Scan
-	tr.update(func(sc *Scan) {
-		sc.Counts = counts
-		sc.Limits = limits
-		sc.Resources = resources(acct)
-		sc.StopReason = stop
-		sc.Phase = PhaseDone
-		sc.Steps[finalIdx].Status = StepDone
-		finish(sc, started, status, msg)
-		finished = sc.Clone()
-	})
+	// The result is saved before the finished status is published, so a
+	// client that sees the scan finished can always read its result.
+	finished := tr.snapshot()
+	finished.Counts = counts
+	finished.Limits = limits
+	finished.Resources = resources(acct)
+	finished.StopReason = stop
+	finished.Phase = PhaseDone
+	finished.Steps[finalIdx].Status = StepDone
+	finish(&finished, started, status, msg)
 
 	err = s.repo.SaveResult(context.Background(), Result{
 		ScanID:     j.id,
@@ -672,7 +728,15 @@ func (s *Service) run(ctx context.Context, j *job) {
 	})
 	if err != nil {
 		log.Error("saving result failed", "event", "result_save_failed", "error", err)
+		status = StatusFailed
+		finished.Status, finished.Error = status, "the server could not save this scan's results"
 	}
+	// Stop requests from joining this scan before it is seen as finished:
+	// a request made after that must start a new scan.
+	s.mu.Lock()
+	s.forgetLocked(j)
+	s.mu.Unlock()
+	tr.update(func(sc *Scan) { *sc = finished })
 
 	event := "scan_" + string(status)
 	if stop == StopTimeout {
@@ -737,7 +801,8 @@ func (s *Service) limitNotices(c results.Counts, acct *resource.Account, stop st
 			c.HostsResolvePending)
 	}
 	if l.URLsOmitted > 0 {
-		add(LimitURLBudget, "%d URLs were seen but not recorded because of the recorded-URL limits.", l.URLsOmitted)
+		add(LimitURLBudget, "%d more URLs were found after the scan reached its limit of %d recorded URLs; they are not listed.",
+			l.URLsOmitted, s.opts.Limits.MaxURLs)
 	}
 	// Waits are reported per operation: parallel workers wait at the same
 	// time, so a total would overstate the delay.
@@ -912,12 +977,20 @@ func newTracker(repo Repository, id string) (*tracker, error) {
 	return &tracker{repo: repo, scan: sc}, nil
 }
 
+// snapshot returns a copy of the status record.
+func (t *tracker) snapshot() Scan {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.scan.Clone()
+}
+
 func (t *tracker) update(fn func(*Scan)) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	fn(&t.scan)
-	// Status writes are best effort; the in-memory store only fails if the
-	// scan was evicted, in which case there is nobody left to report to.
+	// Status writes are best effort: progress is kept in memory, and if the
+	// final status cannot be written to disk, saving the result fails too
+	// and is logged.
 	_ = t.repo.Update(context.Background(), t.scan)
 }
 

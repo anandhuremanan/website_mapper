@@ -67,7 +67,7 @@ That constraint explains most of the design.
 │   │   ├── fetch/          the one outbound HTTP client (limits, SSRF guard)
 │   │   ├── resource/       shared pools, per-scan accounts, bandwidth limiter
 │   │   ├── cache/          bounded TTL cache with single-flight loading
-│   │   ├── store/          in-memory repository for scans and results
+│   │   ├── store/          scans and results on disk, one SQLite file per scan
 │   │   ├── config/         environment variables
 │   │   └── htmlmeta/       <title> extraction
 │   └── deploy/             systemd unit and a small-server profile
@@ -262,13 +262,19 @@ Result
 - **Technologies** are detected from simple, visible evidence (URL path
   fragments like `/_next/`, `Server`/`X-Powered-By` headers, `<meta
   name="generator">`).
-- **Counters** are maintained incrementally for URLs (so progress does not
-  reclassify everything each second) and recomputed for hosts. Live counts
-  and the final result's counts use the same code, so they always agree.
-- **Limits.** The aggregator caps recorded hosts and URLs per scan and per
-  host; anything beyond is counted as omitted, never silently dropped.
-  Archived URLs arrive first and are historical, so they may fill at most
-  half of a host's slots; routes found on the live site always have room.
+- **Counters** are maintained incrementally for URLs, per scan and per host
+  (so neither progress nor the final result needs a pass over the URLs), and
+  recomputed for hosts.
+- **Hosts in memory, URLs on disk.** Hosts are few, small and read
+  constantly by the engines, so the aggregator keeps them in a map. URLs can
+  number in the millions, so each one is a
+  [`URLRecord`](server/internal/results/record.go) written to a `URLStore`
+  as it is found: insert if new, otherwise load, merge and write back. The
+  aggregator serializes those calls, and its memory does not grow with the
+  number of URLs.
+- **Limits.** Recorded hosts and recorded URLs each have a per-scan safety
+  ceiling; anything beyond is counted as omitted, never silently dropped.
+  There is no per-host URL limit.
 
 The aggregator also implements `discovery.State`, which is how engines see
 what earlier engines found.
@@ -399,22 +405,46 @@ How it fits in:
 
 ## Storage and memory
 
-Everything lives in memory ([store/memory.go](server/internal/store/memory.go));
-there is no database yet. The `scan.Repository` interface is where a
-persistent store would plug in.
+Scans and results are kept on disk by [store](server/internal/store/store.go),
+which implements `scan.Repository`: **one SQLite database file per scan** in
+`DATA_DIR`, using a pure-Go driver so the server stays one static binary.
 
-- Scan status records are small and fixed-size; results are stored
-  separately and read once per view.
-- **Queued and running scans are never evicted.** Finished scans are evicted
-  oldest first when there are more than `MAX_STORED_SCANS` of them or their
-  results together exceed `MAX_STORED_RESULT_URLS` URLs (about 0.6 KB per
-  URL). A restart loses everything, by design for now.
+Why a file per scan rather than one database: scans never contend for a
+writer, a damaged file loses one result, and removing an old result is
+deleting its file, which frees the space at once (a shared SQLite database
+would have to be compacted).
 
-Rough memory budget with the defaults: the cache (64 MB), each running scan
-(up to about 50 MB at its URL caps) and stored results (up to about 300 MB).
-The [small-server profile](server/deploy/websitemapper.env) keeps the live
-heap around 100–165 MB; the [systemd unit](server/deploy/websitemapper.service)
-adds hard kernel limits on top.
+- **Layout** ([scandb.go](server/internal/store/scandb.go)). `urls` has one
+  row per URL, clustered on (host, path, origin), so a host's URLs are read
+  in path order straight from the table. Sources, hints and types are small
+  integers and absent text is NULL: about 90 bytes per URL on disk. `hosts`
+  and the result header are written once, when the scan ends.
+- **Writing.** A running scan holds its file's only connection. Writes are
+  grouped into transactions (2,000 rows or one second), and a small
+  write-through cache of recent records makes the links repeated on every
+  page of a site cost no query. Measured on a laptop: about 150,000 URLs
+  per second, with under 2 MB of Go heap for 200,000 URLs.
+- **Finishing.** The result is saved before the finished status is
+  published, so a client that sees a finished scan can always read it. The
+  database then leaves write-ahead-log mode and becomes a single plain file.
+- **Reading.** `GET /results` streams the document host by host, URL by URL,
+  from the file; a result is never built in memory.
+- **Status records** are also held in memory (they are small and polled
+  constantly) and written to disk when a scan is created and when it
+  finishes.
+- **Retention.** Queued and running scans are never removed. Finished scans
+  are removed oldest first past `MAX_STORED_SCANS`, `STORE_MAX_MB` or
+  `STORE_MAX_AGE`. New scans are refused while the disk is nearly full
+  (`STORE_MIN_FREE_MB`).
+- **Restart.** Finished scans are available again. A scan that was queued or
+  running is marked `failed` and its partial data is dropped; resuming a
+  scan is not supported.
+
+Memory with the defaults: the cache (64 MB), a few MB of hosts per running
+scan, and SQLite's page cache (8 MB per running scan, 2 MB per result being
+read), which is allocated outside the Go heap. The
+[small-server profile](server/deploy/websitemapper.env) and the
+[systemd unit](server/deploy/websitemapper.service) add hard limits on top.
 
 ## The HTTP API
 
@@ -473,7 +503,7 @@ All settings are environment variables, parsed and validated in one place
 configuration. There are many settings because every bound in this document
 is adjustable, but most deployments only touch a handful:
 `MAX_CONCURRENT_SCANS`, `GLOBAL_HTTP_CONCURRENCY`, `GLOBAL_DOWNLOAD_KBPS`,
-`CACHE_MAX_MB`, `MAX_STORED_RESULT_URLS`, `SCAN_TIMEOUT` and
+`CACHE_MAX_MB`, `STORE_MAX_MB`, `SCAN_TIMEOUT` and
 `SCAN_DEFAULT_MODE`. Start from [the small-server profile](server/deploy/websitemapper.env)
 for real deployments.
 
@@ -573,7 +603,11 @@ Honest notes for contributors; these are good first issues:
 - Cancelling without a `subscriptionId` is still accepted for unshared
   scans, so anyone who knows a scan ID can cancel it. There are no user
   accounts; scan IDs are random 64-bit values.
-- Everything is in memory; a restart loses scans and the cache.
+- The web client still downloads a whole result in one response and renders
+  it in the browser, which is why `SCAN_MAX_RECORDED_URLS` defaults to
+  50,000 although the store can hold millions. Paged result endpoints are
+  the next step.
+- The discovery cache is in memory; a restart empties it.
 
 ## Glossary
 

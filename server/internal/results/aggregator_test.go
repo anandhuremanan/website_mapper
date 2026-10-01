@@ -3,12 +3,12 @@ package results
 import (
 	"fmt"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
 	"websitemapper/internal/classify"
 	"websitemapper/internal/discovery"
+	"websitemapper/internal/normalize"
 )
 
 func newAgg(t *testing.T) *Aggregator {
@@ -17,7 +17,7 @@ func newAgg(t *testing.T) *Aggregator {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewAggregator(tgt, Limits{})
+	return NewAggregator(tgt, Limits{}, newMemURLs())
 }
 
 func findHost(t *testing.T, r Result, name string) Host {
@@ -38,7 +38,7 @@ func TestAggregatorDeduplicatesURLsAndKeepsProvenance(t *testing.T) {
 	a.Add(discovery.Finding{URL: "https://example.com/about#team", Source: discovery.SourceJavaScript, From: "https://example.com/app.js"})
 	a.Add(discovery.Finding{URL: "https://example.com/about", Source: discovery.SourceHTML, Response: &discovery.Response{Status: 200, ContentType: "text/html", Title: "About"}})
 
-	res := a.Result()
+	res := fullResult(a)
 	if len(res.Hosts) != 1 || len(res.Hosts[0].URLs) != 1 {
 		t.Fatalf("result = %+v", res)
 	}
@@ -63,7 +63,7 @@ func TestAggregatorMergesHostSources(t *testing.T) {
 	// A host root requested because the host was discovered is not host provenance.
 	a.Add(discovery.Finding{URL: "https://stories.example.com/", Source: discovery.SourceHost, Hint: discovery.HintEntry})
 
-	res := a.Result()
+	res := fullResult(a)
 	if len(res.Hosts) != 1 {
 		t.Fatalf("hosts = %+v", res.Hosts)
 	}
@@ -93,7 +93,7 @@ func TestAggregatorHostObservationsAndStates(t *testing.T) {
 	a.Add(discovery.Finding{Host: "mail.example.com", DNS: &discovery.DNSInfo{Resolved: true}})
 	a.Add(discovery.Finding{Host: "mail.example.com", HTTP: &discovery.HTTPInfo{Reachable: false, Error: "connection refused"}})
 
-	res := a.Result()
+	res := fullResult(a)
 	var order []string
 	for _, h := range res.Hosts {
 		order = append(order, h.Hostname)
@@ -123,7 +123,7 @@ func TestAggregatorHostObservationsAndStates(t *testing.T) {
 	if c.Hosts != 5 || c.HostsResolved != 3 || c.HostsReachable != 2 || c.HostsCrawled != 1 {
 		t.Errorf("counts = %+v", c)
 	}
-	if rc := res.Counts(); rc != c {
+	if rc := recount(res); rc != c {
 		t.Errorf("result counts %+v != live counts %+v", rc, c)
 	}
 
@@ -146,7 +146,7 @@ func TestAggregatorScope(t *testing.T) {
 	a.Add(discovery.Finding{URL: "https://docs.example.com/foo", Source: discovery.SourceHTML})
 
 	var names []string
-	for _, h := range a.Result().Hosts {
+	for _, h := range fullResult(a).Hosts {
 		names = append(names, h.Hostname)
 	}
 	if !reflect.DeepEqual(names, []string{"api.example.com", "docs.example.com"}) {
@@ -169,7 +169,7 @@ func TestAggregatorPrefersSuccessfulResponse(t *testing.T) {
 	a := newAgg(t)
 	a.Add(discovery.Finding{URL: "https://example.com/docs", Source: discovery.SourceHTML, Response: &discovery.Response{Status: 301, Redirect: "https://example.com/docs/"}})
 	a.Add(discovery.Finding{URL: "https://example.com/docs/", Source: discovery.SourceRedirect, Response: &discovery.Response{Status: 200, ContentType: "text/html"}})
-	if u := a.Result().Hosts[0].URLs[0]; u.Status != 200 {
+	if u := fullResult(a).Hosts[0].URLs[0]; u.Status != 200 {
 		t.Errorf("status = %d, want 200", u.Status)
 	}
 }
@@ -183,7 +183,7 @@ func TestTechnologyDetection(t *testing.T) {
 	}})
 	a.Add(discovery.Finding{Host: "status.example.com", Source: discovery.SourceCT})
 	a.Add(discovery.Finding{Host: "status.example.com", HTTP: &discovery.HTTPInfo{Reachable: true, Server: "cloudflare"}})
-	got := a.Result().Technologies
+	got := fullResult(a).Technologies
 	want := []Technology{
 		{Name: "Express", Evidence: []string{"X-Powered-By: Express"}},
 		{Name: "SvelteKit", Evidence: []string{"URL path contains /_app/immutable/"}},
@@ -214,35 +214,9 @@ func TestHeaderProduct(t *testing.T) {
 	}
 }
 
-func TestAggregatorCapsURLsPerHost(t *testing.T) {
-	tgt, _ := discovery.ParseTarget("example.com")
-	a := NewAggregator(tgt, Limits{MaxURLsPerHost: 2})
-	for _, p := range []string{"/a", "/b", "/c", "/d", "/a/"} {
-		a.Add(discovery.Finding{URL: "https://example.com" + p, Source: discovery.SourceHTML, Hint: discovery.HintLink})
-	}
-	// A URL the scanner fetched is always recorded, even over the limit.
-	a.Add(discovery.Finding{URL: "https://example.com/fetched", Source: discovery.SourceHTML,
-		Response: &discovery.Response{Status: 200, ContentType: "text/html"}})
-	// Other hosts have their own limit.
-	a.Add(discovery.Finding{URL: "https://api.example.com/x", Source: discovery.SourceHTML})
-
-	res := a.Result()
-	apex := findHost(t, res, "example.com")
-	var paths []string
-	for _, u := range apex.URLs {
-		paths = append(paths, u.Path)
-	}
-	if !reflect.DeepEqual(paths, []string{"/a", "/b", "/fetched"}) || apex.Omitted != 2 {
-		t.Errorf("paths = %v omitted = %d", paths, apex.Omitted)
-	}
-	if api := findHost(t, res, "api.example.com"); len(api.URLs) != 1 {
-		t.Errorf("api urls = %v", api.URLs)
-	}
-}
-
 func TestAggregatorCapsDiscoveredHosts(t *testing.T) {
 	tgt, _ := discovery.ParseTarget("example.com")
-	a := NewAggregator(tgt, Limits{MaxHosts: 100})
+	a := NewAggregator(tgt, Limits{MaxHosts: 100}, newMemURLs())
 	for i := 0; i < 20000; i++ {
 		a.Add(discovery.Finding{Host: fmt.Sprintf("h%d.example.com", i), Source: discovery.SourceCT})
 	}
@@ -255,21 +229,82 @@ func TestAggregatorCapsDiscoveredHosts(t *testing.T) {
 	if c.Hosts != 101 || c.Limits.HostsOmitted != 20000-100+1 || c.URLs != 0 {
 		t.Errorf("counts = %+v", c)
 	}
-	res := a.Result()
-	if len(res.Hosts) != 101 || res.HostsOmitted != c.Limits.HostsOmitted || res.Counts() != c {
+	res := fullResult(a)
+	if len(res.Hosts) != 101 || res.HostsOmitted != c.Limits.HostsOmitted || recount(res) != c {
 		t.Errorf("result hosts = %d omitted = %d", len(res.Hosts), res.HostsOmitted)
 	}
 }
 
 func TestAggregatorCapsTotalURLs(t *testing.T) {
 	tgt, _ := discovery.ParseTarget("example.com")
-	a := NewAggregator(tgt, Limits{MaxURLs: 3, MaxURLsPerHost: 100})
+	a := NewAggregator(tgt, Limits{MaxURLs: 3}, newMemURLs())
 	for i := 0; i < 5; i++ {
 		a.Add(discovery.Finding{URL: fmt.Sprintf("https://a%d.example.com/p", i), Source: discovery.SourceHTML})
 	}
 	c := a.Counts()
 	if c.URLs != 3 || c.Limits.URLsOmitted != 2 || c.Hosts != 5 {
 		t.Errorf("counts = %+v", c)
+	}
+
+	// At the limit, a URL already recorded still gains provenance...
+	a.Add(discovery.Finding{URL: "https://a0.example.com/p", Source: discovery.SourceSitemap})
+	// ...and a URL the scanner requested is always recorded.
+	a.Add(discovery.Finding{URL: "https://a4.example.com/fetched", Source: discovery.SourceHTML,
+		Response: &discovery.Response{Status: 200, ContentType: "text/html"}})
+
+	res := fullResult(a)
+	if u := findHost(t, res, "a0.example.com").URLs[0]; len(u.Sources) != 2 {
+		t.Errorf("a0 sources = %v, want html and sitemap", u.Sources)
+	}
+	h := findHost(t, res, "a4.example.com")
+	if len(h.URLs) != 1 || h.URLs[0].Path != "/fetched" || h.Omitted != 1 {
+		t.Errorf("a4 urls = %+v, omitted = %d", h.URLs, h.Omitted)
+	}
+	if c := a.Counts(); c.URLs != 4 || c.Limits.URLsOmitted != 2 || recount(res) != c {
+		t.Errorf("counts = %+v, recount = %+v", c, recount(res))
+	}
+}
+
+// One host may hold any number of URLs: nothing but the scan-wide limit
+// bounds them, and archived URLs do not crowd out live ones.
+func TestAggregatorHasNoPerHostLimit(t *testing.T) {
+	a := newAgg(t)
+	archived := &discovery.ArchiveInfo{FirstSeen: time.Date(2015, 1, 1, 0, 0, 0, 0, time.UTC), ContentType: "text/html"}
+	for i := 0; i < 3000; i++ {
+		a.Add(discovery.Finding{URL: fmt.Sprintf("https://example.com/old-%d", i), Source: discovery.SourceArchive,
+			Hint: discovery.HintArchive, Archive: archived})
+	}
+	for i := 0; i < 50; i++ {
+		a.Add(discovery.Finding{URL: fmt.Sprintf("https://example.com/live-%d", i), Source: discovery.SourceSitemap, Hint: discovery.HintSitemap})
+	}
+	res := fullResult(a)
+	h := findHost(t, res, "example.com")
+	if len(h.URLs) != 3050 || h.Counts.URLs != 3050 || h.Omitted != 0 {
+		t.Errorf("recorded %d (count %d), omitted %d; want 3050, 0", len(h.URLs), h.Counts.URLs, h.Omitted)
+	}
+	// Archived URLs are never crawl candidates; the live ones are.
+	if got := len(a.PageURLs()); got != 50 {
+		t.Errorf("PageURLs = %d, want the 50 live URLs", got)
+	}
+	if rc := recount(res); rc != a.Counts() {
+		t.Errorf("recount %+v != live counts %+v", rc, a.Counts())
+	}
+}
+
+// A URL's stored parts must rebuild exactly the normalized URL.
+func TestSplitAndJoinURL(t *testing.T) {
+	for _, raw := range []string{
+		"https://example.com/", "http://example.com/a/b", "https://example.com:8443/x?b=2&a=1",
+		"http://example.com:8080/", "https://example.com/caf%C3%A9/menu?q=a%20b", "https://example.com/a%2Fb",
+	} {
+		u, err := normalize.URL(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		origin, path := splitURL(u)
+		if got := JoinURL(u.Hostname(), origin, path); got != u.String() {
+			t.Errorf("JoinURL(%q, %q, %q) = %q, want %q", u.Hostname(), origin, path, got, u.String())
+		}
 	}
 }
 
@@ -321,7 +356,7 @@ func TestAggregatorProgressCounters(t *testing.T) {
 	if c != want {
 		t.Errorf("counts =\n%+v\nwant\n%+v", c, want)
 	}
-	if rc := a.Result().Counts(); rc != c {
+	if rc := recount(fullResult(a)); rc != c {
 		t.Errorf("result counts differ:\n%+v\n%+v", rc, c)
 	}
 }
@@ -339,7 +374,7 @@ func TestAggregatorIncrementalCountsFollowReclassification(t *testing.T) {
 	if c.Pages != 0 || c.APIs != 1 || c.URLs != 1 || c.URLsFetched != 1 {
 		t.Errorf("after fetch: %+v", c)
 	}
-	if rc := a.Result().Counts(); rc != c {
+	if rc := recount(fullResult(a)); rc != c {
 		t.Errorf("result counts %+v != live %+v", rc, c)
 	}
 }
@@ -366,7 +401,7 @@ func TestAggregatorCacheProvenance(t *testing.T) {
 	a.Add(discovery.Finding{URL: "https://new.example.com/both", Source: discovery.SourceHTML,
 		Response: &discovery.Response{Status: 200, ContentType: "text/html", Title: "live"}})
 
-	res := a.Result()
+	res := fullResult(a)
 	if h := findHost(t, res, "old.example.com"); !h.FromCache || h.DNS.CachedAt == nil || h.HTTP.CachedAt == nil {
 		t.Errorf("old = %+v", h)
 	}
@@ -387,49 +422,7 @@ func TestAggregatorCacheProvenance(t *testing.T) {
 	if c.Cache != (CacheCounts{Hosts: 1, DNS: 1, Probes: 1, Pages: 1}) || c.URLsFetched != 2 || c.URLsFailed != 1 {
 		t.Errorf("counts = %+v", c)
 	}
-	if rc := res.Counts(); rc != c {
+	if rc := recount(res); rc != c {
 		t.Errorf("result counts %+v != live %+v", rc, c)
-	}
-}
-
-// TestArchiveLeavesRoomForLiveURLs: the archive is queried first and can
-// list thousands of old URLs for one host. It must not use up the host's
-// whole quota before the live site's routes are seen.
-func TestArchiveLeavesRoomForLiveURLs(t *testing.T) {
-	tgt, _ := discovery.ParseTarget("example.com")
-	a := NewAggregator(tgt, Limits{MaxURLsPerHost: 10})
-	archived := &discovery.ArchiveInfo{FirstSeen: time.Date(2015, 1, 1, 0, 0, 0, 0, time.UTC), ContentType: "text/html"}
-	for i := 0; i < 40; i++ {
-		a.Add(discovery.Finding{URL: fmt.Sprintf("https://example.com/old-%d", i), Source: discovery.SourceArchive,
-			Hint: discovery.HintArchive, Archive: archived})
-	}
-	if c := a.Counts(); c.URLs != 5 || c.Limits.URLsOmitted != 35 {
-		t.Fatalf("after archive: recorded %d, omitted %d; want 5 and 35", c.URLs, c.Limits.URLsOmitted)
-	}
-	// Routes from the live site fill the other half...
-	for i := 0; i < 5; i++ {
-		a.Add(discovery.Finding{URL: fmt.Sprintf("https://example.com/live-%d", i), Source: discovery.SourceSitemap, Hint: discovery.HintSitemap})
-	}
-	// ...a live source confirming an archived URL costs no extra slot...
-	a.Add(discovery.Finding{URL: "https://example.com/old-0", Source: discovery.SourceSitemap, Hint: discovery.HintSitemap})
-	// ...and the overall per-host limit still applies.
-	a.Add(discovery.Finding{URL: "https://example.com/live-extra", Source: discovery.SourceSitemap, Hint: discovery.HintSitemap})
-
-	res := a.Result()
-	h := findHost(t, res, "example.com")
-	live := 0
-	for _, u := range h.URLs {
-		if strings.HasPrefix(u.Path, "/live-") {
-			live++
-		}
-		if u.Path == "/old-0" && len(u.Sources) != 2 {
-			t.Errorf("old-0 sources = %v, want archive and sitemap", u.Sources)
-		}
-	}
-	if len(h.URLs) != 10 || live != 5 || h.Omitted != 36 {
-		t.Errorf("recorded %d (live %d), omitted %d; want 10 (5), 36", len(h.URLs), live, h.Omitted)
-	}
-	if rc := res.Counts(); rc != a.Counts() {
-		t.Errorf("result counts %+v != live counts %+v", rc, a.Counts())
 	}
 }

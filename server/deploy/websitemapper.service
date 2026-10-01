@@ -10,6 +10,8 @@
 #   sudo install -m 0755 server /usr/local/bin/websitemapper
 #   sudo install -D -m 0644 deploy/websitemapper.env /etc/websitemapper/websitemapper.env
 #   sudo install -m 0644 deploy/websitemapper.service /etc/systemd/system/
+# Scan results are kept in /var/lib/websitemapper, which systemd creates and
+# hands to the service user (StateDirectory below).
 #   sudo systemctl daemon-reload && sudo systemctl enable --now websitemapper
 # Check:
 #   systemctl status websitemapper
@@ -24,6 +26,9 @@ Wants=network-online.target
 [Service]
 User=websitemapper
 EnvironmentFile=/etc/websitemapper/websitemapper.env
+# /var/lib/websitemapper: the only place the service may write.
+StateDirectory=websitemapper
+StateDirectoryMode=0750
 ExecStart=/usr/local/bin/websitemapper
 Restart=on-failure
 RestartSec=5
@@ -49,7 +54,7 @@ IOWeight=20
 TasksMax=512
 LimitNOFILE=4096
 
-# --- Hardening (no disk writes needed: everything is in memory) -----------------
+# --- Hardening (the service writes only to its StateDirectory) -------------------
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

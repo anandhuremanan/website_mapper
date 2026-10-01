@@ -68,7 +68,21 @@ func run() error {
 	}
 	caches := newCaches(cfg.Cache)
 	defaultMode, _ := scan.ParseMode(cfg.Scan.DefaultMode, scan.ModeLight)
-	svc := scan.NewService(store.NewMemory(store.Limits{MaxScans: cfg.MaxStoredScans, MaxURLs: cfg.MaxStoredResultURLs}), pipeline(cfg.Scan, pools, caches, log), scan.Options{
+	// Scans and their results are kept on disk, one file per scan, so the
+	// server's memory does not grow with what scans find.
+	repo, err := store.Open(store.Options{
+		Dir:          cfg.Store.DataDir,
+		MaxScans:     cfg.Store.MaxScans,
+		MaxBytes:     cfg.Store.MaxBytes,
+		MaxAge:       cfg.Store.MaxAge,
+		MinFreeBytes: cfg.Store.MinFreeBytes,
+		Log:          log,
+	})
+	if err != nil {
+		return err
+	}
+	defer repo.Close()
+	svc := scan.NewService(repo, pipeline(cfg.Scan, pools, caches, log), scan.Options{
 		DefaultMode:      defaultMode,
 		MaxRunning:       cfg.MaxConcurrentScans,
 		QueueSize:        cfg.QueueSize,
@@ -77,9 +91,8 @@ func run() error {
 		MaxDownloadBytes: cfg.Scan.MaxDownloadBytes,
 		Bandwidth:        pools.bandwidth,
 		Limits: results.Limits{
-			MaxHosts:       cfg.Scan.MaxDiscoveredHosts,
-			MaxURLsPerHost: cfg.Scan.MaxRecordedURLsPerHost,
-			MaxURLs:        cfg.Scan.MaxRecordedURLs,
+			MaxHosts: cfg.Scan.MaxDiscoveredHosts,
+			MaxURLs:  cfg.Scan.MaxRecordedURLs,
 		},
 		Pools:  []*resource.Pool{pools.http, pools.dns, pools.ct, pools.archive},
 		Caches: caches.list(),

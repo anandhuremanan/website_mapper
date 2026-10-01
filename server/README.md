@@ -5,7 +5,8 @@ finds the domain's hosts, checks which ones resolve and answer HTTP(S),
 crawls the reachable ones, and returns a normalized map of hosts and their
 URLs, with provenance for every result.
 
-Requires Go 1.23+. The only third-party dependency is `golang.org/x/net/html`.
+Requires Go 1.26+. Third-party dependencies: `golang.org/x/net/html` and
+`modernc.org/sqlite` (SQLite in pure Go, so the binary stays static).
 
 ## Commands
 
@@ -44,7 +45,7 @@ internal/scan         scan model, scheduler (queue, cancellation, shutdown),
                       stage pipeline, Repository interface
 internal/resource     shared resource pools with fair sharing; per-scan accounts
 internal/cache        bounded TTL cache with single-flight loading (shared discovery cache)
-internal/store        in-memory Repository (swap for PostgreSQL later)
+internal/store        Repository on disk: one SQLite file per scan
 internal/discovery    Engine interface, Finding, State, Target/scope
   subdomains          passive hostname discovery; Source providers: crt.sh, Cert Spotter
   archive             archived URLs from the Wayback Machine CDX index
@@ -178,7 +179,7 @@ of pretending to be complete.
 | hostnames recorded | `SCAN_MAX_DISCOVERED_HOSTS` | further names are counted, not listed (`host_budget_reached`) |
 | hosts resolved / probed / crawled | `SCAN_MAX_RESOLVE_HOSTS`, `SCAN_MAX_PROBE_HOSTS`, `SCAN_MAX_HOSTS` | the rest are marked `skipped` (`host_budget_reached`) |
 | requests per host | `SCAN_MAX_URLS` | that host's crawl stops (`crawl_limit_reached`) |
-| URLs recorded | `SCAN_MAX_RECORDED_URLS_PER_HOST`, `SCAN_MAX_RECORDED_URLS` | further URLs are counted, not stored (`url_budget_reached`) |
+| URLs recorded | `SCAN_MAX_RECORDED_URLS` | further URLs are counted, not stored (`url_budget_reached`) |
 | response size | `SCAN_MAX_BODY_BYTES` | the body is truncated |
 
 **Backpressure.** Nothing queues without a bound: crawl frontiers are cut to
@@ -202,12 +203,20 @@ serving HTTP.
 `counts` below), never the discovered hosts or URLs, so polling stays cheap
 for any scan size. URL counters are maintained incrementally.
 
-**Retention.** Finished scans stay in memory until evicted, oldest first,
-when there are more than `MAX_STORED_SCANS` of them or their results hold
-more than `MAX_STORED_RESULT_URLS` URLs in total. Queued and running scans are
-never evicted. The URL budget is the real memory bound: measured, a stored
-result costs about 0.6 KB per URL (1 KB per URL while the scan runs), so a
-scan at the 50,000-URL cap keeps about 30 MB.
+**Storage and retention.** Each scan is one SQLite file in `DATA_DIR`. URLs
+are written to it while the scan runs, so memory does not grow with the
+number of URLs found; hosts (bounded by `SCAN_MAX_DISCOVERED_HOSTS`) stay in
+memory until the scan ends. Measured: about 90 bytes of disk per URL and
+150,000 URLs recorded per second on a laptop.
+
+Finished scans survive a restart. They are removed, oldest first, when there
+are more than `MAX_STORED_SCANS` of them, when they use more than
+`STORE_MAX_MB` together, or once they are older than `STORE_MAX_AGE`; removing
+one deletes its file, so the space is free at once. Queued and running scans
+are never removed, and the scan that finished last is always kept. A scan
+that was queued or running when the server stopped without finishing it is
+reported as `failed` after the restart, and its partial data is dropped. New
+scans get `503` while the disk has less than `STORE_MIN_FREE_MB` free.
 
 **Bandwidth.** Assets referenced by pages (scripts, styles, images, fonts,
 media, documents) are recorded, never requested. The scanning client reads
@@ -301,17 +310,18 @@ is bounded by configuration rather than by what the machine has:
 | Part | Bound (defaults) | Approximate memory |
 | --- | --- | --- |
 | discovery cache | `CACHE_MAX_MB=64` | ~64 MB |
-| running scans | `MAX_CONCURRENT_SCANS=3` x `SCAN_MAX_RECORDED_URLS=50000` | up to ~50 MB each |
-| stored results | `MAX_STORED_RESULT_URLS=500000` | up to ~300 MB |
+| running scans | `MAX_CONCURRENT_SCANS=3` x `SCAN_MAX_DISCOVERED_HOSTS=10000` hosts | a few MB each, plus 8 MB of SQLite page cache |
+| results being read | one per request in flight | 2 MB of SQLite page cache each |
+| stored results | on disk (`STORE_MAX_MB`) | none |
 
-These are the development defaults. For a small server use the deployment
-profile below, which keeps the live heap around 100-165 MB.
+Results no longer count: URLs are on disk, however many a scan finds.
+SQLite's page cache is allocated outside the Go heap, so `GOMEMLIMIT` does
+not see it; leave room for it under the service's memory limit.
 
 With Go's garbage collector the process can briefly use up to about twice
-its live heap. On a small VPS lower `MAX_STORED_RESULT_URLS` first, since
-stored results are the largest part; setting the Go runtime's
-`GOMEMLIMIT` (for example `GOMEMLIMIT=600MiB`) also makes the collector work
-harder before the process grows.
+its live heap. Setting the Go runtime's `GOMEMLIMIT` (for example
+`GOMEMLIMIT=600MiB`) makes the collector work harder before the process
+grows.
 
 ### Deploying on a small shared server
 
@@ -325,9 +335,11 @@ unit with install steps. Protection works in two layers:
    `MemoryHigh=400M` this service is throttled and reclaimed, at
    `MemoryMax=512M` only this service is OOM-killed and restarted, and
    `CPUQuota=60%` / `CPUWeight=20` / `Nice=10` make other services win the
-   CPU whenever the machine is busy. Go 1.23 does not read cgroup CPU limits,
-   so the profile also sets `GOMAXPROCS=1`, and `GOMEMLIMIT=300MiB` makes the
-   garbage collector work harder before the process grows.
+   CPU whenever the machine is busy. The profile also sets `GOMAXPROCS=1`,
+   and `GOMEMLIMIT=300MiB` makes the garbage collector work harder before
+   the process grows.
+3. **Disk** is bounded by `STORE_MAX_MB` and `STORE_MAX_AGE`, and the unit
+   lets the service write only to `/var/lib/websitemapper`.
 
 **Bandwidth.** `GLOBAL_DOWNLOAD_KBPS` caps what all scans download together,
 counted in bytes on the wire (the scanner requests gzip and decompresses
@@ -340,7 +352,11 @@ count too. Responses to browsers are gzipped, and only the scan status
 (about 2 KB) is polled while a scan runs.
 
 Measured with this profile, running python.org and go.dev at the same time
-and then imanandhu.in:
+and then imanandhu.in. These figures predate results moving to disk, when
+results were held in memory. Since then only one scan has been re-measured
+with the profile: a standard scan of python.org (48 hosts, 7,257 URLs, 32 s)
+peaked at 11 MB of heap and 45 MB of process memory, and its result is a
+0.9 MB file:
 
 | | Measured | Limit |
 | --- | --- | --- |
@@ -429,9 +445,9 @@ Reviewed and deliberately left as they are:
 - A host whose root only redirects to another host (for example
   `blog.example.com` → `example.com/blog`) is recorded from its probe. It
   isn't crawled and doesn't use a crawl slot.
-- `SCAN_MAX_RECORDED_URLS_PER_HOST` caps the URLs kept per host. Pages that
-  link thousands of URLs would otherwise make results huge. The rest are
-  counted in `urlsOmitted`.
+- There is no limit on the URLs kept per host. `SCAN_MAX_RECORDED_URLS` is
+  a ceiling for the whole scan; URLs found beyond it are counted in
+  `urlsOmitted`.
 
 ### Scope and safety
 
@@ -578,7 +594,8 @@ Returns the scan status. Poll this every 1–2 seconds while a scan runs.
 - `error`: set only when the whole scan failed.
 - `finishedAt` and `durationMs` are set once the scan finishes.
 
-`404` if the scan does not exist. Scans live in memory and are lost on restart.
+`404` if the scan does not exist. Finished scans are kept on disk until they
+are removed by age or by the storage limits (see Storage and retention).
 
 ### `POST /api/scans/{id}/cancel`
 

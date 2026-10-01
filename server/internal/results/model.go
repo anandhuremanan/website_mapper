@@ -36,6 +36,8 @@ const (
 
 // Host is a hostname within the target's scope and everything found on it.
 type Host struct {
+	// ID is the number the scan's URL records use for this host.
+	ID       int64     `json:"-"`
 	Hostname string    `json:"hostname"`
 	State    HostState `json:"state"`
 	// Sources are how the host itself was discovered.
@@ -49,10 +51,12 @@ type Host struct {
 	Crawl     *discovery.CrawlInfo   `json:"crawl,omitempty"`
 	Sitemap   *discovery.SitemapInfo `json:"sitemap,omitempty"`
 	Counts    HostCounts             `json:"counts"`
-	URLs      []URL                  `json:"urls"`
 	// Omitted counts URLs seen on this host but not recorded because the
-	// per-host URL limit was reached.
+	// scan's recorded-URL limit was reached.
 	Omitted int `json:"urlsOmitted,omitempty"`
+	// URLs are stored apart from the host (a host can have very many) and
+	// filled in only when a result is read together with its URLs.
+	URLs []URL `json:"urls"`
 }
 
 // HostCounts summarizes a host's URLs.

@@ -203,7 +203,9 @@ type EngineError struct {
 	Partial bool `json:"partial,omitempty"`
 }
 
-// Result is a completed scan's normalized result plus scan context.
+// Result is a finished scan's normalized result plus scan context. Its
+// hosts carry their URLs only when the result was read with them (see
+// ResultReader); stored and summarized results leave them empty.
 type Result struct {
 	ScanID     string         `json:"scanId"`
 	Status     Status         `json:"status"`
@@ -228,15 +230,47 @@ type Domain struct {
 // ErrNotFound is returned when a scan or result does not exist.
 var ErrNotFound = errors.New("not found")
 
-// Repository persists scans and results. The in-memory implementation is
-// used for V1; a database-backed one can replace it without changing the
-// service. Implementations must return copies that callers may modify.
+// ErrStorageFull is returned when the disk holding results is too full to
+// start another scan.
+var ErrStorageFull = errors.New("the server's result storage is full; try again later")
+
+// Repository persists scans and their results. Implementations must return
+// copies that callers may modify.
+//
+// A result has two parts. The URLs, which can number in the millions, are
+// written to a URLStore while the scan runs and read back one host at a
+// time. Everything else (hosts, counts, notices) is small and saved once,
+// with SaveResult, when the scan ends.
 type Repository interface {
 	Create(ctx context.Context, s Scan) error
 	Get(ctx context.Context, id string) (Scan, error)
 	Update(ctx context.Context, s Scan) error
+	// OpenURLs returns the store a running scan records its URLs in. The
+	// caller closes it when the scan ends, after SaveResult if there is a
+	// result to keep.
+	OpenURLs(ctx context.Context, id string) (URLStore, error)
+	// SaveResult stores a finished scan's result. Its hosts' URLs are the
+	// ones already written to the scan's URLStore.
 	SaveResult(ctx context.Context, r Result) error
-	GetResult(ctx context.Context, id string) (Result, error)
+	// OpenResult opens a finished scan's result for reading. It returns
+	// ErrNotFound if the scan has no result.
+	OpenResult(ctx context.Context, id string) (ResultReader, error)
+}
+
+// URLStore is where one running scan records its URLs.
+type URLStore interface {
+	results.URLStore
+	Close() error
+}
+
+// ResultReader reads one stored result. It must be closed.
+type ResultReader interface {
+	// Result returns the result without its hosts' URLs.
+	Result() Result
+	// URLs calls fn for each URL of a host, in path order, until fn returns
+	// an error.
+	URLs(ctx context.Context, hostname string, fn func(results.URL) error) error
+	Close() error
 }
 
 // Clone returns a deep copy of s.

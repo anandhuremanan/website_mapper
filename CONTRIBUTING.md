@@ -25,7 +25,7 @@ be merged. See [Safety rules](ARCHITECTURE.md#safety-rules).
 
 ## Development setup
 
-You need **Go 1.23+** and **Node.js 20.9+**.
+You need **Go 1.26+** and **Node.js 20.9+**.
 
 ```sh
 git clone https://github.com/anandhuremanan/website_mapper.git
@@ -76,6 +76,8 @@ npm run build
   slow.
 - Test fakes used from several goroutines must not share mutable state (for
   example return a copy of a canned response, not the same pointer).
+- Tests that need a result store use `storetest.New(t, store.Options{})`,
+  which opens one in a temporary directory and closes it when the test ends.
 - Client component tests use React Testing Library with jsdom: put
   `// @vitest-environment jsdom` at the top of `*.test.tsx` files.
 

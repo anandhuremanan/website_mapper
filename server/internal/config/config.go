@@ -20,12 +20,7 @@ type Config struct {
 	MaxConcurrentScans int
 	// QueueSize bounds how many scans may wait to run.
 	QueueSize int
-	// MaxStoredScans bounds how many finished scans (and their results) the
-	// in-memory store keeps. Queued and running scans are never evicted.
-	MaxStoredScans int
-	// MaxStoredResultURLs bounds the URLs held by stored results in total,
-	// the main driver of retained memory (about 0.6 KB per URL).
-	MaxStoredResultURLs int
+	Store     StoreConfig
 
 	// GlobalHTTPConcurrency bounds HTTP requests in flight across all scans.
 	GlobalHTTPConcurrency int
@@ -38,6 +33,21 @@ type Config struct {
 	Cache CacheConfig
 
 	Scan ScanConfig
+}
+
+// StoreConfig controls where scans and their results are kept on disk and
+// when finished ones are removed. Queued and running scans are never removed.
+type StoreConfig struct {
+	// DataDir holds one database file per scan.
+	DataDir string
+	// MaxScans bounds how many finished scans are kept.
+	MaxScans int
+	// MaxBytes bounds the disk space finished scans use together.
+	MaxBytes int64
+	// MaxAge is how long a finished scan is kept.
+	MaxAge time.Duration
+	// MinFreeBytes is the free disk space below which new scans are refused.
+	MinFreeBytes int64
 }
 
 // CacheConfig sizes the shared discovery cache.
@@ -77,7 +87,8 @@ type ScanConfig struct {
 	MaxDownloadBytes int64
 	// MaxDiscoveredHosts bounds the hostnames one scan records.
 	MaxDiscoveredHosts int
-	// MaxRecordedURLs bounds the URLs one scan records.
+	// MaxRecordedURLs is a safety ceiling on the URLs one scan records, so
+	// that a single scan cannot fill the disk.
 	MaxRecordedURLs int
 	// MaxDepth is how many links deep the crawler follows from a host's start page.
 	MaxDepth int
@@ -85,8 +96,6 @@ type ScanConfig struct {
 	MaxURLs int
 	// Concurrency is the number of parallel requests to one host.
 	Concurrency int
-	// MaxRecordedURLsPerHost bounds how many URLs are kept per host.
-	MaxRecordedURLsPerHost int
 	// MaxHosts is the maximum number of hosts crawled per scan.
 	MaxHosts int
 	// MaxProbeHosts is the maximum number of hosts probed over HTTP per scan.
@@ -123,12 +132,17 @@ func Load() (Config, error) {
 func LoadFrom(getenv func(string) string) (Config, error) {
 	p := parser{getenv: getenv}
 	cfg := Config{
-		Port:                      p.str("SERVER_PORT", "8080"),
-		LogLevel:                  p.level("LOG_LEVEL", slog.LevelInfo),
-		MaxConcurrentScans:        p.int("MAX_CONCURRENT_SCANS", 3, 1),
-		QueueSize:                 p.int("SCAN_QUEUE_SIZE", 100, 1),
-		MaxStoredScans:            p.int("MAX_STORED_SCANS", 100, 1),
-		MaxStoredResultURLs:       p.int("MAX_STORED_RESULT_URLS", 500000, 1),
+		Port:               p.str("SERVER_PORT", "8080"),
+		LogLevel:           p.level("LOG_LEVEL", slog.LevelInfo),
+		MaxConcurrentScans: p.int("MAX_CONCURRENT_SCANS", 3, 1),
+		QueueSize:          p.int("SCAN_QUEUE_SIZE", 100, 1),
+		Store: StoreConfig{
+			DataDir:      p.str("DATA_DIR", "data"),
+			MaxScans:     p.int("MAX_STORED_SCANS", 500, 1),
+			MaxBytes:     int64(p.int("STORE_MAX_MB", 5120, 1)) << 20,
+			MaxAge:       p.duration("STORE_MAX_AGE", 7*24*time.Hour),
+			MinFreeBytes: int64(p.int("STORE_MIN_FREE_MB", 1024, 0)) << 20,
+		},
 		GlobalHTTPConcurrency:     p.int("GLOBAL_HTTP_CONCURRENCY", 32, 1),
 		GlobalDNSConcurrency:      p.int("GLOBAL_DNS_CONCURRENCY", 16, 1),
 		GlobalDownloadBytesPerSec: int64(p.int("GLOBAL_DOWNLOAD_KBPS", 1024, 0)) << 10,
@@ -142,32 +156,31 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 			ArchiveTTL: p.duration("CACHE_ARCHIVE_TTL", 24*time.Hour),
 		},
 		Scan: ScanConfig{
-			DefaultMode:            p.oneOf("SCAN_DEFAULT_MODE", "light", "passive", "light", "full"),
-			ArchiveEnabled:         p.bool("SCAN_ARCHIVE_ENABLED", true),
-			ArchiveMaxURLs:         p.int("SCAN_ARCHIVE_MAX_URLS", 5000, 1),
-			SitemapMaxURLs:         p.int("SCAN_SITEMAP_MAX_URLS", 2000, 1),
-			SitemapMaxFiles:        p.int("SCAN_SITEMAP_MAX_FILES", 5, 1),
-			RequestTimeout:         p.duration("SCAN_REQUEST_TIMEOUT", 10*time.Second),
-			Timeout:                p.duration("SCAN_TIMEOUT", 30*time.Minute),
-			MaxRequests:            p.int("SCAN_MAX_REQUESTS", 50000, 1),
-			MaxDownloadBytes:       int64(p.int("SCAN_MAX_DOWNLOAD_MB", 500, 1)) << 20,
-			MaxDiscoveredHosts:     p.int("SCAN_MAX_DISCOVERED_HOSTS", 10000, 1),
-			MaxRecordedURLs:        p.int("SCAN_MAX_RECORDED_URLS", 50000, 1),
-			MaxDepth:               p.int("SCAN_MAX_DEPTH", 3, 0),
-			MaxURLs:                p.int("SCAN_MAX_URLS", 500, 1),
-			Concurrency:            p.int("SCAN_CONCURRENCY", 4, 1),
-			MaxHosts:               p.int("SCAN_MAX_HOSTS", 500, 1),
-			MaxRecordedURLsPerHost: p.int("SCAN_MAX_RECORDED_URLS_PER_HOST", 2000, 1),
-			MaxProbeHosts:          p.int("SCAN_MAX_PROBE_HOSTS", 2000, 1),
-			MaxResolveHosts:        p.int("SCAN_MAX_RESOLVE_HOSTS", 10000, 1),
-			HostConcurrency:        p.int("SCAN_HOST_CONCURRENCY", 8, 1),
-			DNSTimeout:             p.duration("SCAN_DNS_TIMEOUT", 5*time.Second),
-			CTEnabled:              p.bool("SCAN_CT_ENABLED", true),
-			CTTimeout:              p.duration("SCAN_CT_TIMEOUT", 60*time.Second),
-			RequestsPerSecond:      p.float("SCAN_REQUESTS_PER_SECOND", 5),
-			MaxBodyBytes:           int64(p.int("SCAN_MAX_BODY_BYTES", 2<<20, 1024)),
-			UserAgent:              p.str("SCAN_USER_AGENT", "WebsiteMapper/0.1 (+passive public discovery)"),
-			AllowPrivateNetworks:   p.bool("SCAN_ALLOW_PRIVATE_NETWORKS", false),
+			DefaultMode:          p.oneOf("SCAN_DEFAULT_MODE", "light", "passive", "light", "full"),
+			ArchiveEnabled:       p.bool("SCAN_ARCHIVE_ENABLED", true),
+			ArchiveMaxURLs:       p.int("SCAN_ARCHIVE_MAX_URLS", 5000, 1),
+			SitemapMaxURLs:       p.int("SCAN_SITEMAP_MAX_URLS", 2000, 1),
+			SitemapMaxFiles:      p.int("SCAN_SITEMAP_MAX_FILES", 5, 1),
+			RequestTimeout:       p.duration("SCAN_REQUEST_TIMEOUT", 10*time.Second),
+			Timeout:              p.duration("SCAN_TIMEOUT", 30*time.Minute),
+			MaxRequests:          p.int("SCAN_MAX_REQUESTS", 50000, 1),
+			MaxDownloadBytes:     int64(p.int("SCAN_MAX_DOWNLOAD_MB", 500, 1)) << 20,
+			MaxDiscoveredHosts:   p.int("SCAN_MAX_DISCOVERED_HOSTS", 10000, 1),
+			MaxRecordedURLs:      p.int("SCAN_MAX_RECORDED_URLS", 50000, 1),
+			MaxDepth:             p.int("SCAN_MAX_DEPTH", 3, 0),
+			MaxURLs:              p.int("SCAN_MAX_URLS", 500, 1),
+			Concurrency:          p.int("SCAN_CONCURRENCY", 4, 1),
+			MaxHosts:             p.int("SCAN_MAX_HOSTS", 500, 1),
+			MaxProbeHosts:        p.int("SCAN_MAX_PROBE_HOSTS", 2000, 1),
+			MaxResolveHosts:      p.int("SCAN_MAX_RESOLVE_HOSTS", 10000, 1),
+			HostConcurrency:      p.int("SCAN_HOST_CONCURRENCY", 8, 1),
+			DNSTimeout:           p.duration("SCAN_DNS_TIMEOUT", 5*time.Second),
+			CTEnabled:            p.bool("SCAN_CT_ENABLED", true),
+			CTTimeout:            p.duration("SCAN_CT_TIMEOUT", 60*time.Second),
+			RequestsPerSecond:    p.float("SCAN_REQUESTS_PER_SECOND", 5),
+			MaxBodyBytes:         int64(p.int("SCAN_MAX_BODY_BYTES", 2<<20, 1024)),
+			UserAgent:            p.str("SCAN_USER_AGENT", "WebsiteMapper/0.1 (+passive public discovery)"),
+			AllowPrivateNetworks: p.bool("SCAN_ALLOW_PRIVATE_NETWORKS", false),
 		},
 	}
 	if len(p.errs) > 0 {

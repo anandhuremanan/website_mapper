@@ -16,6 +16,7 @@ import (
 	"websitemapper/internal/discovery"
 	"websitemapper/internal/scan"
 	"websitemapper/internal/store"
+	"websitemapper/internal/store/storetest"
 )
 
 type oneFinding struct{}
@@ -31,7 +32,7 @@ var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 func newServer(t *testing.T, workers bool) *httptest.Server {
 	t.Helper()
-	svc := scan.NewService(store.NewMemory(store.Limits{MaxScans: 10}), []scan.Stage{{ID: "crawl", Label: "Crawling", Engines: []discovery.Engine{oneFinding{}}}},
+	svc := scan.NewService(storetest.New(t, store.Options{MaxScans: 10}), []scan.Stage{{ID: "crawl", Label: "Crawling", Engines: []discovery.Engine{oneFinding{}}}},
 		scan.Options{QueueSize: 5, ProgressInterval: 10 * time.Millisecond}, quiet)
 	if workers {
 		ctx, cancel := context.WithCancel(context.Background())

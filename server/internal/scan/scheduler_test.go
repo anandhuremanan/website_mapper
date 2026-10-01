@@ -20,6 +20,7 @@ import (
 	"websitemapper/internal/resource"
 	"websitemapper/internal/scan"
 	"websitemapper/internal/store"
+	"websitemapper/internal/store/storetest"
 )
 
 // gateEngine blocks each scan until released (or cancelled) and records
@@ -496,7 +497,7 @@ func TestRequestBudgetIsEnforcedAndReported(t *testing.T) {
 
 func TestShutdownCancelsQueuedAndRunningScans(t *testing.T) {
 	g := newGate()
-	repo := store.NewMemory(store.Limits{MaxScans: 100})
+	repo := storetest.New(t, store.Options{MaxScans: 100})
 	svc := scan.NewService(repo, []scan.Stage{stage("crawl", g)},
 		scan.Options{MaxRunning: 1, QueueSize: 10, ProgressInterval: 10 * time.Millisecond}, quiet)
 	svc.Start(context.Background())

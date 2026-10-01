@@ -1,7 +1,6 @@
 package results
 
 import (
-	"net/url"
 	"sort"
 	"sync"
 
@@ -13,57 +12,50 @@ import (
 // maxDiscoveredFrom bounds how many referrers are kept per URL.
 const maxDiscoveredFrom = 5
 
-// Limits bound the memory one scan's results can use. Zero means no limit.
+// Limits are safety ceilings on what one scan records. Zero means no limit.
 type Limits struct {
-	// MaxHosts bounds recorded hostnames. Certificate logs can list tens of
-	// thousands of historical names for large domains.
+	// MaxHosts bounds recorded hostnames, which are kept in memory.
+	// Certificate logs can list tens of thousands of historical names.
 	MaxHosts int
-	// MaxURLsPerHost bounds recorded URLs per host. Pages that list
-	// thousands of links would otherwise dominate the result.
-	MaxURLsPerHost int
-	// MaxURLs bounds recorded URLs across the whole scan.
+	// MaxURLs bounds recorded URLs across the whole scan, so that one scan
+	// cannot fill the disk.
 	MaxURLs int
 }
 
 // Aggregator collects findings concurrently and builds a Result. It also
 // serves as the discovery.State engines read from.
 //
-// Every URL and host is stored once (keyed by its normalized form), with
-// only the metadata shown to users; response bodies are never retained.
+// Hosts are kept in memory: they are few, small, and read constantly by the
+// engines. URLs go to a URLStore, so a scan's memory does not grow with the
+// number of URLs it finds. Every URL and host is stored once (keyed by its
+// normalized form), with only the metadata shown to users; response bodies
+// are never retained.
 type Aggregator struct {
 	target discovery.Target
 	limits Limits
 
-	mu           sync.Mutex
-	urls         map[string]*urlEntry
+	mu    sync.Mutex
+	store URLStore
+	// err is the first store failure; after it nothing more is recorded.
+	err          error
 	hosts        map[string]*hostEntry
+	hostNames    []string // by host ID - 1
 	hostsOmitted int
-	// urlCounts is maintained incrementally so progress polling does not
-	// reclassify every URL.
+	// urlCounts is maintained incrementally so progress polling never needs
+	// a pass over the URLs.
 	urlCounts Counts
+	tech      techSet
 }
 
 var _ discovery.State = (*Aggregator)(nil)
 
-type urlEntry struct {
-	u       *url.URL
-	sources set[discovery.Source]
-	hints   set[discovery.Hint]
-	methods set[string]
-	from    []string
-	resp    *discovery.Response
-	err     string
-	archive *discovery.ArchiveInfo
-	cls     classify.Result // cached; recomputed when hints, resp or archive change
-}
-
 type hostEntry struct {
+	id int64
 	// liveSeen / cachedSeen record whether the host was discovered by this
 	// scan's own work and/or through reused cache entries.
 	liveSeen, cachedSeen bool
-	urls                 int // recorded URLs
-	archived             int // of those, first recorded from a web archive
-	omitted              int // URLs seen after the per-host limit was reached
+	counts               HostCounts // recorded URLs
+	omitted              int        // URLs seen after the recorded-URL limit was reached
 	sources              set[discovery.Source]
 	dns                  *discovery.DNSInfo
 	http                 *discovery.HTTPInfo
@@ -71,14 +63,24 @@ type hostEntry struct {
 	sitemap              *discovery.SitemapInfo
 }
 
-// NewAggregator creates an Aggregator scoped to target.
-func NewAggregator(target discovery.Target, limits Limits) *Aggregator {
+// NewAggregator creates an Aggregator scoped to target that records URLs in
+// store.
+func NewAggregator(target discovery.Target, limits Limits, store URLStore) *Aggregator {
 	return &Aggregator{
 		target: target,
 		limits: limits,
-		urls:   make(map[string]*urlEntry),
+		store:  store,
 		hosts:  make(map[string]*hostEntry),
+		tech:   techSet{},
 	}
+}
+
+// Err returns the first failure of the URL store, if any. After a failure
+// the Aggregator records nothing more.
+func (a *Aggregator) Err() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.err
 }
 
 // Add merges a finding. Out-of-scope and unparseable findings are ignored.
@@ -92,7 +94,6 @@ func (a *Aggregator) Add(f discovery.Finding) {
 	if err != nil || !a.target.InScope(u.Hostname()) {
 		return
 	}
-	key := u.String()
 
 	// A URL on a host is evidence the host exists, discovered the same way.
 	// SourceHost means the URL came from the host, not the other way round.
@@ -103,99 +104,97 @@ func (a *Aggregator) Add(f discovery.Finding) {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.err != nil {
+		return
+	}
 	host := a.hostLocked(u.Hostname(), src, !f.CachedAt.IsZero())
 	if host == nil {
 		return // host not recorded: over the host limit
 	}
-	e, ok := a.urls[key]
-	if !ok {
-		// Over a limit, only URLs the scanner actually requested are
-		// recorded (bounded by the request budget); the rest are counted.
-		full := (a.limits.MaxURLsPerHost > 0 && host.urls >= a.limits.MaxURLsPerHost) ||
-			(a.limits.MaxURLs > 0 && len(a.urls) >= a.limits.MaxURLs)
-		// Archived URLs are historical and arrive first (the archive is
-		// queried before the site is contacted). They may fill at most half
-		// of a host's slots, so routes found on the live site (sitemaps,
-		// links) always have room.
-		fromArchive := f.Source == discovery.SourceArchive
-		if fromArchive && a.limits.MaxURLsPerHost > 0 && host.archived >= max(a.limits.MaxURLsPerHost/2, 1) {
-			full = true
-		}
-		if full && f.Response == nil && f.Error == "" {
-			host.omitted++
+	origin, path := splitURL(u)
+
+	// At the recorded-URL limit, only URLs the scanner actually requested
+	// are still recorded (bounded by the request budget); the rest are
+	// counted.
+	full := a.limits.MaxURLs > 0 && a.urlCounts.URLs >= a.limits.MaxURLs
+	if !full || f.Response != nil || f.Error != "" {
+		fresh := &URLRecord{HostID: host.id, Path: path, Origin: origin}
+		fresh.merge(f)
+		fresh.classify()
+		inserted, err := a.store.Insert(fresh)
+		if err != nil {
+			a.err = err
 			return
 		}
-		host.urls++
-		if fromArchive {
-			host.archived++
-		}
-		e = &urlEntry{u: u, sources: set[discovery.Source]{}, hints: set[discovery.Hint]{}, methods: set[string]{}}
-		a.urls[key] = e
-	} else {
-		a.urlCounts.subtract(e)
-	}
-	defer a.urlCounts.add(e)
-	reclassify := !ok
-	if f.Source != "" {
-		e.sources.add(f.Source)
-	}
-	if f.Hint != "" {
-		if _, had := e.hints[f.Hint]; !had {
-			e.hints.add(f.Hint)
-			reclassify = true
+		if inserted {
+			a.count(host, fresh, 1)
+			a.tech.addPath(u.Path)
+			a.addResponseEvidence(f)
+			return
 		}
 	}
-	if f.Method != "" {
-		e.methods.add(f.Method)
+
+	rec, ok, err := a.store.Get(host.id, path, origin)
+	if err != nil {
+		a.err = err
+		return
 	}
-	if f.Archive != nil && (e.archive == nil || f.Archive.FirstSeen.Before(e.archive.FirstSeen)) {
-		e.archive = f.Archive
-		reclassify = true
+	if !ok {
+		host.omitted++
+		return
 	}
-	if f.From != "" && len(e.from) < maxDiscoveredFrom && !contains(e.from, f.From) {
-		e.from = append(e.from, f.From)
-	}
-	if f.Response != nil {
-		// Prefer a successful response over an earlier redirect or error,
-		// and this scan's own response over a cached one.
-		if e.resp == nil || (e.resp.Status >= 300 && f.Response.Status < 300) ||
-			(e.resp.CachedAt != nil && f.Response.CachedAt == nil) {
-			e.resp = f.Response
-			reclassify = true
-		}
-		e.err = ""
-	} else if f.Error != "" && e.resp == nil {
-		e.err = f.Error
+	before := *rec
+	changed, reclassify, took := rec.merge(f)
+	if !changed {
+		return
 	}
 	if reclassify {
-		e.cls = classifyEntry(e)
+		rec.classify()
+	}
+	if err := a.store.Update(rec); err != nil {
+		a.err = err
+		return
+	}
+	a.count(host, &before, -1)
+	a.count(host, rec, 1)
+	if took {
+		a.addResponseEvidence(f)
 	}
 }
 
-// add and subtract maintain the URL part of Counts for one entry.
-func (c *Counts) add(e *urlEntry)      { c.applyURL(e, 1) }
-func (c *Counts) subtract(e *urlEntry) { c.applyURL(e, -1) }
+func (a *Aggregator) addResponseEvidence(f discovery.Finding) {
+	if r := f.Response; r != nil {
+		a.tech.addResponse(r.Server, r.PoweredBy, r.Generator)
+	}
+}
 
-func (c *Counts) applyURL(e *urlEntry, d int) {
+// count adds (d = 1) or removes (d = -1) a record from the scan's and its
+// host's counters.
+func (a *Aggregator) count(h *hostEntry, r *URLRecord, d int) {
+	c := &a.urlCounts
 	c.URLs += d
-	switch e.cls.Type {
+	h.counts.URLs += d
+	switch r.Type {
 	case classify.TypePage:
 		c.Pages += d
+		h.counts.Pages += d
 	case classify.TypeAPI:
 		c.APIs += d
+		h.counts.APIs += d
 	case classify.TypeAsset:
 		c.Assets += d
-		if e.cls.AssetKind == classify.AssetJavaScript {
+		h.counts.Assets += d
+		if r.AssetKind == classify.AssetJavaScript {
 			c.JavaScript += d
 		}
 	}
 	switch {
-	case e.resp != nil:
+	case r.Responded:
 		c.URLsFetched += d
-		if e.resp.CachedAt != nil {
+		if r.CachedAt != nil {
 			c.Cache.Pages += d
 		}
-	case e.err != "":
+	case r.Err != "":
 		c.URLsFailed += d
 	}
 }
@@ -235,7 +234,8 @@ func (a *Aggregator) hostLocked(host string, src discovery.Source, cached bool) 
 			a.hostsOmitted++
 			return nil
 		}
-		h = &hostEntry{sources: set[discovery.Source]{}}
+		a.hostNames = append(a.hostNames, host)
+		h = &hostEntry{id: int64(len(a.hostNames)), sources: set[discovery.Source]{}}
 		a.hosts[host] = h
 	}
 	if src != "" && src != discovery.SourceHost {
@@ -268,15 +268,13 @@ func (a *Aggregator) Hosts() []discovery.HostView {
 func (a *Aggregator) PageURLs() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	var out []string
-	for key, e := range a.urls {
-		if e.archiveOnly() {
-			continue
-		}
-		if e.resp == nil && e.err == "" && e.cls.Type == classify.TypePage {
-			out = append(out, key)
-		}
+	if a.err != nil {
+		return nil
 	}
+	var out []string
+	a.err = a.store.PendingPages(func(hostID int64, path, origin string) {
+		out = append(out, JoinURL(a.hostNames[hostID-1], origin, path))
+	})
 	sort.Strings(out)
 	return out
 }
@@ -300,8 +298,7 @@ func (a *Aggregator) Counts() Counts {
 // fromCache reports whether the host was discovered only through the cache.
 func (h *hostEntry) fromCache() bool { return h.cachedSeen && !h.liveSeen }
 
-// countHost adds one host to c. Live and final counts share it, so the two
-// always agree.
+// countHost adds one host to c.
 func countHost(c *Counts, st HostState, dns *discovery.DNSInfo, http *discovery.HTTPInfo, crawl *discovery.CrawlInfo, omitted int) {
 	c.Hosts++
 	if dns != nil && dns.CachedAt != nil {
@@ -362,59 +359,25 @@ func isBudgetSkip(reason string) bool {
 	return reason == discovery.SkipHostLimit || reason == discovery.SkipRequestLimit
 }
 
-// Counts summarizes a finished result.
-func (r Result) Counts() Counts {
-	c := Counts{}
-	c.Limits.HostsOmitted = r.HostsOmitted
-	for _, h := range r.Hosts {
-		countHost(&c, h.State, h.DNS, h.HTTP, h.Crawl, h.Omitted)
-		if h.FromCache {
-			c.Cache.Hosts++
-		}
-		for _, u := range h.URLs {
-			c.URLs++
-			switch u.Type {
-			case classify.TypePage:
-				c.Pages++
-			case classify.TypeAPI:
-				c.APIs++
-			case classify.TypeAsset:
-				c.Assets++
-				if u.AssetKind == classify.AssetJavaScript {
-					c.JavaScript++
-				}
-			}
-			switch {
-			case u.Error != "":
-				c.URLsFailed++
-			case u.Fetched:
-				c.URLsFetched++
-				if u.CachedAt != nil {
-					c.Cache.Pages++
-				}
-			}
-		}
-	}
-	return c
-}
-
-// Result builds a deterministic snapshot: hosts (apex first, then by how far
-// they got, then by name), each with its URLs sorted.
+// Result flushes the URL store and builds a deterministic snapshot of
+// everything except the URLs themselves, which stay in the store: hosts
+// (apex first, then by how far they got, then by name) with their URL
+// counts, and the technologies detected.
 func (a *Aggregator) Result() Result {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-
-	byHost := map[string][]URL{}
-	for key, e := range a.urls {
-		u := buildURL(key, e)
-		byHost[u.Hostname] = append(byHost[u.Hostname], u)
+	if a.err == nil {
+		a.err = a.store.Flush()
 	}
 
+	tech := techSet{}
+	for name, evs := range a.tech {
+		tech[name] = append([]string(nil), evs...)
+	}
 	res := Result{Hosts: make([]Host, 0, len(a.hosts)), HostsOmitted: a.hostsOmitted}
 	for name, h := range a.hosts {
-		urls := byHost[name]
-		sort.Slice(urls, func(i, j int) bool { return urls[i].URL < urls[j].URL })
-		host := Host{
+		res.Hosts = append(res.Hosts, Host{
+			ID:        h.id,
 			Hostname:  name,
 			State:     hostState(h),
 			Sources:   h.sources.sorted(),
@@ -423,78 +386,18 @@ func (a *Aggregator) Result() Result {
 			HTTP:      h.http,
 			Crawl:     h.crawl,
 			Sitemap:   h.sitemap,
-			URLs:      urls,
+			Counts:    h.counts,
 			Omitted:   h.omitted,
+			URLs:      []URL{},
+		})
+		if h.http != nil && h.http.Server != "" {
+			tech.addResponse(h.http.Server, "", "")
 		}
-		if host.URLs == nil {
-			host.URLs = []URL{}
-		}
-		for _, u := range urls {
-			host.Counts.URLs++
-			switch u.Type {
-			case classify.TypePage:
-				host.Counts.Pages++
-			case classify.TypeAPI:
-				host.Counts.APIs++
-			case classify.TypeAsset:
-				host.Counts.Assets++
-			}
-		}
-		res.Hosts = append(res.Hosts, host)
 	}
 	apex := a.target.Domain
 	sort.Slice(res.Hosts, func(i, j int) bool { return hostLess(res.Hosts[i], res.Hosts[j], apex) })
-
-	res.Technologies = detectTechnologies(a.urls, a.hosts)
+	res.Technologies = tech.list()
 	return res
-}
-
-func buildURL(key string, e *urlEntry) URL {
-	out := URL{
-		URL:            key,
-		Hostname:       e.u.Hostname(),
-		Path:           e.u.EscapedPath(),
-		Methods:        e.methods.sorted(),
-		Sources:        e.sources.sorted(),
-		DiscoveredFrom: append([]string(nil), e.from...),
-		Error:          e.err,
-		Fetched:        e.resp != nil || e.err != "",
-		State:          URLDiscovered,
-		Archived:       e.archive,
-	}
-	switch {
-	case e.resp != nil:
-		out.State = URLVerified
-		out.CachedAt = e.resp.CachedAt
-	case e.err != "":
-		out.State = URLFetched
-	}
-	if e.resp != nil {
-		out.Status = e.resp.Status
-		out.ContentType = e.resp.ContentType
-		out.Title = e.resp.Title
-		out.Redirect = e.resp.Redirect
-		out.Server = e.resp.Server
-	}
-	out.Type, out.AssetKind, out.TypeEvidence = e.cls.Type, e.cls.AssetKind, e.cls.Evidence
-	return out
-}
-
-// archiveOnly reports whether the URL is known only from a web archive.
-func (e *urlEntry) archiveOnly() bool {
-	_, archived := e.sources[discovery.SourceArchive]
-	return archived && len(e.sources) == 1
-}
-
-func classifyEntry(e *urlEntry) classify.Result {
-	in := classify.Input{Path: e.u.Path, Hints: e.hints.sorted()}
-	if e.archive != nil {
-		in.ArchivedContentType = e.archive.ContentType
-	}
-	if e.resp != nil {
-		in.Status, in.ContentType = e.resp.Status, e.resp.ContentType
-	}
-	return classify.Classify(in)
 }
 
 func hostState(h *hostEntry) HostState {

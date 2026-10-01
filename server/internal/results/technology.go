@@ -32,58 +32,58 @@ var pathRules = []pathRule{
 	{"Shopify", "/cdn/shop/"},
 }
 
-// detectTechnologies runs path, header and generator rules over all URLs
-// and host probes. Caller holds the aggregator lock.
-func detectTechnologies(urls map[string]*urlEntry, hosts map[string]*hostEntry) []Technology {
-	found := map[string][]string{}
-	addEvidence := func(name, ev string) {
-		evs := found[name]
-		if len(evs) < maxEvidence && !contains(evs, ev) {
-			found[name] = append(evs, ev)
-		}
-	}
+// techSet collects technology evidence while a scan runs, so detecting
+// technologies never needs a pass over every URL.
+type techSet map[string][]string
 
-	keys := make([]string, 0, len(urls))
-	for k := range urls {
-		keys = append(keys, k)
+// add records evidence for a technology. Each keeps its maxEvidence
+// alphabetically first evidence strings, so the outcome does not depend on
+// the order findings arrive in.
+func (t techSet) add(name, ev string) {
+	evs := t[name]
+	i := sort.SearchStrings(evs, ev)
+	if i < len(evs) && evs[i] == ev {
+		return
 	}
-	sort.Strings(keys) // deterministic evidence order
+	if i >= maxEvidence {
+		return
+	}
+	evs = append(evs, "")
+	copy(evs[i+1:], evs[i:])
+	evs[i] = ev
+	if len(evs) > maxEvidence {
+		evs = evs[:maxEvidence]
+	}
+	t[name] = evs
+}
 
-	for _, k := range keys {
-		e := urls[k]
-		for _, r := range pathRules {
-			if strings.Contains(e.u.Path, r.fragment) {
-				addEvidence(r.name, "URL path contains "+r.fragment)
-			}
-		}
-		if e.resp == nil {
-			continue
-		}
-		if s := e.resp.Server; s != "" {
-			addEvidence(headerProduct(s), "Server: "+s)
-		}
-		if p := e.resp.PoweredBy; p != "" {
-			addEvidence(headerProduct(p), "X-Powered-By: "+p)
-		}
-		if g := e.resp.Generator; g != "" {
-			addEvidence(headerProduct(g), `<meta name="generator" content="`+g+`">`)
+// addPath applies the path rules to a newly recorded URL's path.
+func (t techSet) addPath(path string) {
+	for _, r := range pathRules {
+		if strings.Contains(path, r.fragment) {
+			t.add(r.name, "URL path contains "+r.fragment)
 		}
 	}
+}
 
-	names := make([]string, 0, len(hosts))
-	for n := range hosts {
-		names = append(names, n)
+// addResponse applies the header and generator rules to a response.
+func (t techSet) addResponse(server, poweredBy, generator string) {
+	if server != "" {
+		t.add(headerProduct(server), "Server: "+server)
 	}
-	sort.Strings(names)
-	for _, n := range names {
-		if h := hosts[n].http; h != nil && h.Server != "" {
-			addEvidence(headerProduct(h.Server), "Server: "+h.Server)
-		}
+	if poweredBy != "" {
+		t.add(headerProduct(poweredBy), "X-Powered-By: "+poweredBy)
 	}
+	if generator != "" {
+		t.add(headerProduct(generator), `<meta name="generator" content="`+generator+`">`)
+	}
+}
 
-	out := make([]Technology, 0, len(found))
-	for name, ev := range found {
-		out = append(out, Technology{Name: name, Evidence: ev})
+// list returns the technologies detected so far, sorted by name.
+func (t techSet) list() []Technology {
+	out := make([]Technology, 0, len(t))
+	for name, ev := range t {
+		out = append(out, Technology{Name: name, Evidence: append([]string(nil), ev...)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
