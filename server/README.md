@@ -172,7 +172,8 @@ back as soon as that single operation ends:
 | --- | --- | --- |
 | `http` | `GLOBAL_HTTP_CONCURRENCY` | every probe and crawl request, including reading its body |
 | `dns` | `GLOBAL_DNS_CONCURRENCY` | each host's lookup |
-| `certificate-transparency` | 4 (fixed) | subdomain provider queries; crt.sh responses can be tens of MB |
+| `certificate-transparency` | 4 (fixed) | the slow certificate-log providers; crt.sh responses can be tens of MB |
+| `subdomain-lookup` | 8 (fixed) | the quick subdomain sources, kept apart so they never wait behind the slow ones |
 
 Per-scan settings such as `SCAN_HOST_CONCURRENCY` and `SCAN_CONCURRENCY` only
 limit how many operations one scan asks for at once; the pools decide how many

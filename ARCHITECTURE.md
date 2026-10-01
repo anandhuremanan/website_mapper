@@ -338,7 +338,7 @@ small machine. Work is bounded in three layers
 ```mermaid
 flowchart TB
     A["1. Scheduler<br/>MAX_CONCURRENT_SCANS running, FIFO queue of SCAN_QUEUE_SIZE"] --> B
-    B["2. Shared pools (all scans together)<br/>http 32 · dns 64 · certificate-transparency 4 · archive 2<br/>+ global bandwidth limit (GLOBAL_DOWNLOAD_KBPS)"] --> C
+    B["2. Shared pools (all scans together)<br/>http 32 · dns 64 · certificate-transparency 4 · subdomain-lookup 8 · archive 2<br/>+ global bandwidth limit (GLOBAL_DOWNLOAD_KBPS)"] --> C
     C["3. Per-scan budgets<br/>time, requests, bytes, hosts per stage, pages per host, recorded URLs"]
 ```
 

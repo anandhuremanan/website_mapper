@@ -39,6 +39,10 @@ const shutdownGrace = 15 * time.Second
 // each scan makes one query per provider.
 const ctConcurrency = 4
 
+// lookupConcurrency bounds the quick subdomain lookups across all scans.
+// Their answers are small and arrive in about a second.
+const lookupConcurrency = 8
+
 func main() {
 	if err := run(); err != nil {
 		slog.Error("server stopped", "error", err)
@@ -61,6 +65,10 @@ func run() error {
 		http: resource.NewPool("http", cfg.GlobalHTTPConcurrency),
 		dns:  resource.NewPool("dns", cfg.GlobalDNSConcurrency),
 		ct:   resource.NewPool("certificate-transparency", ctConcurrency),
+		// The quick subdomain lookups have a pool of their own: sharing the
+		// certificate-log pool would leave them waiting behind providers
+		// that take a minute, and they would time out in the queue.
+		lookups: resource.NewPool("subdomain-lookup", lookupConcurrency),
 		// archive.org asks for moderate use of its index; the pace of
 		// requests is set by the archive client's rate limit.
 		archive: resource.NewPool("archive", 2),
@@ -96,7 +104,7 @@ func run() error {
 			MaxHosts: cfg.Scan.MaxDiscoveredHosts,
 			MaxURLs:  cfg.Scan.MaxRecordedURLs,
 		},
-		Pools:  []*resource.Pool{pools.http, pools.dns, pools.ct, pools.archive},
+		Pools:  []*resource.Pool{pools.http, pools.dns, pools.ct, pools.lookups, pools.archive},
 		Caches: caches.list(),
 	}, log)
 	svc.Start(context.Background())
@@ -146,8 +154,8 @@ func run() error {
 }
 
 type sharedPools struct {
-	http, dns, ct, archive *resource.Pool
-	bandwidth              *resource.Bandwidth
+	http, dns, ct, lookups, archive *resource.Pool
+	bandwidth                       *resource.Bandwidth
 }
 
 // sharedCaches hold reusable discovery data for all scans. They sit inside
@@ -354,7 +362,7 @@ func subdomainStages(cfg config.ScanConfig, pools sharedPools, caches sharedCach
 		MaxBodyBytes:      16 << 20,
 		UserAgent:         cfg.UserAgent,
 		RequestsPerSecond: 1,
-		Pool:              pools.ct,
+		Pool:              pools.lookups,
 		Bandwidth:         pools.bandwidth,
 	})
 	var quick, slow []subdomains.Source

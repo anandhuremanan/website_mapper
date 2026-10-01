@@ -1121,6 +1121,8 @@ func poolNoun(pool string) string {
 		return "DNS lookup"
 	case "certificate-transparency":
 		return "certificate log query"
+	case "subdomain-lookup":
+		return "subdomain lookup"
 	}
 	return pool
 }
