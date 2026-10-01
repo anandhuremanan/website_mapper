@@ -225,3 +225,33 @@ func TestReuseExpires(t *testing.T) {
 		t.Errorf("an expired scan was reused: %+v", next)
 	}
 }
+
+// TestBackgroundStageWithJoinWait: a background stage that may not hold up
+// the scan is stopped once a joining stage has waited its JoinWait.
+func TestBackgroundStageWithJoinWait(t *testing.T) {
+	slow := newGate() // never released
+	late := &fakeEngine{name: "dns"}
+	bg := stage("certificates", slow)
+	bg.Background, bg.JoinWait = true, 30*time.Millisecond
+	follow := stage("follow-up", late)
+	follow.Join = true
+	svc := startService(t, []scan.Stage{bg, stage("resolve", &fakeEngine{name: "dns"}), follow}, scan.Options{})
+
+	start := time.Now()
+	sc := mustCreate(t, svc, "example.com")
+	done := waitStatus(t, svc, sc.ID, scan.StatusCompleted)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("the scan waited %s for a stage with a 30 ms JoinWait", elapsed)
+	}
+	if late.calls() != 1 {
+		t.Errorf("the joining stage ran %d times", late.calls())
+	}
+	// The stopped stage is reported, not passed over in silence, and what
+	// it found before it was stopped is kept.
+	if len(done.Errors) != 1 || done.Errors[0].Stage != "certificates" {
+		t.Errorf("errors = %+v", done.Errors)
+	}
+	if done.StopReason != "" || done.Counts.URLs != 1 {
+		t.Errorf("stop reason %q, urls %d", done.StopReason, done.Counts.URLs)
+	}
+}

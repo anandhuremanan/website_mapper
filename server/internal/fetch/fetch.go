@@ -31,7 +31,11 @@ var ErrBlockedAddress = errors.New("refusing to connect to non-public address")
 
 // Options configures a Client.
 type Options struct {
-	Timeout           time.Duration
+	Timeout time.Duration
+	// ConnectTimeout bounds opening a connection: the TCP connect, and
+	// separately the TLS handshake. A host that does not answer at all is
+	// given up on after this long instead of after Timeout (0: Timeout).
+	ConnectTimeout    time.Duration
 	MaxBodyBytes      int64
 	UserAgent         string
 	RequestsPerSecond float64
@@ -101,14 +105,17 @@ func New(opts Options) *Client {
 	if opts.ReadBody == nil {
 		opts.ReadBody = isTextual
 	}
-	dialer := &net.Dialer{Timeout: opts.Timeout, KeepAlive: 30 * time.Second}
+	if opts.ConnectTimeout <= 0 || opts.ConnectTimeout > opts.Timeout {
+		opts.ConnectTimeout = opts.Timeout
+	}
+	dialer := &net.Dialer{Timeout: opts.ConnectTimeout, KeepAlive: 30 * time.Second}
 	if !opts.AllowPrivate {
 		dialer.Control = blockNonPublic
 	}
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           dialer.DialContext,
-		TLSHandshakeTimeout:   opts.Timeout,
+		TLSHandshakeTimeout:   opts.ConnectTimeout,
 		ResponseHeaderTimeout: opts.Timeout,
 		MaxIdleConnsPerHost:   4,
 		MaxIdleConns:          idleConns(opts.Pool),

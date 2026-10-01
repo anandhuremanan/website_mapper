@@ -16,8 +16,8 @@ forms, guesses paths or brute-forces names.
 
 ## Features
 
-- **Subdomains from certificate logs** (crt.sh and Cert Spotter), checked in
-  DNS; names that no longer resolve stay visible.
+- **Subdomains from certificate logs and public subdomain databases**,
+  checked in DNS; names that no longer resolve stay visible.
 - **Routes from several sources:** a public web archive (without contacting
   the site), robots.txt and sitemaps, and optionally a crawl of each live
   host.

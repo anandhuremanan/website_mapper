@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -36,7 +37,7 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Cache.MaxBytes != 64<<20 || cfg.Cache.CertTTL != 6*time.Hour || cfg.Cache.ProbeTTL != 2*time.Minute {
 		t.Errorf("cache defaults = %+v", cfg.Cache)
 	}
-	if cfg.MaxConcurrentScans != 3 || cfg.GlobalHTTPConcurrency != 32 || cfg.GlobalDNSConcurrency != 16 || cfg.Scan.Timeout != 30*time.Minute {
+	if cfg.MaxConcurrentScans != 3 || cfg.GlobalHTTPConcurrency != 32 || cfg.GlobalDNSConcurrency != 64 || cfg.Scan.Timeout != 30*time.Minute {
 		t.Errorf("resource defaults = %+v", cfg)
 	}
 }
@@ -75,5 +76,44 @@ func TestLoadInvalid(t *testing.T) {
 	}))
 	if err == nil {
 		t.Fatal("expected error for invalid values")
+	}
+}
+
+func TestSubdomainSourcesAndDNSServers(t *testing.T) {
+	cfg, err := LoadFrom(env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.Scan.SubdomainSources, ","); got != "crtsh,certspotter,anubis,thc,shodan" {
+		t.Errorf("default sources = %s", got)
+	}
+	if got := strings.Join(cfg.Scan.DNSServers, ","); got != "1.1.1.1:53,8.8.8.8:53" {
+		t.Errorf("default DNS servers = %s", got)
+	}
+
+	cfg, err = LoadFrom(env(map[string]string{
+		"SCAN_SUBDOMAIN_SOURCES": " crtsh , certspotter ",
+		"SCAN_DNS_SERVERS":       "9.9.9.9, [2606:4700:4700::1111]:5353",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.Scan.SubdomainSources, ","); got != "crtsh,certspotter" {
+		t.Errorf("sources = %s", got)
+	}
+	// A missing port is the DNS port.
+	if got := strings.Join(cfg.Scan.DNSServers, ","); got != "9.9.9.9:53,[2606:4700:4700::1111]:5353" {
+		t.Errorf("DNS servers = %s", got)
+	}
+
+	cfg, err = LoadFrom(env(map[string]string{"SCAN_SUBDOMAIN_SOURCES": "none", "SCAN_DNS_SERVERS": "system"}))
+	if err != nil || len(cfg.Scan.SubdomainSources) != 0 || len(cfg.Scan.DNSServers) != 0 {
+		t.Errorf("none/system = %+v, %v", cfg.Scan, err)
+	}
+
+	for key, bad := range map[string]string{"SCAN_SUBDOMAIN_SOURCES": "crtsh,wordlist", "SCAN_DNS_SERVERS": "dns.example.com"} {
+		if _, err := LoadFrom(env(map[string]string{key: bad})); err == nil || !strings.Contains(err.Error(), key) {
+			t.Errorf("%s=%s: err = %v", key, bad, err)
+		}
 	}
 }

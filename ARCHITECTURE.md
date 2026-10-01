@@ -55,7 +55,7 @@ That constraint explains most of the design.
 │   │   ├── api/            REST handlers, gzip, health
 │   │   ├── scan/           scan model, scheduler, coalescing, stage runner
 │   │   ├── discovery/      Engine contract, Finding, Target/scope, host helpers
-│   │   │   ├── subdomains/ certificate transparency (crt.sh, Cert Spotter)
+│   │   │   ├── subdomains/ certificate logs and public subdomain databases
 │   │   │   ├── archive/    web archive (Wayback Machine CDX index)
 │   │   │   ├── dnsresolve/ DNS resolution
 │   │   │   ├── httpprobe/  is a host live? (one GET per host)
@@ -97,7 +97,7 @@ flowchart LR
         Agg --> Store["store (memory)"]
         API --> Store
     end
-    Pools --> Internet["target sites,<br/>crt.sh, Cert Spotter,<br/>web.archive.org, DNS"]
+    Pools --> Internet["target sites,<br/>subdomain sources,<br/>web.archive.org, DNS"]
 ```
 
 The request path is short: the API creates a scan and returns at once; a
@@ -173,7 +173,8 @@ runs in; a scan only runs the stages of its mode.
 | Stage | passive | light | full | Engines |
 | --- | :-: | :-: | :-: | --- |
 | Searching web archives (background) | ✓ | ✓ | ✓ | `archive` |
-| Discovering subdomains | ✓ | ✓ | ✓ | `subdomains` |
+| Searching certificate logs (background) | ✓ | ✓ | ✓ | `subdomains` (slow sources) |
+| Discovering subdomains | ✓ | ✓ | ✓ | `subdomains` (quick sources) |
 | Resolving discovered hosts | ✓ | ✓ | ✓ | `dns` |
 | Checking which hosts are live | | ✓ | ✓ | `http` |
 | Reading robots.txt and sitemaps | | ✓ | ✓ | `sitemap` |
@@ -189,8 +190,12 @@ runs in; a scan only runs the stages of its mode.
 Stages run in order, with one exception. A stage marked `Background` is
 started in its turn and the stages after it run alongside it; a stage marked
 `Join` first waits for every background stage. The web archive is the
-background stage: it is a slow third party and nothing needs to wait for
-its routes, so hosts are discovered, resolved and probed while it answers.
+background stage, and so are the slow certificate-log providers: they are
+slow third parties and nothing needs to wait for them, so hosts from the
+quick sources are resolved and probed while they answer. A background stage
+can also set `JoinWait`: the scan then waits only that long for it once
+everything else is done. The certificate-log stage does (5 s); the archive
+does not, because its listing is the bulk of the result.
 The follow-up stage joins it, which is how hosts only the archive knows
 still get checked.
 
@@ -228,9 +233,9 @@ certificate providers failing).
 
 | Engine | Package | What it does | Requests to the target |
 | --- | --- | --- | --- |
-| `subdomains` | `discovery/subdomains` | Asks crt.sh and Cert Spotter (in parallel) for certificate names; keeps in-scope hostnames | none |
+| `subdomains` | `discovery/subdomains` | Asks public sources (in parallel) for names under the domain and keeps in-scope hostnames. Two instances: the quick sources (Shodan's certificate search, AnubisDB, ip.thc.org) in the foreground, the slow certificate logs (crt.sh, Cert Spotter) in the background | none |
 | `archive` | `discovery/archive` | The Wayback Machine CDX index for the domain and all subdomains, a page of 25,000 URLs at a time: URLs archived with HTTP 200, first capture date, content type; drops malformed junk. Reported as it arrives, so memory stays at one page | none |
-| `dns` | `discovery/dnsresolve` | A/AAAA/CNAME per host; flags hosts that resolve only to private addresses | none (DNS only) |
+| `dns` | `discovery/dnsresolve` | One A question per host to public resolvers, whose answer carries the alias chain (AAAA only if there is no IPv4 address); flags hosts that resolve only to private addresses. Falls back to the system resolver if the servers cannot be reached | none (DNS only) |
 | `http` | `discovery/httpprobe` | `GET https://host/`, falling back to `http://`; status, redirect, title, server | 1–2 per host |
 | `sitemap` | `discovery/sitemap` | robots.txt `Sitemap:` lines (never `Disallow`), else `/sitemap.xml`; sitemap indexes, `.xml.gz`, text sitemaps | a few per host |
 | `html` | `discovery/htmlcrawl` | Breadth-first crawl per host; extracts links and asset references; follows redirects within the host | up to `SCAN_MAX_URLS` per host |
@@ -333,7 +338,7 @@ small machine. Work is bounded in three layers
 ```mermaid
 flowchart TB
     A["1. Scheduler<br/>MAX_CONCURRENT_SCANS running, FIFO queue of SCAN_QUEUE_SIZE"] --> B
-    B["2. Shared pools (all scans together)<br/>http 32 · dns 16 · certificate-transparency 4 · archive 2<br/>+ global bandwidth limit (GLOBAL_DOWNLOAD_KBPS)"] --> C
+    B["2. Shared pools (all scans together)<br/>http 32 · dns 64 · certificate-transparency 4 · archive 2<br/>+ global bandwidth limit (GLOBAL_DOWNLOAD_KBPS)"] --> C
     C["3. Per-scan budgets<br/>time, requests, bytes, hosts per stage, pages per host, recorded URLs"]
 ```
 

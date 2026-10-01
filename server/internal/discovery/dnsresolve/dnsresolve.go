@@ -20,8 +20,8 @@ import (
 
 // Cache holds DNS answers by hostname, shared by all scans.
 //
-// Go's resolver does not report record TTLs, so answers are kept for a
-// bounded, configured time instead. Caching only affects what a scan
+// Answers are kept for a bounded, configured time rather than for each
+// record's TTL. Caching only affects what a scan
 // reports: every HTTP connection still resolves the name again and checks
 // the address it connects to, so the cache cannot be used to bypass the
 // non-public address guard.
@@ -63,16 +63,28 @@ type Options struct {
 
 // Engine resolves hosts that have not been resolved yet.
 type Engine struct {
-	resolver Resolver
+	lookuper Lookuper
 	opts     Options
 }
 
-// New creates an Engine.
+// New creates an Engine that resolves through r, such as *net.Resolver.
 func New(r Resolver, opts Options) *Engine {
+	return NewWith(viaResolver{r}, opts)
+}
+
+// NewWith creates an Engine that resolves through l, such as a *Client.
+func NewWith(l Lookuper, opts Options) *Engine {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 5 * time.Second
 	}
-	return &Engine{resolver: r, opts: opts}
+	return &Engine{lookuper: l, opts: opts}
+}
+
+// viaResolver makes a Resolver a Lookuper.
+type viaResolver struct{ r Resolver }
+
+func (v viaResolver) Lookup(ctx context.Context, host string) ([]netip.Addr, string, error) {
+	return lookupWith(ctx, v.r, host)
 }
 
 func (e *Engine) Name() string { return "dns" }
@@ -152,7 +164,7 @@ func (e *Engine) lookup(ctx context.Context, host string) (info *discovery.DNSIn
 	ctx, cancel := context.WithTimeout(ctx, e.opts.Timeout)
 	defer cancel()
 
-	addrs, err := e.resolver.LookupIPAddr(ctx, host)
+	addrs, cname, err := e.lookuper.Lookup(ctx, host)
 	if err != nil {
 		if parent.Err() != nil {
 			return nil, false // the scan stopped; this is not a DNS answer
@@ -167,11 +179,7 @@ func (e *Engine) lookup(ctx context.Context, host string) (info *discovery.DNSIn
 
 	info = &discovery.DNSInfo{Resolved: true, NonPublic: true}
 	seen := map[string]bool{}
-	for _, a := range addrs {
-		ip, ok := netip.AddrFromSlice(a.IP)
-		if !ok {
-			continue
-		}
+	for _, ip := range addrs {
 		ip = ip.Unmap()
 		if s := ip.String(); !seen[s] {
 			seen[s] = true
@@ -183,12 +191,10 @@ func (e *Engine) lookup(ctx context.Context, host string) (info *discovery.DNSIn
 	}
 	sort.Strings(info.Addresses)
 
-	// The CNAME is informative only; failures are ignored.
-	if cname, err := e.resolver.LookupCNAME(ctx, host); err == nil {
-		cname = strings.TrimSuffix(strings.ToLower(cname), ".")
-		if cname != "" && cname != host {
-			info.CNAME = cname
-		}
+	// The alias is informative only.
+	cname = strings.TrimSuffix(strings.ToLower(cname), ".")
+	if cname != "" && cname != host {
+		info.CNAME = cname
 	}
 	return info, true
 }

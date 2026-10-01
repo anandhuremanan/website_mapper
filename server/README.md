@@ -47,7 +47,8 @@ internal/resource     shared resource pools with fair sharing; per-scan accounts
 internal/cache        bounded TTL cache with single-flight loading (shared discovery cache)
 internal/store        Repository on disk: one SQLite file per scan
 internal/discovery    Engine interface, Finding, State, Target/scope
-  subdomains          passive hostname discovery; Source providers: crt.sh, Cert Spotter
+  subdomains          passive hostname discovery; Source providers: crt.sh, Cert Spotter,
+                      Shodan CT, AnubisDB, ip.thc.org
   archive             archived URLs from the Wayback Machine CDX index
   dnsresolve          resolves hosts (injectable Resolver)
   httpprobe           checks https:// then http:// on resolved hosts
@@ -112,8 +113,9 @@ a scan runs only the stages of its mode.
 | --- | --- | --- | --- |
 | Validating target | all | (built in) | Input parsed and scope derived when the scan is created |
 | Searching web archives | all | `archive` | The Wayback Machine CDX index for the domain and all subdomains, read a page at a time: URLs archived with HTTP 200, first capture, content type. Started first and left running **in the background** while the steps below proceed |
-| Discovering subdomains | all | `subdomains` | Certificate Transparency via crt.sh and Cert Spotter, run concurrently and merged |
-| Resolving discovered hosts | all | `dns` | A/AAAA/CNAME lookup for every known host |
+| Searching certificate logs | all | `subdomains` | crt.sh and Cert Spotter, which are slow or often down: run **in the background**, like the archive |
+| Discovering subdomains | all | `subdomains` | The quick sources (Shodan's certificate search, AnubisDB, ip.thc.org), asked concurrently and merged; about a second |
+| Resolving discovered hosts | all | `dns` | One A question per host to public resolvers (the answer includes the alias chain); AAAA only for names without an IPv4 address |
 | Checking which hosts are live | light, full | `http` | `GET https://host/`, falling back to `http://host/`, on resolved public hosts |
 | Reading robots.txt and sitemaps | light, full | `sitemap` | `Sitemap:` lines of robots.txt (never `Disallow`), else `/sitemap.xml`; sitemap indexes, `.xml.gz` and text sitemaps; listed URLs are not requested |
 | Crawling reachable hosts | full | `html` | BFS crawl per reachable host, seeded from sitemaps |
@@ -169,8 +171,8 @@ back as soon as that single operation ends:
 | Pool | Size | Covers |
 | --- | --- | --- |
 | `http` | `GLOBAL_HTTP_CONCURRENCY` | every probe and crawl request, including reading its body |
-| `dns` | `GLOBAL_DNS_CONCURRENCY` | each host's A/AAAA and CNAME lookups |
-| `certificate-transparency` | 4 (fixed) | crt.sh / Cert Spotter queries, whose responses can be tens of MB |
+| `dns` | `GLOBAL_DNS_CONCURRENCY` | each host's lookup |
+| `certificate-transparency` | 4 (fixed) | subdomain provider queries; crt.sh responses can be tens of MB |
 
 Per-scan settings such as `SCAN_HOST_CONCURRENCY` and `SCAN_CONCURRENCY` only
 limit how many operations one scan asks for at once; the pools decide how many
@@ -777,9 +779,30 @@ URL fields:
 
 - **crt.sh** returns the full certificate history, which includes names that
   no longer resolve. It is slow and often returns 502/503 under load, so it
-  is retried twice.
+  is retried twice. It allows about 5 requests a minute per IP.
 - **Cert Spotter** returns only current certificates. Unauthenticated use is
   limited to about 10 requests per hour per IP; each scan uses up to 3.
+- Because those two are slow or often unavailable, they run in the
+  background, and a scan that has finished everything else waits only 5 s
+  more for them. A provider still silent then is reported as not included;
+  it keeps being asked (up to `SCAN_CT_TIMEOUT`) and its answer is cached,
+  so a later scan of the domain has it at once. The scan goes ahead with
+  three quick sources:
+  **Shodan's certificate search** (`ctl.shodan.io`; certificates, labelled
+  Certificate Transparency), **AnubisDB** (`anubisdb.com`) and
+  **ip.thc.org** (public subdomain databases, labelled "Subdomain
+  database"). Each answered in about a second when tested. They are small
+  free services with no published terms for automated use: each is asked
+  once per domain and the answer cached for `CACHE_CERT_TTL`; drop them from
+  `SCAN_SUBDOMAIN_SOURCES` to stop using them. ip.thc.org states its limit
+  in response headers (250 requests, refilled at one every 2 s).
+- **DNS** is asked directly (`SCAN_DNS_SERVERS`, by default Cloudflare's and
+  Google's public resolvers) rather than through the operating system: one
+  question per host instead of three or more. Google documents 1,500
+  queries a second per IP; the scanner sends at most
+  `GLOBAL_DNS_CONCURRENCY` at a time. Connections to hosts still use the
+  system resolver and check every address they connect to, so this changes
+  what a scan reports, not what it may contact.
 - **The Wayback Machine's CDX index** lists every capture of a domain. The
   scanner asks for one row per URL (`collapse=urlkey`), 25,000 at a time,
   and continues each page with the index's resume key.

@@ -210,6 +210,7 @@ func (c sharedCaches) list() []interface{ Stats() cache.Stats } {
 func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log *slog.Logger) []scan.Stage {
 	client := fetch.New(fetch.Options{
 		Timeout:           cfg.RequestTimeout,
+		ConnectTimeout:    cfg.ConnectTimeout,
 		MaxBodyBytes:      cfg.MaxBodyBytes,
 		UserAgent:         cfg.UserAgent,
 		RequestsPerSecond: cfg.RequestsPerSecond,
@@ -221,18 +222,32 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log
 		ReadBody: fetch.HTMLOnly,
 	})
 
-	dns := dnsresolve.New(net.DefaultResolver, dnsresolve.Options{
+	// One scan may use the whole DNS pool; the pool shares it fairly when
+	// several scans resolve at once.
+	dnsOptions := dnsresolve.Options{
 		MaxHosts:    cfg.MaxResolveHosts,
-		Concurrency: 2 * cfg.HostConcurrency,
+		Concurrency: pools.dns.Stats().Capacity,
 		Timeout:     cfg.DNSTimeout,
 		Pool:        pools.dns,
 		Cache:       caches.dns,
 		TTL:         caches.ttl.DNSTTL,
 		NegativeTTL: time.Minute,
-	})
+	}
+	// Names are resolved by asking DNS servers directly, one question per
+	// host, which is several times less work than the system resolver does
+	// for the same answer. The system resolver takes over if the servers
+	// cannot be reached, and is what connections to hosts always use.
+	dns := dnsresolve.New(net.DefaultResolver, dnsOptions)
+	if len(cfg.DNSServers) > 0 {
+		dns = dnsresolve.NewWith(&dnsresolve.Client{
+			Servers: cfg.DNSServers, Timeout: 2 * time.Second, Fallback: net.DefaultResolver, Log: log,
+		}, dnsOptions)
+	}
 	probe := httpprobe.New(client, httpprobe.Options{
-		MaxHosts:     cfg.MaxProbeHosts,
-		Concurrency:  cfg.HostConcurrency,
+		MaxHosts: cfg.MaxProbeHosts,
+		// Every probe goes to a different host, so they need no spacing;
+		// the shared pool bounds them.
+		Concurrency:  max(cfg.HostConcurrency, pools.http.Stats().Capacity),
 		AllowPrivate: cfg.AllowPrivateNetworks,
 		Cache:        caches.probe,
 		TTL:          caches.ttl.ProbeTTL,
@@ -285,25 +300,7 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log
 			})}})
 	}
 	if cfg.CTEnabled {
-		// crt.sh is slow and returns large responses for busy domains, so it
-		// gets its own client with a longer timeout and a larger body limit.
-		// SCAN_CT_TIMEOUT also bounds each provider in total, retries
-		// included, so one slow provider cannot hold up the scan.
-		ctClient := fetch.New(fetch.Options{
-			Timeout:           cfg.CTTimeout,
-			MaxBodyBytes:      64 << 20,
-			UserAgent:         cfg.UserAgent,
-			RequestsPerSecond: 1,
-			Pool:              pools.ct,
-			Bandwidth:         pools.bandwidth,
-		})
-		// Two independent Certificate Transparency providers: public CT
-		// services fail often, and results are merged either way.
-		sources := []subdomains.Source{subdomains.NewCRTSh(ctClient), subdomains.NewCertSpotter(ctClient)}
-		stages = append(stages, scan.Stage{ID: "subdomains", Label: "Discovering subdomains", Modes: all,
-			Engines: []discovery.Engine{subdomains.New(sources, cfg.CTTimeout, log).WithCache(subdomains.CacheOptions{
-				Cache: caches.cert, TTL: caches.ttl.CertTTL, RateLimitTTL: 15 * time.Minute, FailureTTL: 5 * time.Minute,
-			})}})
+		stages = append(stages, subdomainStages(cfg, pools, caches, log)...)
 	}
 	return append(stages,
 		scan.Stage{ID: "resolve", Label: "Resolving discovered hosts", Modes: all, Engines: []discovery.Engine{dns}},
@@ -319,4 +316,78 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log
 		scan.Stage{ID: "follow-up", Label: "Checking hosts found later", Modes: []scan.Mode{scan.ModeFull},
 			Join: true, Engines: []discovery.Engine{dns, probe, sitemaps, crawler}},
 	)
+}
+
+// fastSourceTimeout bounds each quick subdomain provider in total.
+const fastSourceTimeout = 10 * time.Second
+
+// slowSourceWait is how long a scan that has nothing else left to do waits
+// for the slow subdomain providers. They keep being asked after that, up to
+// SCAN_CT_TIMEOUT, and their answers are cached for later scans.
+const slowSourceWait = 5 * time.Second
+
+// subdomainStages builds the stages that ask public sources for subdomains.
+//
+// The providers differ a great deal in speed. Lookup services answer in
+// about a second, while the certificate logs' own search often takes a
+// minute or fails. So the quick ones form the stage the scan waits for, and
+// the slow ones run in the background. The follow-up stage joins them and
+// checks the hosts only they found, but waits at most slowSourceWait: a
+// provider that is still silent then is left to finish for the cache, and
+// the scan says it was not included. With no quick provider enabled, the
+// scan waits for the slow ones as it used to.
+func subdomainStages(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log *slog.Logger) []scan.Stage {
+	// crt.sh is slow and returns large responses for busy domains, so the
+	// certificate-log providers get a client with a long timeout and a
+	// large body limit. SCAN_CT_TIMEOUT also bounds each provider in total,
+	// retries included.
+	slowClient := fetch.New(fetch.Options{
+		Timeout:           cfg.CTTimeout,
+		MaxBodyBytes:      64 << 20,
+		UserAgent:         cfg.UserAgent,
+		RequestsPerSecond: 1,
+		Pool:              pools.ct,
+		Bandwidth:         pools.bandwidth,
+	})
+	quickClient := fetch.New(fetch.Options{
+		Timeout:           fastSourceTimeout,
+		MaxBodyBytes:      16 << 20,
+		UserAgent:         cfg.UserAgent,
+		RequestsPerSecond: 1,
+		Pool:              pools.ct,
+		Bandwidth:         pools.bandwidth,
+	})
+	var quick, slow []subdomains.Source
+	for _, name := range cfg.SubdomainSources {
+		switch name {
+		case "crtsh":
+			slow = append(slow, subdomains.NewCRTSh(slowClient))
+		case "certspotter":
+			slow = append(slow, subdomains.NewCertSpotter(slowClient))
+		case "anubis":
+			quick = append(quick, subdomains.NewAnubis(quickClient))
+		case "thc":
+			quick = append(quick, subdomains.NewTHC(quickClient))
+		case "shodan":
+			quick = append(quick, subdomains.NewShodanCT(quickClient))
+		}
+	}
+	engine := func(sources []subdomains.Source, timeout time.Duration) []discovery.Engine {
+		return []discovery.Engine{subdomains.New(sources, timeout, log).WithCache(subdomains.CacheOptions{
+			Cache: caches.cert, TTL: caches.ttl.CertTTL, RateLimitTTL: 15 * time.Minute, FailureTTL: 5 * time.Minute,
+		})}
+	}
+	switch {
+	case len(quick) > 0 && len(slow) > 0:
+		return []scan.Stage{
+			{ID: "certificates", Label: "Searching certificate logs", Background: true, JoinWait: slowSourceWait,
+				Engines: engine(slow, cfg.CTTimeout)},
+			{ID: "subdomains", Label: "Discovering subdomains", Engines: engine(quick, fastSourceTimeout)},
+		}
+	case len(quick) > 0:
+		return []scan.Stage{{ID: "subdomains", Label: "Discovering subdomains", Engines: engine(quick, fastSourceTimeout)}}
+	case len(slow) > 0:
+		return []scan.Stage{{ID: "subdomains", Label: "Discovering subdomains", Engines: engine(slow, cfg.CTTimeout)}}
+	}
+	return nil
 }

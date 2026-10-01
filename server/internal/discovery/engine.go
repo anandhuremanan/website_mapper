@@ -35,13 +35,16 @@ const (
 	// SourceHost marks a host's root URL, requested because the host itself
 	// was discovered. It is URL provenance only, never host provenance.
 	SourceHost Source = "host"
+	// SourceDataset: listed by a public database of hostnames (collected
+	// from DNS and other public data), rather than seen on a certificate.
+	SourceDataset Source = "dataset"
 )
 
 // Sources lists every Source. Stored results record a URL's sources by
 // position in this list, so only append to it: never reorder or remove.
 var Sources = []Source{
 	SourceTarget, SourceHTML, SourceJavaScript, SourceSitemap, SourceRobots,
-	SourceCT, SourceRedirect, SourceArchive, SourceHost,
+	SourceCT, SourceRedirect, SourceArchive, SourceHost, SourceDataset,
 }
 
 // Hint describes how a URL was referenced, which helps classify it before

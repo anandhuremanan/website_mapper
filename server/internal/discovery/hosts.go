@@ -21,7 +21,9 @@ func PrioritizeHosts(hosts []HostView, t Target) {
 			return 2
 		}
 		for _, s := range h.Sources {
-			if s != SourceCT {
+			// Certificate logs and hostname databases list names, old and
+			// new; other sources saw the host in use.
+			if s != SourceCT && s != SourceDataset {
 				return 3 // linked from content or a redirect
 			}
 		}

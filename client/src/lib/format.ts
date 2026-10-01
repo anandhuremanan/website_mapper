@@ -10,6 +10,7 @@ export const sourceLabels: Record<Source, string> = {
   redirect: "Redirect",
   host: "Discovered host",
   archive: "Web archive",
+  dataset: "Subdomain database",
 };
 
 export const modeLabels: Record<ScanMode, string> = {

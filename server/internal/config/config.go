@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -113,8 +114,16 @@ type ScanConfig struct {
 	HostConcurrency int
 	// DNSTimeout bounds resolving one host.
 	DNSTimeout time.Duration
-	// CTEnabled turns Certificate Transparency subdomain discovery on or off.
+	// DNSServers are the resolvers asked directly ("host:port"); empty
+	// means the operating system's resolver.
+	DNSServers []string
+	// ConnectTimeout bounds opening a connection to a host, so hosts that
+	// do not answer are given up on quickly.
+	ConnectTimeout time.Duration
+	// CTEnabled turns subdomain discovery from public sources on or off.
 	CTEnabled bool
+	// SubdomainSources are the providers asked for subdomains.
+	SubdomainSources []string
 	// CTTimeout bounds the Certificate Transparency query (crt.sh is slow).
 	CTTimeout time.Duration
 	// RequestsPerSecond is the per-host request rate limit.
@@ -149,7 +158,7 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 			MinFreeBytes: int64(p.int("STORE_MIN_FREE_MB", 1024, 0)) << 20,
 		},
 		GlobalHTTPConcurrency:     p.int("GLOBAL_HTTP_CONCURRENCY", 32, 1),
-		GlobalDNSConcurrency:      p.int("GLOBAL_DNS_CONCURRENCY", 16, 1),
+		GlobalDNSConcurrency:      p.int("GLOBAL_DNS_CONCURRENCY", 64, 1),
 		GlobalDownloadBytesPerSec: int64(p.int("GLOBAL_DOWNLOAD_KBPS", 1024, 0)) << 10,
 		Cache: CacheConfig{
 			MaxBytes: int64(p.int("CACHE_MAX_MB", 64, 0)) << 20,
@@ -181,6 +190,9 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 			MaxResolveHosts:      p.int("SCAN_MAX_RESOLVE_HOSTS", 10000, 1),
 			HostConcurrency:      p.int("SCAN_HOST_CONCURRENCY", 8, 1),
 			DNSTimeout:           p.duration("SCAN_DNS_TIMEOUT", 5*time.Second),
+			DNSServers:           p.dnsServers("SCAN_DNS_SERVERS", "1.1.1.1:53,8.8.8.8:53"),
+			ConnectTimeout:       p.duration("SCAN_CONNECT_TIMEOUT", 4*time.Second),
+			SubdomainSources:     p.list("SCAN_SUBDOMAIN_SOURCES", "crtsh,certspotter,anubis,thc,shodan", SubdomainSources...),
 			CTEnabled:            p.bool("SCAN_CT_ENABLED", true),
 			CTTimeout:            p.duration("SCAN_CT_TIMEOUT", 60*time.Second),
 			RequestsPerSecond:    p.float("SCAN_REQUESTS_PER_SECOND", 5),
@@ -194,6 +206,9 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 	}
 	return cfg, nil
 }
+
+// SubdomainSources are the providers SCAN_SUBDOMAIN_SOURCES may list.
+var SubdomainSources = []string{"crtsh", "certspotter", "anubis", "thc", "shodan"}
 
 type parser struct {
 	getenv func(string) string
@@ -229,6 +244,52 @@ func (p *parser) oneOf(key, def string, allowed ...string) string {
 	}
 	p.errs = append(p.errs, fmt.Sprintf("%s must be one of %s", key, strings.Join(allowed, ", ")))
 	return def
+}
+
+// list reads a comma-separated list whose items must be among allowed.
+// "none" is the empty list.
+func (p *parser) list(key, def string, allowed ...string) []string {
+	v := p.str(key, def)
+	if v == "none" {
+		return nil
+	}
+	var out []string
+	for _, item := range strings.Split(v, ",") {
+		item = strings.TrimSpace(item)
+		ok := false
+		for _, a := range allowed {
+			ok = ok || item == a
+		}
+		if !ok {
+			p.errs = append(p.errs, fmt.Sprintf("%s must list only %s (or be none)", key, strings.Join(allowed, ", ")))
+			return nil
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// dnsServers reads a comma-separated list of resolver addresses; a port is
+// added where missing. "system" means the operating system's resolver.
+func (p *parser) dnsServers(key, def string) []string {
+	v := p.str(key, def)
+	if v == "system" {
+		return nil
+	}
+	var out []string
+	for _, item := range strings.Split(v, ",") {
+		item = strings.TrimSpace(item)
+		host, port, err := net.SplitHostPort(item)
+		if err != nil {
+			host, port = item, "53"
+		}
+		if net.ParseIP(host) == nil {
+			p.errs = append(p.errs, fmt.Sprintf("%s must be system or IP addresses such as 1.1.1.1 or 1.1.1.1:53", key))
+			return nil
+		}
+		out = append(out, net.JoinHostPort(host, port))
+	}
+	return out
 }
 
 func (p *parser) float(key string, def float64) float64 {

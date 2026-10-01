@@ -75,6 +75,11 @@ type Stage struct {
 	// Join waits for every background stage started so far before this
 	// stage runs, so that it sees what they found.
 	Join bool
+	// JoinWait is, for a background stage, how long a joining stage (or
+	// the end of the scan) waits for it before stopping it: for sources
+	// that are welcome to add to the result but may not hold it up. Zero
+	// waits until the stage is done.
+	JoinWait time.Duration
 }
 
 // runsIn reports whether the stage is part of a scan in mode m.
@@ -757,9 +762,10 @@ func (s *Service) run(ctx context.Context, j *job) {
 	stopProgress := s.trackProgress(tr, agg, acct, &phase, snapshot)
 
 	var runs, failed atomic.Int64
-	// runStage runs a stage's engines in order. Only foreground stages set
-	// the scan's current phase.
-	runStage := func(step int, st Stage) {
+	// runStage runs a stage's engines in order on ctx, which for a background
+	// stage can end before the scan's own context does. Only foreground
+	// stages set the scan's current phase.
+	runStage := func(ctx context.Context, scanCtx context.Context, step int, st Stage) {
 		tr.update(func(sc *Scan) { sc.Steps[step].Status = StepRunning })
 		stageFailed, total := 0, 0
 		for _, eng := range st.Engines {
@@ -778,7 +784,7 @@ func (s *Service) run(ctx context.Context, j *job) {
 			total += count
 			var partial *discovery.PartialError
 			switch {
-			case err == nil, ctx.Err() != nil:
+			case err == nil, scanCtx.Err() != nil:
 				// Being stopped by cancellation or the time limit is not an
 				// engine failure; the stop reason explains it.
 			case errors.As(err, &partial):
@@ -794,7 +800,7 @@ func (s *Service) run(ctx context.Context, j *job) {
 			}
 		}
 		counts := agg.Counts()
-		interrupted := ctx.Err() != nil
+		interrupted := scanCtx.Err() != nil
 		tr.update(func(sc *Scan) {
 			sc.Steps[step].Findings = total
 			sc.Counts = counts
@@ -809,20 +815,57 @@ func (s *Service) run(ctx context.Context, j *job) {
 		})
 	}
 
-	// background tracks the stages running alongside the others; waiting
-	// names what the scan is waiting for when a stage joins them.
+	// Background stages run alongside the others. running holds each one
+	// still in flight (by step); each sends on ended when it ends.
+	type backgroundStage struct {
+		phase  Phase // shown while the scan waits for the stage
+		wait   time.Duration
+		cancel context.CancelFunc
+	}
 	var (
-		background sync.WaitGroup
-		inFlight   atomic.Int32
-		waiting    Phase
+		mu      sync.Mutex
+		running = map[int]*backgroundStage{}
+		ended   = make(chan struct{}, len(j.stages))
 	)
+	// join waits for the background stages, stopping those with a JoinWait
+	// once it has waited that long.
 	join := func() {
-		if inFlight.Load() > 0 {
-			p := waiting
+		start := time.Now()
+		for {
+			mu.Lock()
+			first, p := -1, Phase("")
+			var next time.Duration // until the next stage runs out of time
+			for step, bg := range running {
+				if first < 0 || step < first {
+					first, p = step, bg.phase
+				}
+				if bg.wait <= 0 {
+					continue
+				}
+				left := bg.wait - time.Since(start)
+				if left <= 0 {
+					bg.cancel() // it ends shortly and reports in
+				} else if next == 0 || left < next {
+					next = left
+				}
+			}
+			mu.Unlock()
+			if first < 0 {
+				return
+			}
 			phase.Store(p)
 			tr.update(func(sc *Scan) { sc.Phase, sc.Progress = p, nil })
+			if next == 0 {
+				<-ended
+				continue
+			}
+			timer := time.NewTimer(next)
+			select {
+			case <-ended:
+			case <-timer.C:
+			}
+			timer.Stop()
 		}
-		background.Wait()
 	}
 	for i, st := range j.stages {
 		step := i + 1 // step 0 is validation
@@ -834,18 +877,25 @@ func (s *Service) run(ctx context.Context, j *job) {
 			continue
 		}
 		if !st.Background {
-			runStage(step, st)
+			runStage(ctx, ctx, step, st)
 			continue
 		}
+		bg := &backgroundStage{phase: phase.Load().(Phase), wait: st.JoinWait}
 		if len(st.Engines) > 0 {
-			waiting = phaseFor(st.Engines[0].Name())
+			bg.phase = phaseFor(st.Engines[0].Name())
 		}
-		background.Add(1)
-		inFlight.Add(1)
+		var stageCtx context.Context
+		stageCtx, bg.cancel = context.WithCancel(ctx)
+		mu.Lock()
+		running[step] = bg
+		mu.Unlock()
 		go func() {
-			defer background.Done()
-			defer inFlight.Add(-1)
-			runStage(step, st)
+			defer bg.cancel()
+			runStage(stageCtx, ctx, step, st)
+			mu.Lock()
+			delete(running, step)
+			mu.Unlock()
+			ended <- struct{}{}
 		}()
 	}
 	join()

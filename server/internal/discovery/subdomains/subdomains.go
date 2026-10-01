@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"sync"
 	"time"
 
 	"websitemapper/internal/cache"
@@ -90,47 +89,72 @@ func (e *Engine) Name() string { return "subdomains" }
 // from sources that succeed are always kept. If some sources fail, the
 // failures are returned as a discovery.PartialError (recorded, not a
 // failure); only when every source fails does the engine fail.
+//
+// If ctx ends while providers are still being asked, Discover returns with
+// what the others answered. The outstanding queries are not abandoned:
+// they run on to their time limit so that their answers are cached, and a
+// later scan gets them at once instead of waiting again.
 func (e *Engine) Discover(ctx context.Context, in discovery.Input, emit discovery.Emit) error {
-	var (
-		mu   sync.Mutex
-		errs []error
-	)
-	var wg sync.WaitGroup
+	type reply struct {
+		src    Source
+		answer Answer
+		info   cache.Info
+		err    error
+	}
+	replies := make(chan reply, len(e.sources))
+	// The scan's values (its resource account) without its cancellation.
+	detached := context.WithoutCancel(ctx)
 	for _, src := range e.sources {
-		wg.Add(1)
-		go func(src Source) {
-			defer wg.Done()
-			answer, info, err := e.cache.Cache.Do(ctx, src.Name()+"|"+in.Target.Domain, func(ctx context.Context) (cache.Loaded[Answer], error) {
+		go func() {
+			answer, info, err := e.cache.Cache.Do(detached, src.Name()+"|"+in.Target.Domain, func(ctx context.Context) (cache.Loaded[Answer], error) {
 				return e.ask(ctx, src, in.Target)
 			})
-			if err != nil {
-				return // the scan itself stopped
+			replies <- reply{src, answer, info, err}
+		}()
+	}
+
+	var errs []error
+	waiting := map[string]bool{}
+	for _, src := range e.sources {
+		waiting[src.Name()] = true
+	}
+collect:
+	for len(waiting) > 0 {
+		select {
+		case <-ctx.Done():
+			break collect
+		case r := <-replies:
+			delete(waiting, r.src.Name())
+			if r.err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", r.src.Name(), r.err))
+				continue
 			}
 			var cachedAt time.Time
-			if info.Hit || info.Shared {
-				cachedAt = info.CreatedAt
+			if r.info.Hit || r.info.Shared {
+				cachedAt = r.info.CreatedAt
 			}
-			if answer.Err != "" {
-				msg := answer.Err
-				if info.Hit {
-					msg += fmt.Sprintf(" (answer cached at %s)", info.CreatedAt.UTC().Format(time.RFC3339))
+			if r.answer.Err != "" {
+				msg := r.answer.Err
+				if r.info.Hit {
+					msg += fmt.Sprintf(" (answer cached at %s)", r.info.CreatedAt.UTC().Format(time.RFC3339))
 				}
-				e.log.Warn("passive source failed", "source", src.Name(), "error", msg, "cached", info.Hit)
-				mu.Lock()
-				errs = append(errs, fmt.Errorf("%s: %s", src.Name(), msg))
-				mu.Unlock()
-				return
+				e.log.Warn("passive source failed", "source", r.src.Name(), "error", msg, "cached", r.info.Hit)
+				errs = append(errs, fmt.Errorf("%s: %s", r.src.Name(), msg))
+				continue
 			}
-			e.log.Info("passive source finished", "source", src.Name(), "hosts", len(answer.Hosts), "cached", !cachedAt.IsZero())
-			for _, h := range answer.Hosts {
-				emit(discovery.Finding{Host: h, Source: src.Provenance(), CachedAt: cachedAt})
+			e.log.Info("passive source finished", "source", r.src.Name(), "hosts", len(r.answer.Hosts), "cached", !cachedAt.IsZero())
+			for _, h := range r.answer.Hosts {
+				emit(discovery.Finding{Host: h, Source: r.src.Provenance(), CachedAt: cachedAt})
 			}
-		}(src)
+		}
 	}
-	wg.Wait()
+	// In source order, so the message is the same every time.
+	for _, src := range e.sources {
+		if waiting[src.Name()] {
+			errs = append(errs, fmt.Errorf("%s: had not answered when the scan moved on; its answer will be used by later scans", src.Name()))
+		}
+	}
 	switch {
-	case ctx.Err() != nil:
-		return ctx.Err()
 	case len(errs) == 0:
 		return nil
 	case len(errs) == len(e.sources):

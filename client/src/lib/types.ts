@@ -31,7 +31,8 @@ export type Source =
   | "certificate-transparency"
   | "redirect"
   | "host"
-  | "archive";
+  | "archive"
+  | "dataset";
 
 export type UrlType = "page" | "api" | "asset" | "unknown";
 export type AssetKind =

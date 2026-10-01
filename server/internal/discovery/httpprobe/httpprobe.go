@@ -147,6 +147,9 @@ func (e *Engine) probe(ctx context.Context, t discovery.Target, host string) *di
 				return &discovery.HTTPInfo{Skipped: discovery.SkipRequestLimit}
 			}
 			lastErr = err
+			if errors.Is(err, fetch.ErrBlockedAddress) {
+				break // the other scheme reaches the same address
+			}
 			continue
 		}
 		info := &discovery.HTTPInfo{
