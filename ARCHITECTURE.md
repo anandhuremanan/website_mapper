@@ -147,12 +147,15 @@ sequenceDiagram
 3. **Run.** The scan gets its own context (cancelled by the user, the scan
    time limit or shutdown) carrying a resource *account* (its request and
    download budgets). The entered host and the apex domain are added as
-   hosts, then the stages of the scan's mode run in order. Every engine reads
-   what earlier engines found and reports new findings.
+   hosts, then the stages of the scan's mode run in order (the web archive
+   in the background, alongside the others). Every engine reads what earlier
+   engines found and reports new findings.
 4. **Progress.** Once a second the service writes fixed-size counters (hosts
    resolved, pages fetched, pending work, limits reached) to the status
    record. The status never contains the hosts or URLs themselves, so polling
-   costs the same for any scan size.
+   costs the same for any scan size. Every few seconds it also saves a
+   snapshot of the result so far, which is what the result endpoints return
+   while the scan runs.
 5. **Finish.** The aggregator builds the result; the status gets its final
    state and any stop reason; the result is stored separately from the status.
 
@@ -169,13 +172,13 @@ runs in; a scan only runs the stages of its mode.
 
 | Stage | passive | light | full | Engines |
 | --- | :-: | :-: | :-: | --- |
+| Searching web archives (background) | ✓ | ✓ | ✓ | `archive` |
 | Discovering subdomains | ✓ | ✓ | ✓ | `subdomains` |
-| Searching web archives | ✓ | ✓ | ✓ | `archive` |
 | Resolving discovered hosts | ✓ | ✓ | ✓ | `dns` |
 | Checking which hosts are live | | ✓ | ✓ | `http` |
 | Reading robots.txt and sitemaps | | ✓ | ✓ | `sitemap` |
 | Crawling reachable hosts | | | ✓ | `html` |
-| Follow-up for hosts found later | | ✓ | ✓ | the same engines again |
+| Follow-up for hosts found later (joins the archive) | ✓ | ✓ | ✓ | the same engines again |
 
 - **passive** never contacts the target: certificate logs, the web archive
   and DNS only. Archived routes are historical and unverified.
@@ -183,9 +186,17 @@ runs in; a scan only runs the stages of its mode.
   host to see if it is live, plus its robots.txt and sitemaps.
 - **full** also crawls pages and follows links.
 
+Stages run in order, with one exception. A stage marked `Background` is
+started in its turn and the stages after it run alongside it; a stage marked
+`Join` first waits for every background stage. The web archive is the
+background stage: it is a slow third party and nothing needs to wait for
+its routes, so hosts are discovered, resolved and probed while it answers.
+The follow-up stage joins it, which is how hosts only the archive knows
+still get checked.
+
 Engines that act on hosts only process hosts they have not handled before,
 so the follow-up stage can run the same engine instances again for hosts
-first seen in sitemaps, links or redirects. There is exactly one follow-up
+first seen by the archive, in sitemaps, links or redirects. There is exactly one follow-up
 round; hosts first seen in that round are listed and reported as unchecked
 (`discovery_round_limit`), so discovery can never recurse without bound.
 
@@ -393,7 +404,11 @@ How it fits in:
   normalized start URL, the same mode and the same options. A request
   equivalent to a queued or running scan joins it: same scan ID, its own
   `subscriptionId`, no new job, worker or queue slot. Finished scans are
-  never joined; a new scan starts and reuses the cache instead.
+  never joined.
+- **Reuse.** For `SCAN_REUSE_MINUTES` after a scan completes normally, an
+  equivalent request gets that finished scan back (`reused: true`) instead
+  of scanning again, unless it asks for a fresh scan. Only the scan's ID is
+  remembered, in memory; the result itself is read from the store as usual.
 - **Cancellation is per subscriber.** `POST /api/scans/{id}/cancel` with a
   `subscriptionId` releases that subscription only. When the last one is
   released, the scan itself is cancelled: removed from the queue if waiting,
@@ -425,9 +440,16 @@ would have to be compacted).
   write-through cache of recent records makes the links repeated on every
   page of a site cost no query. Measured on a laptop: about 150,000 URLs
   per second, with under 2 MB of Go heap for 200,000 URLs.
+- **Snapshots.** Hosts live in the aggregator's memory, so readers cannot
+  see them in the database. Every few seconds (and once when the scan
+  starts) the service saves the hosts and the result header beside the URLs
+  already written. Readers open their own connection, which the write-ahead
+  log allows while the scan keeps writing, and see the latest snapshot.
 - **Finishing.** The result is saved before the finished status is
   published, so a client that sees a finished scan can always read it. The
-  database then leaves write-ahead-log mode and becomes a single plain file.
+  database then leaves write-ahead-log mode and becomes a single plain file
+  (unless someone is reading it at that moment; SQLite then folds the log in
+  when the last reader closes).
 - **Reading** ([reader.go](server/internal/store/reader.go)). A result is
   read in pages: hosts, URLs (filtered by host, type or search text) and one
   level of a host's path tree at a time. Every query is a range read of
@@ -488,7 +510,9 @@ The client ([client/](client/)) is a Next.js App Router app with two pages:
 Data flow is deliberately simple. [lib/use-scan.ts](client/src/lib/use-scan.ts)
 polls the status (every 1.5 s at first, slowing to 5 s for long scans, and
 not at all while the tab is hidden) and loads the result summary when the
-scan finishes. The result itself is never downloaded whole: each tab reads
+scan finishes. While the scan runs, the same result view is shown below the
+progress panel with what has been found so far, counted from the status
+record. The result itself is never downloaded whole: each tab reads
 pages through [lib/use-pages.ts](client/src/lib/use-pages.ts) as the user
 looks at them, searches run on the server, and the map loads a folder's
 children when it is expanded. [lib/types.ts](client/src/lib/types.ts) mirrors
@@ -621,8 +645,9 @@ Honest notes for contributors; these are good first issues:
 - Cancelling without a `subscriptionId` is still accepted for unshared
   scans, so anyone who knows a scan ID can cancel it. There are no user
   accounts; scan IDs are random 64-bit values.
-- Results can only be read once a scan has finished; a running scan shows
-  counters, not hosts or URLs.
+- While a scan runs, lists in the web client show what had been found when
+  they were opened; they are refreshed by hand, not pushed.
+- Result reuse is remembered in memory, so it does not survive a restart.
 - URL type filters and searches read rows until a page is full. On very
   large results a rare type or a search with few matches takes a full pass.
 - The discovery cache is in memory; a restart empties it.

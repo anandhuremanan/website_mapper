@@ -1,8 +1,9 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { exportUrl, getHosts } from "@/lib/api";
+import { createScan, exportUrl, getHosts } from "@/lib/api";
 import { formatDuration, hostStatus, modeLabels, plural, sourceLabel } from "@/lib/format";
 import type { Scan, ScanSummary } from "@/lib/types";
 import { usePages } from "@/lib/use-pages";
@@ -12,13 +13,46 @@ import { ListFooter, UrlList } from "./url-list";
 
 type Tab = "overview" | "hosts" | "map" | "pages" | "apis" | "assets" | "technologies";
 
+/** What a running scan has found so far, in the shape of a result summary. */
+export function liveSummary(scan: Scan): ScanSummary {
+  return {
+    scanId: scan.id,
+    status: scan.status,
+    limits: scan.limits,
+    domain: {
+      mode: scan.mode,
+      target: scan.target,
+      canonical: scan.domain,
+      startUrl: scan.startUrl,
+      scannedAt: scan.startedAt ?? scan.createdAt,
+      durationMs: 0,
+    },
+    errors: scan.errors,
+    counts: scan.counts,
+    technologies: [],
+  };
+}
+
+interface Props {
+  scan: Scan;
+  result: ScanSummary;
+  /**
+   * The scan is still running: `result` is what it has found so far (see
+   * liveSummary). Counts follow the scan; lists show what had been found
+   * when they were opened, until they are refreshed.
+   */
+  live?: boolean;
+}
+
 /**
- * A finished scan's result. Only the summary is loaded up front; each tab
- * reads its hosts and URLs from the server in pages as they are shown.
+ * A scan's result. Only the summary is loaded up front; each tab reads its
+ * hosts and URLs from the server in pages as they are shown.
  */
-export function ResultsView({ scan, result }: { scan: Scan; result: ScanSummary }) {
+export function ResultsView({ scan, result, live = false }: Props) {
   const [tab, setTab] = useState<Tab>("overview");
   const [openHost, setOpenHost] = useState<string | null>(null);
+  // Changing this starts every list again from its first page.
+  const [refresh, setRefresh] = useState(0);
 
   const { counts, domain } = result;
   // The Pages tab also lists URLs of unknown type (for example form targets).
@@ -31,7 +65,10 @@ export function ResultsView({ scan, result }: { scan: Scan; result: ScanSummary 
     { id: "pages", label: "Pages", count: pages },
     { id: "apis", label: "APIs", count: counts.apis },
     { id: "assets", label: "Assets", count: counts.assets },
-    { id: "technologies", label: "Technologies", count: result.technologies.length },
+    // Technologies are detected from the whole result, once it is complete.
+    ...(live
+      ? []
+      : [{ id: "technologies" as const, label: "Technologies", count: result.technologies.length }]),
   ];
 
   const showHost = (hostname: string) => {
@@ -41,31 +78,51 @@ export function ResultsView({ scan, result }: { scan: Scan; result: ScanSummary 
 
   return (
     <div className="space-y-6">
-      <header className="space-y-2">
-        <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <h1 className="font-mono text-2xl font-semibold tracking-tight">{domain.canonical}</h1>
-          <span className="flex flex-wrap gap-x-4 text-sm">
-            {counts.urls > 0 && (
-              <a href={exportUrl(scan.id)} download className="text-accent hover:underline">
-                Download URLs (CSV)
-              </a>
-            )}
-            <Link href="/" className="text-accent hover:underline">
-              New scan
-            </Link>
-          </span>
-        </div>
-        <p className="text-sm">
-          {plural(counts.hosts, "host")} ({counts.hostsReachable} reachable) ·{" "}
-          {plural(counts.urls, "URL")} · {plural(counts.apis, "API-like endpoint")} ·{" "}
-          {plural(counts.assets, "asset")}
-        </p>
-        <p className="text-xs text-muted">
-          {modeLabels[domain.mode] ?? domain.mode} scan from{" "}
-          <span className="font-mono">{domain.startUrl}</span> ·{" "}
-          {new Date(domain.scannedAt).toLocaleString()} · took {formatDuration(domain.durationMs)}
-        </p>
-      </header>
+      {live ? (
+        <header className="space-y-1">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <h2 className="text-lg font-semibold">Found so far</h2>
+            <button
+              type="button"
+              onClick={() => setRefresh((n) => n + 1)}
+              className="text-sm text-accent hover:underline"
+            >
+              Refresh lists
+            </button>
+          </div>
+          <p className="text-xs text-muted">
+            The counts follow the scan. Lists show what had been found when they were opened.
+          </p>
+        </header>
+      ) : (
+        <header className="space-y-2">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <h1 className="font-mono text-2xl font-semibold tracking-tight">{domain.canonical}</h1>
+            <span className="flex flex-wrap items-baseline gap-x-4 text-sm">
+              {counts.urls > 0 && (
+                <a href={exportUrl(scan.id)} download className="text-accent hover:underline">
+                  Download URLs (CSV)
+                </a>
+              )}
+              <ScanAgain scan={scan} />
+              <Link href="/" className="text-accent hover:underline">
+                New scan
+              </Link>
+            </span>
+          </div>
+          <p className="text-sm">
+            {plural(counts.hosts, "host")} ({counts.hostsReachable} reachable) ·{" "}
+            {plural(counts.urls, "URL")} · {plural(counts.apis, "API-like endpoint")} ·{" "}
+            {plural(counts.assets, "asset")}
+          </p>
+          <p className="text-xs text-muted">
+            {modeLabels[domain.mode] ?? domain.mode} scan from{" "}
+            <span className="font-mono">{domain.startUrl}</span> ·{" "}
+            {new Date(domain.scannedAt).toLocaleString()} · took{" "}
+            {formatDuration(domain.durationMs)}
+          </p>
+        </header>
+      )}
 
       {scan.status === "failed" && (
         <p className="rounded-md border border-border bg-surface px-3 py-2 text-sm">
@@ -74,7 +131,7 @@ export function ResultsView({ scan, result }: { scan: Scan; result: ScanSummary 
         </p>
       )}
 
-      {(scan.status === "cancelled" || result.limits.length > 0) && (
+      {!live && (scan.status === "cancelled" || result.limits.length > 0) && (
         <div className="space-y-1 rounded-md border border-border bg-surface px-3 py-2 text-sm">
           {scan.status === "cancelled" && (
             <p className="font-medium">
@@ -117,9 +174,16 @@ export function ResultsView({ scan, result }: { scan: Scan; result: ScanSummary 
         </div>
       </nav>
 
-      <section>
+      {/* Lists start again when refreshed, and when the scan finishes. */}
+      <section key={`${refresh}|${live}`}>
         {tab === "overview" && (
-          <Overview scanId={scan.id} result={result} goTo={setTab} showHost={showHost} />
+          <Overview
+            scanId={scan.id}
+            result={result}
+            live={live}
+            goTo={setTab}
+            showHost={showHost}
+          />
         )}
         {tab === "hosts" && (
           <HostList
@@ -165,14 +229,52 @@ export function ResultsView({ scan, result }: { scan: Scan; result: ScanSummary 
   );
 }
 
+/** Starts a new scan of the same target and mode, ignoring recent results. */
+function ScanAgain({ scan }: { scan: Scan }) {
+  const router = useRouter();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function onClick() {
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await createScan(scan.target, scan.mode, true);
+      router.push(`/scans/${next.id}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={busy}
+        className="text-accent hover:underline disabled:opacity-50"
+      >
+        {busy ? "Starting…" : "Scan again"}
+      </button>
+      {error && (
+        <span role="alert" className="text-warn">
+          {error}
+        </span>
+      )}
+    </>
+  );
+}
+
 interface OverviewProps {
   scanId: string;
   result: ScanSummary;
+  live: boolean;
   goTo: (t: Tab) => void;
   showHost: (hostname: string) => void;
 }
 
-function Overview({ scanId, result, goTo, showHost }: OverviewProps) {
+function Overview({ scanId, result, live, goTo, showHost }: OverviewProps) {
   const { counts } = result;
   const rows: { label: string; value: number; tab: Tab }[] = [
     { label: "Hosts discovered", value: counts.hosts, tab: "hosts" },
@@ -182,7 +284,10 @@ function Overview({ scanId, result, goTo, showHost }: OverviewProps) {
     { label: "Pages", value: counts.pages, tab: "pages" },
     { label: "API-like endpoints", value: counts.apis, tab: "apis" },
     { label: "Assets", value: counts.assets, tab: "assets" },
-    { label: "Technologies", value: result.technologies.length, tab: "technologies" },
+    // Technologies are detected once the scan is complete.
+    ...(live
+      ? []
+      : [{ label: "Technologies", value: result.technologies.length, tab: "technologies" as const }]),
   ];
 
   return (

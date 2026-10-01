@@ -81,6 +81,9 @@ type ScanConfig struct {
 	RequestTimeout time.Duration
 	// Timeout is the overall time budget for one scan.
 	Timeout time.Duration
+	// ReuseTTL is how long a completed scan is returned for new requests
+	// for the same target and mode instead of scanning again (0: never).
+	ReuseTTL time.Duration
 	// MaxRequests bounds one scan's outbound HTTP requests.
 	MaxRequests int
 	// MaxDownloadBytes bounds the bytes one scan downloads.
@@ -163,6 +166,7 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 			SitemapMaxFiles:      p.int("SCAN_SITEMAP_MAX_FILES", 5, 1),
 			RequestTimeout:       p.duration("SCAN_REQUEST_TIMEOUT", 10*time.Second),
 			Timeout:              p.duration("SCAN_TIMEOUT", 30*time.Minute),
+			ReuseTTL:             time.Duration(p.int("SCAN_REUSE_MINUTES", 15, 0)) * time.Minute,
 			MaxRequests:          p.int("SCAN_MAX_REQUESTS", 50000, 1),
 			MaxDownloadBytes:     int64(p.int("SCAN_MAX_DOWNLOAD_MB", 500, 1)) << 20,
 			MaxDiscoveredHosts:   p.int("SCAN_MAX_DISCOVERED_HOSTS", 10000, 1),

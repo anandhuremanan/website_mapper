@@ -87,6 +87,7 @@ func run() error {
 		MaxRunning:       cfg.MaxConcurrentScans,
 		QueueSize:        cfg.QueueSize,
 		ScanTimeout:      cfg.Scan.Timeout,
+		ReuseTTL:         cfg.Scan.ReuseTTL,
 		MaxRequests:      cfg.Scan.MaxRequests,
 		MaxDownloadBytes: cfg.Scan.MaxDownloadBytes,
 		Bandwidth:        pools.bandwidth,
@@ -188,13 +189,15 @@ func (c sharedCaches) list() []interface{ Stats() cache.Stats } {
 
 // pipeline defines the scan's stages, in order:
 //
-//  1. passive discovery of hostnames (Certificate Transparency)
-//  2. passive discovery of routes and hostnames (web archive)
+//  1. passive discovery of routes and hostnames (web archive), started
+//     first and left running in the background
+//  2. passive discovery of hostnames (Certificate Transparency)
 //  3. DNS resolution of every known host
 //  4. HTTP(S) probing of resolved hosts (light, full)
 //  5. robots.txt and sitemaps of reachable hosts (light, full)
 //  6. crawling of reachable hosts, which may reveal more hosts (full)
-//  7. the same steps for hosts first found in 5 or 6 (light, full)
+//  7. once the archive is done, the same steps for hosts first found by it
+//     or in 5 or 6
 //
 // Host engines only process hosts they have not seen, so the same engine
 // instances are reused in the follow-up stage. New engines (for example
@@ -259,6 +262,22 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log
 	all := []scan.Mode(nil)
 	lightAndFull := []scan.Mode{scan.ModeLight, scan.ModeFull}
 	var stages []scan.Stage
+	if cfg.ArchiveEnabled {
+		archiveClient := fetch.New(fetch.Options{
+			Timeout:      cfg.CTTimeout,
+			MaxBodyBytes: 16 << 20,
+			UserAgent:    cfg.UserAgent,
+			Pool:         pools.archive,
+			Bandwidth:    pools.bandwidth,
+		})
+		// The archive is slow and nothing has to wait for its routes, so it
+		// runs in the background while hosts are discovered and checked. The
+		// follow-up stages join it, to check any hosts only it found.
+		stages = append(stages, scan.Stage{ID: "archive", Label: "Searching web archives", Modes: all, Background: true,
+			Engines: []discovery.Engine{archive.New(archiveClient, archive.Options{
+				MaxURLs: cfg.ArchiveMaxURLs, Cache: caches.archive, TTL: caches.ttl.ArchiveTTL, FailureTTL: 5 * time.Minute,
+			})}})
+	}
 	if cfg.CTEnabled {
 		// crt.sh is slow and returns large responses for busy domains, so it
 		// gets its own client with a longer timeout and a larger body limit.
@@ -280,27 +299,18 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log
 				Cache: caches.cert, TTL: caches.ttl.CertTTL, RateLimitTTL: 15 * time.Minute, FailureTTL: 5 * time.Minute,
 			})}})
 	}
-	if cfg.ArchiveEnabled {
-		archiveClient := fetch.New(fetch.Options{
-			Timeout:      cfg.CTTimeout,
-			MaxBodyBytes: 16 << 20,
-			UserAgent:    cfg.UserAgent,
-			Pool:         pools.archive,
-			Bandwidth:    pools.bandwidth,
-		})
-		stages = append(stages, scan.Stage{ID: "archive", Label: "Searching web archives", Modes: all,
-			Engines: []discovery.Engine{archive.New(archiveClient, archive.Options{
-				MaxURLs: cfg.ArchiveMaxURLs, Cache: caches.archive, TTL: caches.ttl.ArchiveTTL, FailureTTL: 5 * time.Minute,
-			})}})
-	}
 	return append(stages,
 		scan.Stage{ID: "resolve", Label: "Resolving discovered hosts", Modes: all, Engines: []discovery.Engine{dns}},
 		scan.Stage{ID: "probe", Label: "Checking which hosts are live", Modes: lightAndFull, Engines: []discovery.Engine{probe}},
 		scan.Stage{ID: "sitemaps", Label: "Reading robots.txt and sitemaps", Modes: lightAndFull, Engines: []discovery.Engine{sitemaps}},
 		scan.Stage{ID: "crawl", Label: "Crawling reachable hosts", Modes: []scan.Mode{scan.ModeFull}, Engines: []discovery.Engine{crawler}},
-		scan.Stage{ID: "follow-up", Label: "Checking hosts found in sitemaps", Modes: []scan.Mode{scan.ModeLight},
-			Engines: []discovery.Engine{dns, probe, sitemaps}},
-		scan.Stage{ID: "follow-up", Label: "Checking hosts found while crawling", Modes: []scan.Mode{scan.ModeFull},
-			Engines: []discovery.Engine{dns, probe, sitemaps, crawler}},
+		// One follow-up round per mode, for hosts first seen by the archive,
+		// in sitemaps or while crawling.
+		scan.Stage{ID: "follow-up", Label: "Checking hosts found in the web archive", Modes: []scan.Mode{scan.ModePassive},
+			Join: true, Engines: []discovery.Engine{dns}},
+		scan.Stage{ID: "follow-up", Label: "Checking hosts found later", Modes: []scan.Mode{scan.ModeLight},
+			Join: true, Engines: []discovery.Engine{dns, probe, sitemaps}},
+		scan.Stage{ID: "follow-up", Label: "Checking hosts found later", Modes: []scan.Mode{scan.ModeFull},
+			Join: true, Engines: []discovery.Engine{dns, probe, sitemaps, crawler}},
 	)
 }

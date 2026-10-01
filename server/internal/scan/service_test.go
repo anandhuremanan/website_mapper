@@ -300,3 +300,10 @@ func TestHostsFromLastRoundAreReported(t *testing.T) {
 		t.Errorf("pending = %d, limits = %+v", sc.Counts.HostsResolvePending, sc.Limits)
 	}
 }
+
+// calls returns how many times the engine ran.
+func (e *fakeEngine) calls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.callCount
+}

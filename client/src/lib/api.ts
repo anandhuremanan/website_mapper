@@ -58,10 +58,15 @@ function subscriptionFor(scanId: string): string | null {
   }
 }
 
-export async function createScan(target: string, mode: ScanMode): Promise<Scan> {
+/**
+ * Starts a scan, or joins an equivalent one already running. Unless `fresh`
+ * is set, a scan of the same target and mode that finished recently is
+ * returned instead (`reused: true`).
+ */
+export async function createScan(target: string, mode: ScanMode, fresh = false): Promise<Scan> {
   const scan = await request<Scan>("/api/scans", {
     method: "POST",
-    body: JSON.stringify({ target, mode }),
+    body: JSON.stringify({ target, mode, fresh }),
   });
   rememberSubscription(scan);
   return scan;
@@ -83,9 +88,10 @@ export function cancelScan(id: string): Promise<Scan> {
   });
 }
 
-// A finished scan's result is read in pages: a summary, then hosts, URLs
-// and tree levels as the user looks at them. Each page's `next` is passed
-// back as `after` to get the following page.
+// A result is read in pages: a summary, then hosts, URLs and tree levels as
+// the user looks at them. Each page's `next` is passed back as `after` to
+// get the following page. A running scan can be read too: its pages show
+// what has been found so far.
 
 function resultPath(id: string, part: string, params: Record<string, string | undefined> = {}) {
   const query = new URLSearchParams();

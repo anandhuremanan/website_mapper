@@ -72,7 +72,9 @@ type Store struct {
 type entry struct {
 	scan scan.Scan
 	// w is open while the scan records URLs.
-	w         *writer
+	w *writer
+	// hasResult is true once the scan has something to read: its final
+	// result, or a snapshot saved while it runs.
 	hasResult bool
 	size      int64
 }
@@ -340,24 +342,51 @@ func (s *Store) setSizeLocked(e *entry, id string) {
 	s.bytes += e.size
 }
 
-func (s *Store) SaveResult(_ context.Context, r scan.Result) error {
+// writerOf returns the open writer of a scan.
+func (s *Store) writerOf(id string) (*writer, error) {
 	s.mu.Lock()
-	e, ok := s.scans[r.ScanID]
+	defer s.mu.Unlock()
+	e, ok := s.scans[id]
 	if !ok {
-		s.mu.Unlock()
-		return scan.ErrNotFound
+		return nil, scan.ErrNotFound
 	}
-	w := e.w
-	s.mu.Unlock()
-	if w == nil {
-		return fmt.Errorf("scan %s is not recording URLs", r.ScanID)
+	if e.w == nil {
+		return nil, fmt.Errorf("scan %s is not recording URLs", id)
+	}
+	return e.w, nil
+}
+
+func (s *Store) markReadable(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.scans[id]; ok {
+		e.hasResult = true
+	}
+}
+
+// SaveSnapshot stores the result of a scan that is still running, so that
+// it can be read while the scan continues.
+func (s *Store) SaveSnapshot(_ context.Context, r scan.Result) error {
+	w, err := s.writerOf(r.ScanID)
+	if err != nil {
+		return err
+	}
+	if err := w.save(r); err != nil {
+		return fmt.Errorf("store: saving snapshot: %w", err)
+	}
+	s.markReadable(r.ScanID)
+	return nil
+}
+
+func (s *Store) SaveResult(_ context.Context, r scan.Result) error {
+	w, err := s.writerOf(r.ScanID)
+	if err != nil {
+		return err
 	}
 	if err := w.finish(r); err != nil {
 		return fmt.Errorf("store: saving result: %w", err)
 	}
-	s.mu.Lock()
-	e.hasResult = true
-	s.mu.Unlock()
+	s.markReadable(r.ScanID)
 	s.released(r.ScanID, w)
 	return nil
 }
@@ -365,7 +394,7 @@ func (s *Store) SaveResult(_ context.Context, r scan.Result) error {
 func (s *Store) OpenResult(ctx context.Context, id string) (scan.ResultReader, error) {
 	s.mu.Lock()
 	e, ok := s.scans[id]
-	ready := ok && e.hasResult && e.w == nil
+	ready := ok && e.hasResult
 	s.mu.Unlock()
 	if !ready {
 		return nil, scan.ErrNotFound

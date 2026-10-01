@@ -103,17 +103,23 @@ a scan runs only the stages of its mode.
 | Step | Modes | Engines | What happens |
 | --- | --- | --- | --- |
 | Validating target | all | (built in) | Input parsed and scope derived when the scan is created |
+| Searching web archives | all | `archive` | One Wayback Machine CDX query for the domain and all subdomains: URLs archived with HTTP 200, first capture, content type. Started first and left running **in the background** while the steps below proceed |
 | Discovering subdomains | all | `subdomains` | Certificate Transparency via crt.sh and Cert Spotter, run concurrently and merged |
-| Searching web archives | all | `archive` | One Wayback Machine CDX query for the domain and all subdomains: URLs archived with HTTP 200, first capture, content type |
 | Resolving discovered hosts | all | `dns` | A/AAAA/CNAME lookup for every known host |
 | Checking which hosts are live | light, full | `http` | `GET https://host/`, falling back to `http://host/`, on resolved public hosts |
 | Reading robots.txt and sitemaps | light, full | `sitemap` | `Sitemap:` lines of robots.txt (never `Disallow`), else `/sitemap.xml`; sitemap indexes, `.xml.gz` and text sitemaps; listed URLs are not requested |
 | Crawling reachable hosts | full | `html` | BFS crawl per reachable host, seeded from sitemaps |
-| Checking hosts found in sitemaps / while crawling | light / full | `dns`, `http`, `sitemap` (+ `html`) | The same engines again, for hosts first seen in sitemaps, links or redirects |
+| Checking hosts found later | all | `dns` (+ `http`, `sitemap`, `html` by mode) | Waits for the archive, then runs the same engines again for hosts first seen by the archive, in sitemaps, links or redirects |
 | Finalizing results | all | (built in) | Aggregate and store |
 
 Before the first stage, the entered host and the apex domain are added as
 hosts, so they are always resolved, probed and crawled.
+
+Stages run one after another, except stages marked `Background`: those are
+started in their turn and the following stages run alongside them. The web
+archive is slow and nothing needs to wait for its routes, so it is one. A
+stage marked `Join` waits for the background stages before it runs; the
+follow-up stage does, so hosts only the archive knows are still checked.
 
 Engines read a shared, read-only `discovery.State` (the hosts and URLs found
 so far) and report `Finding`s. Engines that act on hosts only process hosts
@@ -292,7 +298,13 @@ crawling elsewhere.
   it: it gets the same scan ID and its own `subscriptionId`, and adds no job,
   no worker and no queue slot (it works even when the queue is full). All
   subscribers read the same status and results. Finished scans are never
-  joined; a new request starts a new scan, which reuses the cache.
+  joined.
+- **Recent results are reused.** For `SCAN_REUSE_MINUTES` (15) after a scan
+  completes normally, a request for an equivalent scan gets that finished
+  scan back at once (`"reused": true`, HTTP `200`) and nothing is scanned.
+  `"fresh": true` in the request always starts a scan, which then reuses
+  the cache. Scans that were cancelled, failed or timed out are not reused,
+  and reuse is forgotten when the server restarts.
 - **Cancellation is per subscriber.** `POST /api/scans/{id}/cancel` with
   `{"subscriptionId": "..."}` releases that subscription only; the response
   has `"detached": true` while others remain. When the **last** subscription
@@ -501,12 +513,13 @@ caller's lookup), `evictions`, `expired`, `rejected`, `entries` and
 Request:
 
 ```json
-{ "target": "example.com", "mode": "light" }
+{ "target": "example.com", "mode": "light", "fresh": false }
 ```
 
 `target` can be a bare domain or a URL such as `https://www.example.com/docs`.
 `mode` is `passive`, `light` or `full` (see Scan modes); it may be omitted.
-Scans in different modes never coalesce.
+Scans in different modes never coalesce. `fresh` (optional) asks for a new
+scan even when a recent one could be returned.
 
 Response `202 Accepted` (with a `Location` header) contains the scan status
 object described below. It returns immediately: `"status": "running"` if
@@ -514,6 +527,10 @@ capacity was free, otherwise `"status": "queued"` with a `queuePosition`.
 It also contains `subscriptionId` (keep it to cancel), and
 `"coalesced": true` when the request joined an equivalent scan that was
 already queued or running (see Scan coalescing).
+
+Response `200 OK` with `"reused": true` and a finished status object means
+an equivalent scan completed recently and is returned instead; read its
+result as usual.
 
 Errors: `400` for an invalid target or body, and `503` with `Retry-After`
 when the queue is full or the server is shutting down.
@@ -615,10 +632,11 @@ the scan does not exist.
 ### Reading a result
 
 A result can hold millions of URLs, so it is read in pages. All of the
-endpoints below are available once the scan is `completed`, `failed` or
-`cancelled` (after it started running). Before that, and for scans
-cancelled while still queued, they return `409` with
-`{"error": "...", "status": "running"}`.
+endpoints below are available from the moment a scan runs: while it is
+`running` they return what it has found so far (the summary then has
+`"status": "running"`), saved every few seconds. For a scan that is still
+queued, or was cancelled while queued, they return `409` with
+`{"error": "...", "status": "queued"}`.
 
 Listings take `limit` (default 100, at most 500) and return `next` when
 more follows; pass it back as `after` to get the next page. A page costs

@@ -48,6 +48,9 @@ const (
 	// globalWaitNotice is the average wait for shared capacity above which
 	// the wait is reported to the user.
 	globalWaitNotice = 250 * time.Millisecond
+
+	// maxRecent bounds how many completed scans are remembered for reuse.
+	maxRecent = 1000
 )
 
 // Stage is one ordered phase of a scan, shown as one progress step. Its
@@ -56,12 +59,22 @@ const (
 // The pipeline is an ordered list of stages, so new engines (for example
 // JavaScript analysis) are added by inserting them into a stage or adding a
 // stage, without changing the service.
+//
+// Stages normally run one after another. A Background stage is started in
+// its turn and the following stages run alongside it: this is for slow,
+// independent sources (a web archive) that nothing else needs to wait for.
+// A later stage that does need what they found sets Join.
 type Stage struct {
 	ID      string
 	Label   string
 	Engines []discovery.Engine
 	// Modes are the scan modes the stage runs in; empty means every mode.
 	Modes []Mode
+	// Background runs the stage alongside the stages after it.
+	Background bool
+	// Join waits for every background stage started so far before this
+	// stage runs, so that it sees what they found.
+	Join bool
 }
 
 // runsIn reports whether the stage is part of a scan in mode m.
@@ -82,6 +95,9 @@ type CreateRequest struct {
 	Target string
 	// Mode is the scan depth; empty means the service's default.
 	Mode Mode
+	// Fresh always starts (or joins) a scan, even when a recent finished
+	// scan of the same target and mode could be returned instead.
+	Fresh bool
 }
 
 // Options configures a Service.
@@ -97,6 +113,12 @@ type Options struct {
 	ScanTimeout time.Duration
 	// ProgressInterval is how often live counts are persisted while running.
 	ProgressInterval time.Duration
+	// SnapshotInterval is how often a running scan's result so far is
+	// saved, which is what readers of a running scan see.
+	SnapshotInterval time.Duration
+	// ReuseTTL is how long a completed scan is returned for new requests
+	// for the same target and mode instead of scanning again (0: never).
+	ReuseTTL time.Duration
 	// MaxRequests bounds each scan's outbound HTTP requests (0: no limit).
 	MaxRequests int
 	// MaxDownloadBytes bounds the bytes each scan downloads (0: no limit).
@@ -124,16 +146,25 @@ type Service struct {
 	opts   Options
 	log    *slog.Logger
 
-	mu      sync.Mutex
-	base    context.Context // set by Start; parent of every scan context
-	queue   []*job          // waiting scans, FIFO
-	jobs    map[string]*job // queued and running scans, by scan ID
-	active  map[string]*job // queued and running scans, by equivalence key
-	joined  int64           // requests that joined an existing scan
+	mu     sync.Mutex
+	base   context.Context // set by Start; parent of every scan context
+	queue  []*job          // waiting scans, FIFO
+	jobs   map[string]*job // queued and running scans, by scan ID
+	active map[string]*job // queued and running scans, by equivalence key
+	joined int64           // requests that joined an existing scan
+	// recent maps equivalence keys to the latest scan that completed
+	// normally, for reuse within ReuseTTL.
+	recent  map[string]recentScan
+	reused  int64 // requests answered with a recent finished scan
 	running int
 	closed  bool
 	stopped chan struct{} // closed when the service stops accepting scans
 	wg      sync.WaitGroup
+}
+
+type recentScan struct {
+	id       string
+	finished time.Time
 }
 
 type job struct {
@@ -174,6 +205,9 @@ func NewService(repo Repository, stages []Stage, opts Options, log *slog.Logger)
 	if opts.ProgressInterval <= 0 {
 		opts.ProgressInterval = time.Second
 	}
+	if opts.SnapshotInterval <= 0 {
+		opts.SnapshotInterval = 5 * time.Second
+	}
 	return &Service{
 		repo:    repo,
 		stages:  stages,
@@ -181,6 +215,7 @@ func NewService(repo Repository, stages []Stage, opts Options, log *slog.Logger)
 		log:     log,
 		jobs:    make(map[string]*job),
 		active:  make(map[string]*job),
+		recent:  make(map[string]recentScan),
 		stopped: make(chan struct{}),
 	}
 }
@@ -249,8 +284,10 @@ func (s *Service) stop() {
 
 // Create validates the target and returns immediately. If an equivalent
 // scan is already queued or running, the request joins it (same scan ID, a
-// new subscription) instead of starting another. Otherwise a new scan is
-// queued and runs when capacity is available.
+// new subscription) instead of starting another. If one completed within
+// ReuseTTL, that finished scan is returned (unless the request asks for a
+// fresh one). Otherwise a new scan is queued and runs when capacity is
+// available.
 func (s *Service) Create(ctx context.Context, req CreateRequest) (Scan, error) {
 	target, err := discovery.ParseTarget(req.Target)
 	if err != nil {
@@ -290,6 +327,15 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Scan, error) {
 			"target", target.StartURL, "subscribers", len(j.subscribers))
 		return sc, nil
 	}
+	if !req.Fresh {
+		if sc, ok := s.recentLocked(ctx, key); ok {
+			s.reused++
+			sc.Reused = true
+			s.log.Info("scan request answered with a recent scan", "event", "scan_reused", "scan_id", sc.ID,
+				"target", target.StartURL)
+			return sc, nil
+		}
+	}
 	if len(s.queue) >= s.opts.QueueSize {
 		return Scan{}, ErrQueueFull
 	}
@@ -322,6 +368,41 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Scan, error) {
 	}
 	sc.SubscriptionID, sc.Subscribers = token, 1
 	return sc, nil
+}
+
+// recentLocked returns the scan that completed for key within ReuseTTL, if
+// it is still stored. Caller holds mu.
+func (s *Service) recentLocked(ctx context.Context, key string) (Scan, bool) {
+	r, ok := s.recent[key]
+	if !ok {
+		return Scan{}, false
+	}
+	if time.Since(r.finished) < s.opts.ReuseTTL {
+		if sc, err := s.repo.Get(ctx, r.id); err == nil && sc.Status == StatusCompleted {
+			return sc, true
+		}
+	}
+	delete(s.recent, key) // expired, or removed from the store
+	return Scan{}, false
+}
+
+// rememberLocked records a scan that completed normally, for reuse. Caller
+// holds mu.
+func (s *Service) rememberLocked(j *job) {
+	if s.opts.ReuseTTL <= 0 {
+		return
+	}
+	now := time.Now()
+	if len(s.recent) >= maxRecent {
+		for key, r := range s.recent {
+			if now.Sub(r.finished) >= s.opts.ReuseTTL {
+				delete(s.recent, key)
+			}
+		}
+	}
+	if len(s.recent) < maxRecent {
+		s.recent[j.key] = recentScan{id: j.id, finished: now}
+	}
 }
 
 // dispatchLocked starts queued scans while capacity allows. Caller holds mu.
@@ -515,8 +596,10 @@ type Stats struct {
 	QueueSize  int              `json:"queueSize"`
 	Pools      []resource.Stats `json:"pools"`
 	// CoalescedRequests counts scan requests that joined an equivalent
-	// active scan instead of starting a new one.
+	// active scan instead of starting a new one; ReusedRequests those
+	// answered with a recent finished scan.
 	CoalescedRequests int64                   `json:"coalescedRequests"`
+	ReusedRequests    int64                   `json:"reusedRequests"`
 	Caches            []cache.Stats           `json:"caches"`
 	Bandwidth         resource.BandwidthStats `json:"bandwidth"`
 	// Storage reports the result store, if it measures itself.
@@ -538,7 +621,7 @@ type StorageStats struct {
 func (s *Service) Stats() Stats {
 	s.mu.Lock()
 	st := Stats{Running: s.running, Queued: len(s.queue), MaxRunning: s.opts.MaxRunning, QueueSize: s.opts.QueueSize,
-		CoalescedRequests: s.joined, Caches: []cache.Stats{}, Bandwidth: s.opts.Bandwidth.Stats()}
+		CoalescedRequests: s.joined, ReusedRequests: s.reused, Caches: []cache.Stats{}, Bandwidth: s.opts.Bandwidth.Stats()}
 	s.mu.Unlock()
 	for _, p := range s.opts.Pools {
 		st.Pools = append(st.Pools, p.Stats())
@@ -628,30 +711,69 @@ func (s *Service) run(ctx context.Context, j *job) {
 	for _, h := range j.target.Hosts() {
 		agg.Add(discovery.Finding{Host: h, Source: discovery.SourceTarget})
 	}
+	// snapshot saves the result so far, which is what readers of a running
+	// scan see. The first one is taken now, so a running scan can always be
+	// read.
+	header := func(sc Scan, counts results.Counts) Result {
+		return Result{
+			ScanID:     j.id,
+			Status:     sc.Status,
+			StopReason: sc.StopReason,
+			Domain: Domain{
+				Mode:       sc.Mode,
+				Target:     sc.Target,
+				Canonical:  sc.Domain,
+				StartURL:   sc.StartURL,
+				ScannedAt:  started.UTC(),
+				DurationMs: time.Since(started).Milliseconds(),
+			},
+			Errors: sc.Errors,
+			Limits: sc.Limits,
+			Counts: counts,
+		}
+	}
+	// After the first, a snapshot is saved at most every SnapshotInterval
+	// and only if the counts changed. (Called from one goroutine at a time.)
+	var (
+		savedCounts results.Counts
+		savedAt     time.Time
+	)
+	snapshot := func() {
+		counts := agg.Counts()
+		if !savedAt.IsZero() && (counts == savedCounts || time.Since(savedAt) < s.opts.SnapshotInterval) {
+			return
+		}
+		res := header(tr.snapshot(), counts)
+		res.Result = agg.Result()
+		if err := s.repo.SaveSnapshot(context.Background(), res); err != nil {
+			log.Warn("saving a snapshot failed", "event", "snapshot_failed", "error", err)
+		}
+		savedCounts, savedAt = counts, time.Now()
+	}
+	snapshot()
+
 	var phase atomic.Value // Phase
 	phase.Store(PhaseSubdomains)
-	stopProgress := s.trackProgress(tr, agg, acct, &phase)
+	stopProgress := s.trackProgress(tr, agg, acct, &phase, snapshot)
 
-	runs, failed := 0, 0
-	for i, st := range j.stages {
-		step := i + 1 // step 0 is validation
-		if ctx.Err() != nil {
-			tr.update(func(sc *Scan) { sc.Steps[step].Status = StepSkipped })
-			continue
-		}
+	var runs, failed atomic.Int64
+	// runStage runs a stage's engines in order. Only foreground stages set
+	// the scan's current phase.
+	runStage := func(step int, st Stage) {
 		tr.update(func(sc *Scan) { sc.Steps[step].Status = StepRunning })
-
 		stageFailed, total := 0, 0
 		for _, eng := range st.Engines {
 			if ctx.Err() != nil {
 				break
 			}
-			p := phaseFor(eng.Name())
-			phase.Store(p)
-			counts := agg.Counts()
-			tr.update(func(sc *Scan) { sc.Phase, sc.Progress = p, phaseProgress(p, counts) })
+			if !st.Background {
+				p := phaseFor(eng.Name())
+				phase.Store(p)
+				counts := agg.Counts()
+				tr.update(func(sc *Scan) { sc.Phase, sc.Progress = p, phaseProgress(p, counts) })
+			}
 
-			runs++
+			runs.Add(1)
 			count, err := s.runEngine(ctx, log, j.target, st, eng, agg)
 			total += count
 			var partial *discovery.PartialError
@@ -664,7 +786,7 @@ func (s *Service) run(ctx context.Context, j *job) {
 					sc.Errors = append(sc.Errors, EngineError{Stage: st.ID, Engine: eng.Name(), Message: err.Error(), Partial: true})
 				})
 			default:
-				failed++
+				failed.Add(1)
 				stageFailed++
 				tr.update(func(sc *Scan) {
 					sc.Errors = append(sc.Errors, EngineError{Stage: st.ID, Engine: eng.Name(), Message: err.Error()})
@@ -686,6 +808,47 @@ func (s *Service) run(ctx context.Context, j *job) {
 			}
 		})
 	}
+
+	// background tracks the stages running alongside the others; waiting
+	// names what the scan is waiting for when a stage joins them.
+	var (
+		background sync.WaitGroup
+		inFlight   atomic.Int32
+		waiting    Phase
+	)
+	join := func() {
+		if inFlight.Load() > 0 {
+			p := waiting
+			phase.Store(p)
+			tr.update(func(sc *Scan) { sc.Phase, sc.Progress = p, nil })
+		}
+		background.Wait()
+	}
+	for i, st := range j.stages {
+		step := i + 1 // step 0 is validation
+		if st.Join {
+			join()
+		}
+		if ctx.Err() != nil {
+			tr.update(func(sc *Scan) { sc.Steps[step].Status = StepSkipped })
+			continue
+		}
+		if !st.Background {
+			runStage(step, st)
+			continue
+		}
+		if len(st.Engines) > 0 {
+			waiting = phaseFor(st.Engines[0].Name())
+		}
+		background.Add(1)
+		inFlight.Add(1)
+		go func() {
+			defer background.Done()
+			defer inFlight.Add(-1)
+			runStage(step, st)
+		}()
+	}
+	join()
 	stopProgress()
 
 	finalIdx := len(j.stages) + 1
@@ -694,7 +857,7 @@ func (s *Service) run(ctx context.Context, j *job) {
 		sc.Phase, sc.Progress = PhaseFinalizing, nil
 	})
 
-	status, stop, msg := s.outcome(ctx, runs, failed)
+	status, stop, msg := s.outcome(ctx, int(runs.Load()), int(failed.Load()))
 	res := agg.Result()
 	counts := agg.Counts()
 	if err := agg.Err(); err != nil {
@@ -714,23 +877,10 @@ func (s *Service) run(ctx context.Context, j *job) {
 	finished.Steps[finalIdx].Status = StepDone
 	finish(&finished, started, status, msg)
 
-	err = s.repo.SaveResult(context.Background(), Result{
-		ScanID:     j.id,
-		Status:     finished.Status,
-		StopReason: stop,
-		Domain: Domain{
-			Mode:       finished.Mode,
-			Target:     finished.Target,
-			Canonical:  finished.Domain,
-			StartURL:   finished.StartURL,
-			ScannedAt:  started.UTC(),
-			DurationMs: finished.DurationMs,
-		},
-		Errors: finished.Errors,
-		Limits: finished.Limits,
-		Counts: counts,
-		Result: res,
-	})
+	final := header(finished, counts)
+	final.Domain.DurationMs = finished.DurationMs
+	final.Result = res
+	err = s.repo.SaveResult(context.Background(), final)
 	if err != nil {
 		log.Error("saving result failed", "event", "result_save_failed", "error", err)
 		status = StatusFailed
@@ -740,6 +890,9 @@ func (s *Service) run(ctx context.Context, j *job) {
 	// a request made after that must start a new scan.
 	s.mu.Lock()
 	s.forgetLocked(j)
+	if finished.Status == StatusCompleted && stop == "" {
+		s.rememberLocked(j)
+	}
 	s.mu.Unlock()
 	tr.update(func(sc *Scan) { *sc = finished })
 
@@ -931,9 +1084,10 @@ func sortedKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-// trackProgress periodically persists live counters until the returned stop
-// function is called. Each update writes only fixed-size aggregates.
-func (s *Service) trackProgress(tr *tracker, agg *results.Aggregator, acct *resource.Account, phase *atomic.Value) (stop func()) {
+// trackProgress periodically persists live counters, and less often a
+// snapshot of the result so far, until the returned stop function is called.
+// Each status update writes only fixed-size aggregates.
+func (s *Service) trackProgress(tr *tracker, agg *results.Aggregator, acct *resource.Account, phase *atomic.Value, snapshot func()) (stop func()) {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -946,6 +1100,7 @@ func (s *Service) trackProgress(tr *tracker, agg *results.Aggregator, acct *reso
 			case <-done:
 				return
 			case <-t.C:
+				snapshot()
 				counts := agg.Counts()
 				p := phase.Load().(Phase)
 				res := resources(acct)

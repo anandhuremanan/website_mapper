@@ -404,14 +404,18 @@ func (w *writer) putStatus(sc scan.Scan) error {
 	return putJSON(context.Background(), w.conn, metaScan, sc)
 }
 
-// finish stores the result's hosts and header beside the URLs already
-// written, then turns the database into a single plain file and closes it.
-func (w *writer) finish(r scan.Result) error {
+// save stores a result's hosts and header beside the URLs already written
+// and commits, so that readers see all three together.
+func (w *writer) save(r scan.Result) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return errWriterClosed
 	}
+	return w.saveLocked(r)
+}
+
+func (w *writer) saveLocked(r scan.Result) error {
 	ctx := context.Background()
 	if err := w.begin(); err != nil {
 		return err
@@ -435,15 +439,27 @@ func (w *writer) finish(r scan.Result) error {
 	if err := putJSON(ctx, w.conn, metaResult, header); err != nil {
 		return err
 	}
-	if err := w.commit(); err != nil {
+	return w.commit()
+}
+
+// finish saves the final result, then turns the database into a single
+// plain file and closes it.
+func (w *writer) finish(r scan.Result) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return errWriterClosed
+	}
+	if err := w.saveLocked(r); err != nil {
 		return err
 	}
 	// Fold the write-ahead log into the main file and leave WAL mode, so
 	// the finished result is one file that needs no side files to read.
+	// This needs the database to itself: if someone is reading the result
+	// right now it stays in WAL mode, which works just as well; SQLite
+	// folds the log in when the last reader closes.
 	var mode string
-	if err := w.conn.QueryRowContext(ctx, `PRAGMA journal_mode = DELETE`).Scan(&mode); err != nil {
-		return err
-	}
+	_ = w.conn.QueryRowContext(context.Background(), `PRAGMA journal_mode = DELETE`).Scan(&mode)
 	return w.closeLocked()
 }
 

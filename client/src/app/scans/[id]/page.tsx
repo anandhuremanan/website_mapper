@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { ResultsView } from "@/components/results/results-view";
+import { liveSummary, ResultsView } from "@/components/results/results-view";
 import { ScanProgress } from "@/components/scan-progress";
 import { isFinished } from "@/lib/types";
 import { useScan } from "@/lib/use-scan";
@@ -39,11 +39,14 @@ export default function ScanPage() {
           {error}
         </p>
       )}
+      {!(finished && summary) && <ScanProgress scan={scan} />}
+      {/* What a running scan has found can be browsed before it ends. The
+          same view then shows the final result, keeping the open tab. */}
       {finished && summary ? (
         <ResultsView scan={scan} result={summary} />
-      ) : (
-        <ScanProgress scan={scan} />
-      )}
+      ) : scan.status === "running" && scan.counts.hosts > 0 ? (
+        <ResultsView scan={scan} result={liveSummary(scan)} live />
+      ) : null}
     </div>
   );
 }

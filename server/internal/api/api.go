@@ -95,6 +95,8 @@ type createRequest struct {
 	Target string `json:"target"`
 	// Mode is "passive", "light" or "full"; empty means the default.
 	Mode string `json:"mode"`
+	// Fresh asks for a new scan even if a recent one could be returned.
+	Fresh bool `json:"fresh"`
 }
 
 func (h *handler) createScan(w http.ResponseWriter, r *http.Request) {
@@ -106,7 +108,7 @@ func (h *handler) createScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sc, err := h.scans.Create(r.Context(), scan.CreateRequest{Target: req.Target, Mode: scan.Mode(req.Mode)})
+	sc, err := h.scans.Create(r.Context(), scan.CreateRequest{Target: req.Target, Mode: scan.Mode(req.Mode), Fresh: req.Fresh})
 	switch {
 	case errors.Is(err, discovery.ErrInvalidTarget), errors.Is(err, scan.ErrInvalidMode):
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -121,6 +123,11 @@ func (h *handler) createScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Location", "/api/scans/"+sc.ID)
+	if sc.Reused {
+		// A recent finished scan: nothing was started.
+		writeJSON(w, http.StatusOK, sc)
+		return
+	}
 	writeJSON(w, http.StatusAccepted, sc)
 }
 

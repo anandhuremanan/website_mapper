@@ -168,6 +168,9 @@ type Scan struct {
 	// Detached is set in a cancel response when only the requester's
 	// subscription was released; the scan continues for the others.
 	Detached bool `json:"detached,omitempty"`
+	// Reused is set in a create response that returned a recent finished
+	// scan of the same target and mode instead of scanning again.
+	Reused bool `json:"reused,omitempty"`
 	// Progress is the current phase's progress, when it is measured in hosts.
 	Progress *PhaseProgress `json:"progress,omitempty"`
 	// StopReason is set when the scan ended before finishing its work.
@@ -204,8 +207,9 @@ type EngineError struct {
 	Partial bool `json:"partial,omitempty"`
 }
 
-// Result is a finished scan's normalized result plus scan context. Its
-// hosts carry their URLs only when the result was read with them (see
+// Result is a scan's normalized result plus scan context: final once the
+// scan has finished, a snapshot (Status running) before that. Its hosts
+// carry their URLs only when the result was read with them (see
 // ResultReader); stored and summarized results leave them empty.
 type Result struct {
 	ScanID     string         `json:"scanId"`
@@ -250,11 +254,15 @@ type Repository interface {
 	// caller closes it when the scan ends, after SaveResult if there is a
 	// result to keep.
 	OpenURLs(ctx context.Context, id string) (URLStore, error)
+	// SaveSnapshot stores the result so far of a scan that is still
+	// running, so that it can be read while the scan continues.
+	SaveSnapshot(ctx context.Context, r Result) error
 	// SaveResult stores a finished scan's result. Its hosts' URLs are the
 	// ones already written to the scan's URLStore.
 	SaveResult(ctx context.Context, r Result) error
-	// OpenResult opens a finished scan's result for reading. It returns
-	// ErrNotFound if the scan has no result.
+	// OpenResult opens a scan's result for reading: the final one, or the
+	// latest snapshot of a running scan. It returns ErrNotFound if the scan
+	// has neither.
 	OpenResult(ctx context.Context, id string) (ResultReader, error)
 }
 

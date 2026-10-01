@@ -124,6 +124,8 @@ export interface Scan {
   coalesced?: boolean;
   /** Cancel responses only: our subscription was released; others remain. */
   detached?: boolean;
+  /** Create responses only: a recent finished scan was returned instead of a new one. */
+  reused?: boolean;
   /** Progress of the current phase, in hosts. */
   progress?: { total: number; completed: number; pending: number };
   stopReason?: StopReason;
@@ -235,7 +237,10 @@ export interface Technology {
   evidence: string[];
 }
 
-/** A finished scan's result without its hosts and URLs, which are paged. */
+/**
+ * A scan's result without its hosts and URLs, which are read in pages. For
+ * a running scan it describes what has been found so far.
+ */
 export interface ScanSummary {
   scanId: string;
   status: ScanStatus;
