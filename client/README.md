@@ -3,8 +3,10 @@
 Next.js (App Router, TypeScript, Tailwind CSS) web UI for Web Scanner.
 
 The browser only talks to Next.js. Requests to `/api/*` are proxied to the Go
-server through a rewrite in [next.config.ts](next.config.ts), so no CORS setup
-is needed. Set `API_URL` if the server is not on `http://localhost:8080`.
+server by [src/proxy.ts](src/proxy.ts), so no CORS setup is needed. Set
+`API_URL` if the server is not on `http://localhost:8080`, and
+`API_PROXY_SECRET` if the server was given one: the proxy then adds it, and
+the visitor's address, to every request it forwards.
 
 ## Commands
 

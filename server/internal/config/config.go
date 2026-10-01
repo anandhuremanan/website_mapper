@@ -23,6 +23,14 @@ type Config struct {
 	QueueSize int
 	Store     StoreConfig
 
+	// APIProxySecret, if set, closes the API to everyone but the web
+	// client, which sends it with every request it forwards.
+	APIProxySecret string
+	// StartLimit is how many scans one visitor may start per StartWindow
+	// (0: no limit).
+	StartLimit  int
+	StartWindow time.Duration
+
 	// GlobalHTTPConcurrency bounds HTTP requests in flight across all scans.
 	GlobalHTTPConcurrency int
 	// GlobalDNSConcurrency bounds DNS lookups in flight across all scans.
@@ -150,6 +158,9 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 		LogLevel:           p.level("LOG_LEVEL", slog.LevelInfo),
 		MaxConcurrentScans: p.int("MAX_CONCURRENT_SCANS", 3, 1),
 		QueueSize:          p.int("SCAN_QUEUE_SIZE", 100, 1),
+		APIProxySecret:     p.str("API_PROXY_SECRET", ""),
+		StartLimit:         p.int("SCAN_START_LIMIT", 10, 0),
+		StartWindow:        p.duration("SCAN_START_WINDOW", 10*time.Minute),
 		Store: StoreConfig{
 			DataDir:      p.str("DATA_DIR", "data"),
 			MaxScans:     p.int("MAX_STORED_SCANS", 500, 1),

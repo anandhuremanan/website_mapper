@@ -497,6 +497,31 @@ Reviewed and deliberately left as they are:
 
 All responses are JSON. Errors look like `{"error": "message"}`.
 
+### Access
+
+By default the API is open: anyone who can reach it can use it. That suits
+development and a port that is not reachable from outside.
+
+Set `API_PROXY_SECRET` to close it to everyone but the web client. The
+client's proxy ([client/src/proxy.ts](../client/src/proxy.ts)), given the
+same value, adds it to every request it forwards as `X-Scanner-Secret`,
+together with the visitor's address as `X-Scanner-Client`. Requests without
+the secret get `401`; only `GET /api/health` still answers, with
+`{"status":"ok"}` and nothing else, so uptime checks keep working.
+
+`SCAN_START_LIMIT` (10) new scans per `SCAN_START_WINDOW` (10 minutes) may
+be started by one visitor; more get `429` with `Retry-After`. Joining a
+running scan or getting a recent finished one back does not count and is
+never refused. With a secret, visitors are told apart by the address the
+web client reports, which can be believed because the secret came with it.
+On an open API the first `X-Forwarded-For` address is used (or the peer),
+which a direct caller can forge; closing the API is what makes the limit
+hold.
+
+Keep the secret out of files that are replaced from the repository. On the
+deployment described below, put it in its own file readable only by root
+and load it with a second `EnvironmentFile=` line in the unit.
+
 ### `GET /api/health`
 
 ```json

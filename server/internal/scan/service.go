@@ -103,6 +103,10 @@ type CreateRequest struct {
 	// Fresh always starts (or joins) a scan, even when a recent finished
 	// scan of the same target and mode could be returned instead.
 	Fresh bool
+	// BeforeStart, if set, is called when the request is about to start a
+	// new scan: not when it joins a running one or gets a finished one
+	// back. An error from it refuses the request and is returned as is.
+	BeforeStart func() error
 }
 
 // Options configures a Service.
@@ -343,6 +347,11 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (Scan, error) {
 	}
 	if len(s.queue) >= s.opts.QueueSize {
 		return Scan{}, ErrQueueFull
+	}
+	if req.BeforeStart != nil {
+		if err := req.BeforeStart(); err != nil {
+			return Scan{}, err
+		}
 	}
 	sc := Scan{
 		ID:        id,

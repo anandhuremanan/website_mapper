@@ -39,7 +39,7 @@ func newServer(t *testing.T, workers bool) *httptest.Server {
 		svc.Start(ctx)
 		t.Cleanup(func() { cancel(); svc.Wait() })
 	}
-	srv := httptest.NewServer(api.NewHandler(svc, quiet))
+	srv := httptest.NewServer(api.NewHandler(svc, quiet, api.Access{}))
 	t.Cleanup(srv.Close)
 	return srv
 }

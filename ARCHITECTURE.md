@@ -524,7 +524,11 @@ children when it is expanded. [lib/types.ts](client/src/lib/types.ts) mirrors
 the server's JSON by hand, and [lib/api.ts](client/src/lib/api.ts) is the
 only place that makes requests. The subscription token from a create response is kept in
 `sessionStorage` so "Cancel" only releases this tab's interest in a shared
-scan. In development, `next.config.ts` proxies `/api/*` to the Go server.
+scan. [proxy.ts](client/src/proxy.ts) forwards `/api/*` to the Go server, so
+the browser only ever talks to the client. When the two share a secret
+(`API_PROXY_SECRET`), the proxy adds it and the visitor's address to each
+request, and the API answers nobody else and limits how many scans each
+visitor may start ([api/access.go](server/internal/api/access.go)).
 
 ## Safety rules
 
@@ -653,6 +657,8 @@ Honest notes for contributors; these are good first issues:
 - Cancelling without a `subscriptionId` is still accepted for unshared
   scans, so anyone who knows a scan ID can cancel it. There are no user
   accounts; scan IDs are random 64-bit values.
+- The start limit counts scans per visitor address and is kept in memory:
+  it restarts with the server, and visitors behind one address share it.
 - While a scan runs, lists in the web client show what had been found when
   they were opened; they are refreshed by hand, not pushed.
 - Result reuse is remembered in memory, so it does not survive a restart.

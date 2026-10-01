@@ -8,6 +8,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -37,13 +38,15 @@ type Scans interface {
 const maxRequestBody = 4 << 10
 
 type handler struct {
-	scans Scans
-	log   *slog.Logger
+	scans  Scans
+	log    *slog.Logger
+	access Access
+	starts *startLimiter
 }
 
 // NewHandler returns the API's http.Handler.
-func NewHandler(scans Scans, log *slog.Logger) http.Handler {
-	h := &handler{scans: scans, log: log}
+func NewHandler(scans Scans, log *slog.Logger, access Access) http.Handler {
+	h := &handler{scans: scans, log: log, access: access, starts: newStartLimiter(access)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", h.health)
 	mux.HandleFunc("POST /api/scans", h.createScan)
@@ -61,7 +64,14 @@ func NewHandler(scans Scans, log *slog.Logger) http.Handler {
 	return h.middleware(mux)
 }
 
-func (h *handler) health(w http.ResponseWriter, _ *http.Request) {
+// health reports that the server is up and, to callers allowed to use the
+// API, how it is doing. On a closed API anyone may still ask whether it is
+// up (uptime checks, the deploy script), but learns nothing more.
+func (h *handler) health(w http.ResponseWriter, r *http.Request) {
+	if !h.access.allowed(r) {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "scheduler": h.scans.Stats(), "process": readProcessStats()})
 }
 
@@ -108,8 +118,25 @@ func (h *handler) createScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sc, err := h.scans.Create(r.Context(), scan.CreateRequest{Target: req.Target, Mode: scan.Mode(req.Mode), Fresh: req.Fresh})
+	// The start limit applies only if this request starts a new scan.
+	visitor := h.access.visitor(r)
+	sc, err := h.scans.Create(r.Context(), scan.CreateRequest{
+		Target: req.Target, Mode: scan.Mode(req.Mode), Fresh: req.Fresh,
+		BeforeStart: func() error {
+			if wait := h.starts.take(visitor); wait > 0 {
+				return &startLimitError{wait}
+			}
+			return nil
+		},
+	})
+	var limited *startLimitError
 	switch {
+	case errors.As(err, &limited):
+		w.Header().Set("Retry-After", strconv.Itoa(int(limited.wait.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, fmt.Sprintf(
+			"You have started %d scans in the last %s, which is the limit. Try again in %s.",
+			h.access.StartLimit, plainDuration(h.access.StartWindow), plainDuration(limited.wait)))
+		return
 	case errors.Is(err, discovery.ErrInvalidTarget), errors.Is(err, scan.ErrInvalidMode):
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -505,13 +532,21 @@ func (h *handler) middleware(next http.Handler) http.Handler {
 				writeError(rec, http.StatusInternalServerError, "internal error")
 			}
 			level := slog.LevelInfo
-			if r.Method == http.MethodGet && rec.status < 400 {
-				level = slog.LevelDebug // status polling would otherwise flood the log
+			if (r.Method == http.MethodGet && rec.status < 400) || rec.status == http.StatusUnauthorized {
+				// Status polling would otherwise flood the log, and so
+				// would strangers knocking on a closed API.
+				level = slog.LevelDebug
 			}
 			h.log.Log(r.Context(), level, "http request", "method", r.Method, "path", r.URL.Path,
 				"status", rec.status, "duration", time.Since(start).Round(time.Microsecond))
 		}()
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		// A closed API answers only the web client, except for the
+		// bare "is it up" check.
+		if !h.access.allowed(r) && r.URL.Path != "/api/health" {
+			writeError(rec, http.StatusUnauthorized, "this API is only available through the Web Scanner site")
+			return
+		}
 		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			gz := newGzipWriter(rec)
 			defer gz.Close()
@@ -544,4 +579,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// plainDuration writes a duration the way a person would say it.
+func plainDuration(d time.Duration) string {
+	switch {
+	case d >= 90*time.Second:
+		return fmt.Sprintf("%d minutes", int(d.Round(time.Minute).Minutes()))
+	case d > 45*time.Second:
+		return "a minute"
+	}
+	return fmt.Sprintf("%d seconds", max(int(d.Round(time.Second).Seconds()), 1))
 }

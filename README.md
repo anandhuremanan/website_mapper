@@ -87,8 +87,10 @@ run.
   secrets `VPS_HOST`, `VPS_SSH_PORT`, `VPS_USER` and `VPS_DEPLOY_KEY`.
 - The web client (`client/`) is built and deployed by Vercel.
 
-Keep the API port closed to the internet and serve it through the client or
-a reverse proxy. Finished scans survive a restart and are removed after a
+The browser only ever talks to the web client, which forwards `/api/*` to the
+API. If the API is reachable from the internet, set `API_PROXY_SECRET` on
+both sides so that it answers only the client (see
+[server/README.md](server/README.md#access)). Finished scans survive a restart and are removed after a
 week or when the disk budget is reached; the discovery cache is in memory
 and starts empty. Memory, CPU, disk and bandwidth behaviour are described in
 [server/README.md](server/README.md#deploying-on-a-small-shared-server).
