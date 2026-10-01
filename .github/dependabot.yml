@@ -1,9 +1,20 @@
 version: 2
+
+# One pull request a week per ecosystem, holding every compatible update.
+# Major versions are not proposed automatically: they can change behaviour
+# and usually need other packages to catch up first, so they are taken up
+# by hand. (Security updates are still raised whatever the version.)
 updates:
   - package-ecosystem: gomod
     directory: /server
     schedule:
       interval: weekly
+    groups:
+      go-minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: npm
     directory: /client
     schedule:
@@ -11,7 +22,13 @@ updates:
     groups:
       npm-minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

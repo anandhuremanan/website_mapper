@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
+import { track } from "@/lib/analytics";
 import { createScan, exportUrl, getHosts } from "@/lib/api";
 import { formatDuration, hostStatus, modeLabels, plural, sourceLabel } from "@/lib/format";
 import type { Scan, ScanSummary } from "@/lib/types";
@@ -49,10 +50,14 @@ interface Props {
  * hosts and URLs from the server in pages as they are shown.
  */
 export function ResultsView({ scan, result, live = false }: Props) {
-  const [tab, setTab] = useState<Tab>("overview");
+  const [tab, setTabState] = useState<Tab>("overview");
   const [openHost, setOpenHost] = useState<string | null>(null);
   // Changing this starts every list again from its first page.
   const [refresh, setRefresh] = useState(0);
+  const setTab = (next: Tab) => {
+    if (next !== tab) track("result_tab_opened", { tab: next, live });
+    setTabState(next);
+  };
 
   const { counts, domain } = result;
   // The Pages tab also lists URLs of unknown type (for example form targets).
@@ -100,7 +105,12 @@ export function ResultsView({ scan, result, live = false }: Props) {
             <h1 className="font-mono text-2xl font-semibold tracking-tight">{domain.canonical}</h1>
             <span className="flex flex-wrap items-baseline gap-x-4 text-sm">
               {counts.urls > 0 && (
-                <a href={exportUrl(scan.id)} download className="text-accent hover:underline">
+                <a
+                  href={exportUrl(scan.id)}
+                  download
+                  onClick={() => track("urls_exported", { urls: counts.urls })}
+                  className="text-accent hover:underline"
+                >
                   Download URLs (CSV)
                 </a>
               )}
@@ -240,6 +250,7 @@ function ScanAgain({ scan }: { scan: Scan }) {
     setError(null);
     try {
       const next = await createScan(scan.target, scan.mode, true);
+      track("scan_again", { mode: scan.mode });
       router.push(`/scans/${next.id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

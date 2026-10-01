@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useState } from "react";
+import { track } from "@/lib/analytics";
 import { cancelScan } from "@/lib/api";
 import type { Phase, Scan, StepStatus } from "@/lib/types";
 
@@ -59,6 +60,7 @@ export function ScanProgress({ scan }: { scan: Scan }) {
     setCancelError(null);
     try {
       const res = await cancelScan(scan.id);
+      track("scan_cancelled", { mode: scan.mode });
       if (res.detached) setDetached(true);
     } catch (err) {
       setCancelError(err instanceof Error ? err.message : String(err));

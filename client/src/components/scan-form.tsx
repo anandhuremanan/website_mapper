@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
+import { track } from "@/lib/analytics";
 import { createScan } from "@/lib/api";
 import type { ScanMode } from "@/lib/types";
 
@@ -43,6 +44,10 @@ export function ScanForm() {
     setError(null);
     try {
       const scan = await createScan(target.trim(), mode);
+      track("scan_started", {
+        mode,
+        outcome: scan.reused ? "reused" : scan.coalesced ? "joined" : "new",
+      });
       router.push(`/scans/${scan.id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");

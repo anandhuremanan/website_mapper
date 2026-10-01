@@ -19,6 +19,17 @@ npm run lint
 npm run build && npm start
 ```
 
+## Analytics
+
+Usage analytics are optional and off by default. Setting
+`NEXT_PUBLIC_POSTHOG_KEY` (and `NEXT_PUBLIC_POSTHOG_HOST` for the project's
+region) sends a small set of events to PostHog: a scan was started,
+finished or cancelled, a result tab was opened, the CSV was downloaded. It
+runs without cookies or browser storage, without automatic click capture
+and without session recording, and never sends the scanned domain, hosts or
+URLs. The events and their properties are listed in
+[src/lib/analytics.ts](src/lib/analytics.ts).
+
 ## Structure
 
 ```text

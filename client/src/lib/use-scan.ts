@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { track } from "./analytics";
 import { ApiError, getScan, getSummary } from "./api";
 import { isFinished, type Scan, type ScanSummary } from "./types";
 
@@ -42,6 +43,9 @@ export function useScan(id: string): ScanState {
     let done = false;
     // True when a poll was skipped because the tab was hidden.
     let waiting = false;
+    // True once this tab has seen the scan unfinished: only then is its
+    // end something that happened here, rather than an old result opened.
+    let watched = false;
 
     async function tick() {
       // The first request always runs, so a tab opened in the background
@@ -55,7 +59,18 @@ export function useScan(id: string): ScanState {
         if (cancelled) return;
         setState((s) => ({ ...s, scan, error: null }));
 
+        if (!isFinished(scan.status)) watched = true;
         if (isFinished(scan.status)) {
+          if (watched) {
+            track("scan_finished", {
+              mode: scan.mode,
+              status: scan.status,
+              stop_reason: scan.stopReason ?? "",
+              duration_s: Math.round((scan.durationMs ?? 0) / 1000),
+              hosts: scan.counts.hosts,
+              urls: scan.counts.urls,
+            });
+          }
           const summary = await getSummary(id).catch((err) => {
             // A scan that failed or was cancelled before starting has no results.
             if (err instanceof ApiError && err.status === 409) return null;
