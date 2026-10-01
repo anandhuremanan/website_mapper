@@ -27,6 +27,9 @@ func newGzipWriter(w http.ResponseWriter) *gzipWriter {
 	return &gzipWriter{ResponseWriter: w, gz: gz}
 }
 
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (g *gzipWriter) Unwrap() http.ResponseWriter { return g.ResponseWriter }
+
 func (g *gzipWriter) WriteHeader(code int) {
 	if !g.wroteHeader {
 		g.wroteHeader = true

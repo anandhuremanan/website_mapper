@@ -89,7 +89,10 @@ var (
 		classify.AssetFont, classify.AssetMedia, classify.AssetDocument, classify.AssetOther}
 )
 
-const typePageCode = 1
+const (
+	typePageCode  = 1
+	typeAssetCode = 3
+)
 
 func code[T comparable](all []T, v T) int {
 	for i, x := range all {
@@ -545,87 +548,3 @@ func scanRecord(row rowScanner, r *results.URLRecord, lead ...any) error {
 	}
 	return nil
 }
-
-// reader reads one finished result.
-type reader struct {
-	db  *sql.DB
-	res scan.Result
-	ids map[string]int64 // hostname -> host ID
-}
-
-var _ scan.ResultReader = (*reader)(nil)
-
-func openReader(ctx context.Context, path string) (*reader, error) {
-	db, err := openDB(path, "query_only(1)", fmt.Sprintf("cache_size(-%d)", readerCacheKB))
-	if err != nil {
-		return nil, err
-	}
-	r := &reader{db: db, ids: map[string]int64{}}
-	if err := r.load(ctx); err != nil {
-		db.Close()
-		return nil, err
-	}
-	return r, nil
-}
-
-func (r *reader) load(ctx context.Context) error {
-	found, err := getJSON(ctx, r.db, metaResult, &r.res)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return scan.ErrNotFound
-	}
-	rows, err := r.db.QueryContext(ctx, `SELECT id, data FROM hosts ORDER BY rank`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	r.res.Hosts = []results.Host{}
-	for rows.Next() {
-		var (
-			h    results.Host
-			data []byte
-		)
-		if err := rows.Scan(&h.ID, &data); err != nil {
-			return err
-		}
-		if err := json.Unmarshal(data, &h); err != nil {
-			return err
-		}
-		h.URLs = []results.URL{}
-		r.ids[h.Hostname] = h.ID
-		r.res.Hosts = append(r.res.Hosts, h)
-	}
-	return rows.Err()
-}
-
-func (r *reader) Result() scan.Result {
-	res := r.res
-	res.Hosts = append([]results.Host(nil), r.res.Hosts...)
-	return res
-}
-
-func (r *reader) URLs(ctx context.Context, hostname string, fn func(results.URL) error) error {
-	id, ok := r.ids[hostname]
-	if !ok {
-		return nil
-	}
-	rows, err := r.db.QueryContext(ctx, `SELECT path, origin, `+urlColumns+` FROM urls WHERE host_id = ? ORDER BY path, origin`, id)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		rec := results.URLRecord{HostID: id}
-		if err := scanRecord(rows, &rec, &rec.Path, &rec.Origin); err != nil {
-			return err
-		}
-		if err := fn(rec.View(hostname)); err != nil {
-			return err
-		}
-	}
-	return rows.Err()
-}
-
-func (r *reader) Close() error { return r.db.Close() }

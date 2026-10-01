@@ -7,6 +7,7 @@ import (
 	"errors"
 	"time"
 
+	"websitemapper/internal/classify"
 	"websitemapper/internal/results"
 )
 
@@ -263,14 +264,93 @@ type URLStore interface {
 	Close() error
 }
 
-// ResultReader reads one stored result. It must be closed.
+// ResultReader reads one stored result a page at a time, so that reading
+// costs the same however large the result is. It must be closed.
 type ResultReader interface {
-	// Result returns the result without its hosts' URLs.
-	Result() Result
-	// URLs calls fn for each URL of a host, in path order, until fn returns
-	// an error.
-	URLs(ctx context.Context, hostname string, fn func(results.URL) error) error
+	// Summary returns the result without its hosts.
+	Summary() Result
+	// Hosts returns hosts (without URLs) in display order.
+	Hosts(ctx context.Context, q HostQuery) (HostPage, error)
+	// URLs calls fn for each matching URL, ordered by host and then path,
+	// until q.Limit URLs were passed or fn returns an error. next is where
+	// to continue, or "" if there are no more.
+	URLs(ctx context.Context, q URLQuery, fn func(results.URL) error) (next string, err error)
+	// Tree returns one level of a host's path tree. It returns ErrNotFound
+	// for a host the result does not have.
+	Tree(ctx context.Context, q TreeQuery) (Tree, error)
 	Close() error
+}
+
+// ErrBadQuery is returned for a cursor or path that cannot be used.
+var ErrBadQuery = errors.New("invalid query")
+
+// HostQuery selects a page of hosts. A zero Limit means no limit.
+type HostQuery struct {
+	// Search keeps hosts whose name contains it.
+	Search string
+	// After is the Next of the previous page.
+	After string
+	Limit int
+}
+
+// HostPage is one page of hosts.
+type HostPage struct {
+	Hosts []results.Host `json:"hosts"`
+	// Next continues the listing; empty on the last page.
+	Next string `json:"next,omitempty"`
+}
+
+// URLQuery selects URLs. A zero Limit means no limit.
+type URLQuery struct {
+	// Host restricts the listing to one host; empty means every host.
+	Host string
+	// Types keeps URLs of these types; empty means every type.
+	Types []classify.Type
+	// Search keeps URLs whose path or title contains it (or, when listing
+	// every host, whose hostname does).
+	Search string
+	// After is the next cursor of the previous page.
+	After string
+	Limit int
+}
+
+// TreeQuery selects one level of a host's path tree: the children of Path.
+type TreeQuery struct {
+	Host string
+	// Path is the parent, such as "/blog/2024"; "" or "/" is the root.
+	Path string
+	// Assets includes asset URLs; by default the tree shows routes only.
+	Assets bool
+	// After is the Next of the previous page of children.
+	After string
+	Limit int
+}
+
+// Tree is one level of a host's path tree.
+type Tree struct {
+	// Path is the parent node, "/" for the root.
+	Path string `json:"path"`
+	// Total counts the URLs at or below the parent.
+	Total int `json:"total"`
+	// URLs end exactly at the parent (several if they differ by query or
+	// scheme). Sent with the first page only.
+	URLs     []results.URL `json:"urls"`
+	Children []TreeNode    `json:"children"`
+	// Next continues the children; empty on the last page.
+	Next string `json:"next,omitempty"`
+}
+
+// TreeNode is a path segment below a Tree's parent.
+type TreeNode struct {
+	// Name is the segment, such as "2024"; Path the full path to it.
+	Name string `json:"name"`
+	Path string `json:"path"`
+	// Total counts the URLs at or below this node.
+	Total int `json:"total"`
+	// HasChildren is true when there are deeper paths to expand.
+	HasChildren bool `json:"hasChildren"`
+	// URLs end exactly at this node.
+	URLs []results.URL `json:"urls"`
 }
 
 // Clone returns a deep copy of s.

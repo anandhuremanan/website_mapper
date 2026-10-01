@@ -474,8 +474,8 @@ func (s *Service) viewLocked(ctx context.Context, id string) (Scan, error) {
 	return sc, nil
 }
 
-// OpenResult opens a finished scan's result for reading its URLs one host
-// at a time, however many there are. The caller must close the reader.
+// OpenResult opens a finished scan's result for reading a page at a time,
+// however large it is. The caller must close the reader.
 func (s *Service) OpenResult(ctx context.Context, id string) (ResultReader, error) {
 	return s.repo.OpenResult(ctx, id)
 }
@@ -488,10 +488,15 @@ func (s *Service) Result(ctx context.Context, id string) (Result, error) {
 		return Result{}, err
 	}
 	defer r.Close()
-	res := r.Result()
+	res := r.Summary()
+	hosts, err := r.Hosts(ctx, HostQuery{})
+	if err != nil {
+		return Result{}, err
+	}
+	res.Hosts = hosts.Hosts
 	for i := range res.Hosts {
 		h := &res.Hosts[i]
-		err := r.URLs(ctx, h.Hostname, func(u results.URL) error {
+		_, err := r.URLs(ctx, URLQuery{Host: h.Hostname}, func(u results.URL) error {
 			h.URLs = append(h.URLs, u)
 			return nil
 		})

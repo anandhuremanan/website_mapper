@@ -9,15 +9,15 @@ import { useScan } from "@/lib/use-scan";
 
 export default function ScanPage() {
   const { id } = useParams<{ id: string }>();
-  const { scan, result, error, notFound } = useScan(id);
+  const { scan, summary, error, notFound } = useScan(id);
 
   if (notFound) {
     return (
       <div className="space-y-2">
         <h1 className="text-xl font-semibold">Scan not found</h1>
         <p className="text-sm text-muted">
-          Scans are kept in memory: they disappear when the server restarts, and the oldest
-          finished scans are cleared to free memory.{" "}
+          Finished scans are kept for a limited time and then removed to free space, oldest
+          first.{" "}
           <Link href="/" className="text-accent underline-offset-2 hover:underline">
             Start a new scan
           </Link>
@@ -39,8 +39,8 @@ export default function ScanPage() {
           {error}
         </p>
       )}
-      {finished && result ? (
-        <ResultsView scan={scan} result={result} />
+      {finished && summary ? (
+        <ResultsView scan={scan} result={summary} />
       ) : (
         <ScanProgress scan={scan} />
       )}

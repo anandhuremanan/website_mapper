@@ -199,9 +199,9 @@ export interface Host {
   http?: HttpInfo;
   crawl?: CrawlInfo;
   sitemap?: SitemapInfo;
+  /** The host's URLs are read separately, in pages; these count them. */
   counts: { urls: number; pages: number; apis: number; assets: number };
-  urls: DiscoveredUrl[];
-  /** URLs seen on this host but not recorded (per-host limit). */
+  /** URLs seen on this host but not recorded (the scan's URL limit). */
   urlsOmitted?: number;
 }
 
@@ -235,7 +235,8 @@ export interface Technology {
   evidence: string[];
 }
 
-export interface ScanResult {
+/** A finished scan's result without its hosts and URLs, which are paged. */
+export interface ScanSummary {
   scanId: string;
   status: ScanStatus;
   stopReason?: StopReason;
@@ -252,6 +253,38 @@ export interface ScanResult {
   };
   errors: EngineError[];
   counts: Counts;
-  hosts: Host[];
   technologies: Technology[];
+}
+
+/** One page of a listing; `next` is passed back to get the page after it. */
+export interface HostPage {
+  hosts: Host[];
+  next?: string;
+}
+
+export interface UrlPage {
+  urls: DiscoveredUrl[];
+  next?: string;
+}
+
+/** A path segment in a host's tree. */
+export interface TreeChild {
+  /** The segment, e.g. "blog"; `path` is the full path to it. */
+  name: string;
+  path: string;
+  /** URLs at or below this node. */
+  total: number;
+  hasChildren: boolean;
+  /** URLs that end exactly here (several if they differ by query or scheme). */
+  urls: DiscoveredUrl[];
+}
+
+/** One level of a host's path tree: the children of `path`. */
+export interface TreeLevel {
+  path: string;
+  /** URLs at or below `path`; sent with the first page only. */
+  total: number;
+  urls: DiscoveredUrl[];
+  children: TreeChild[];
+  next?: string;
 }

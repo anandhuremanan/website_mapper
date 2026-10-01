@@ -612,12 +612,58 @@ releases its share of the server, and saves the results collected so far
 was given, or if the subscription is unknown or already released. `404` if
 the scan does not exist.
 
+### Reading a result
+
+A result can hold millions of URLs, so it is read in pages. All of the
+endpoints below are available once the scan is `completed`, `failed` or
+`cancelled` (after it started running). Before that, and for scans
+cancelled while still queued, they return `409` with
+`{"error": "...", "status": "running"}`.
+
+Listings take `limit` (default 100, at most 500) and return `next` when
+more follows; pass it back as `after` to get the next page. A page costs
+the same whatever the size of the result.
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/scans/{id}/summary` | everything but hosts and URLs: `domain`, `counts`, `limits`, `errors`, `technologies`, `stopReason`, `hostsOmitted` |
+| `GET /api/scans/{id}/hosts` | `{"hosts": [...], "next"}`: hosts in display order, each with its `counts` but without `urls`. `q` keeps hosts whose name contains it |
+| `GET /api/scans/{id}/urls` | `{"urls": [...], "next"}`: URLs ordered by host, then path. `host` selects one host; `type` is a comma-separated list of `page`, `api`, `asset`, `unknown`; `q` matches the path, the title or (across hosts) the hostname |
+| `GET /api/scans/{id}/tree` | one level of a host's path tree (below) |
+| `GET /api/scans/{id}/export` | every URL as CSV (one row per URL), streamed |
+| `GET /api/scans/{id}/results` | the whole result as one JSON document (below), streamed |
+
+`400` for an unknown `type`, a `limit` that is not a positive number, or an
+`after` value that did not come from the previous page.
+
+**The tree.** `GET /api/scans/{id}/tree?host=example.com&path=/blog` lists
+the children of `/blog` (`path` defaults to the root). `assets=true` includes
+asset URLs; by default the tree shows routes only. `404` for a host the
+result does not have.
+
+```json
+{
+  "path": "/blog",
+  "total": 214,
+  "urls": [ { "url": "https://example.com/blog", "...": "..." } ],
+  "children": [
+    { "name": "2024", "path": "/blog/2024", "total": 180, "hasChildren": true, "urls": [] },
+    { "name": "about", "path": "/blog/about", "total": 1, "hasChildren": false,
+      "urls": [ { "url": "https://example.com/blog/about", "...": "..." } ] }
+  ],
+  "next": "..."
+}
+```
+
+`total` counts the URLs at or below a node. `urls` are the URLs that end
+exactly at a node (several when they differ by query string or scheme). The
+parent's own `total` and `urls` are sent with the first page only.
+
 ### `GET /api/scans/{id}/results`
 
-Available once the scan is `completed`, `failed` or `cancelled` (after it
-started running). Returns `409` with `{"error": "...", "status": "running"}`
-before that, and for scans cancelled while still queued. The result carries
-the same `stopReason` and `limits` as the status, plus `hostsOmitted`.
+The whole result in one response. Prefer the paged endpoints above for
+anything interactive: this document grows with the result. It carries the
+same `stopReason` and `limits` as the status, plus `hostsOmitted`.
 
 The result has a hierarchy: `hosts[]`, each with its own `urls[]`.
 

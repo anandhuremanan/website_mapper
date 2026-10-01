@@ -1,4 +1,12 @@
-import type { Scan, ScanMode, ScanResult } from "./types";
+import type {
+  HostPage,
+  Scan,
+  ScanMode,
+  ScanSummary,
+  TreeLevel,
+  UrlPage,
+  UrlType,
+} from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -75,6 +83,75 @@ export function cancelScan(id: string): Promise<Scan> {
   });
 }
 
-export function getResults(id: string): Promise<ScanResult> {
-  return request<ScanResult>(`/api/scans/${encodeURIComponent(id)}/results`);
+// A finished scan's result is read in pages: a summary, then hosts, URLs
+// and tree levels as the user looks at them. Each page's `next` is passed
+// back as `after` to get the following page.
+
+function resultPath(id: string, part: string, params: Record<string, string | undefined> = {}) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value) query.set(key, value);
+  }
+  const qs = query.toString();
+  return `/api/scans/${encodeURIComponent(id)}/${part}${qs ? `?${qs}` : ""}`;
+}
+
+export function getSummary(id: string): Promise<ScanSummary> {
+  return request<ScanSummary>(resultPath(id, "summary"));
+}
+
+export interface HostQuery {
+  /** Keeps hosts whose name contains this text. */
+  q?: string;
+  after?: string;
+}
+
+export function getHosts(id: string, query: HostQuery = {}): Promise<HostPage> {
+  return request<HostPage>(resultPath(id, "hosts", { q: query.q, after: query.after }));
+}
+
+export interface UrlQuery {
+  /** One host; every host when omitted. */
+  host?: string;
+  /** URL types to keep; every type when omitted. */
+  types?: UrlType[];
+  /** Keeps URLs whose path, title or (across hosts) hostname contains this. */
+  q?: string;
+  after?: string;
+}
+
+export function getUrls(id: string, query: UrlQuery = {}): Promise<UrlPage> {
+  return request<UrlPage>(
+    resultPath(id, "urls", {
+      host: query.host,
+      type: query.types?.join(","),
+      q: query.q,
+      after: query.after,
+    }),
+  );
+}
+
+export interface TreeQuery {
+  host: string;
+  /** The parent path; the host's root when omitted. */
+  path?: string;
+  /** Include asset URLs (scripts, styles, images, fonts). */
+  assets?: boolean;
+  after?: string;
+}
+
+export function getTree(id: string, query: TreeQuery): Promise<TreeLevel> {
+  return request<TreeLevel>(
+    resultPath(id, "tree", {
+      host: query.host,
+      path: query.path,
+      assets: query.assets ? "true" : undefined,
+      after: query.after,
+    }),
+  );
+}
+
+/** Address of a CSV file with every URL of a result. */
+export function exportUrl(id: string): string {
+  return resultPath(id, "export");
 }

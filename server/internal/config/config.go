@@ -166,7 +166,7 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 			MaxRequests:          p.int("SCAN_MAX_REQUESTS", 50000, 1),
 			MaxDownloadBytes:     int64(p.int("SCAN_MAX_DOWNLOAD_MB", 500, 1)) << 20,
 			MaxDiscoveredHosts:   p.int("SCAN_MAX_DISCOVERED_HOSTS", 10000, 1),
-			MaxRecordedURLs:      p.int("SCAN_MAX_RECORDED_URLS", 50000, 1),
+			MaxRecordedURLs:      p.int("SCAN_MAX_RECORDED_URLS", 1000000, 1),
 			MaxDepth:             p.int("SCAN_MAX_DEPTH", 3, 0),
 			MaxURLs:              p.int("SCAN_MAX_URLS", 500, 1),
 			Concurrency:          p.int("SCAN_CONCURRENCY", 4, 1),

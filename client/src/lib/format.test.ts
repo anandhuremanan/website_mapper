@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { allUrls, hostStatus } from "./format";
+import { hostStatus } from "./format";
 import type { Host } from "./types";
 
 function host(partial: Partial<Host>): Host {
@@ -8,7 +8,6 @@ function host(partial: Partial<Host>): Host {
     state: "discovered",
     sources: ["certificate-transparency"],
     counts: { urls: 0, pages: 0, apis: 0, assets: 0 },
-    urls: [],
     ...partial,
   };
 }
@@ -58,29 +57,5 @@ describe("hostStatus", () => {
     expect(hostStatus(host({ dns: { resolved: false, skipped: "host limit reached" } })).detail).toContain(
       "host limit reached",
     );
-  });
-});
-
-describe("allUrls", () => {
-  it("flattens URLs across hosts", () => {
-    const u = (url: string) => ({
-      url,
-      hostname: new URL(url).hostname,
-      path: new URL(url).pathname,
-      type: "page" as const,
-      typeEvidence: "",
-      sources: [],
-      fetched: false,
-      state: "discovered" as const,
-    });
-    const hosts = [
-      host({ hostname: "a.example.com", urls: [u("https://a.example.com/1")] }),
-      host({ hostname: "b.example.com", urls: [u("https://b.example.com/1"), u("https://b.example.com/2")] }),
-    ];
-    expect(allUrls(hosts).map((x) => x.url)).toEqual([
-      "https://a.example.com/1",
-      "https://b.example.com/1",
-      "https://b.example.com/2",
-    ]);
   });
 });

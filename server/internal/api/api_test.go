@@ -243,3 +243,112 @@ func TestCreateScanMode(t *testing.T) {
 		t.Errorf("invalid mode = %d %v", code, body)
 	}
 }
+
+// finishedScan runs a scan to completion and returns its ID.
+func finishedScan(t *testing.T, srv *httptest.Server) string {
+	t.Helper()
+	_, body := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com"}`)
+	id := body["id"].(string)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, body = do(t, "GET", srv.URL+"/api/scans/"+id, "")
+		if body["status"] == "completed" {
+			return id
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("scan did not complete: %v", body)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestPagedResults(t *testing.T) {
+	srv := newServer(t, true)
+	base := srv.URL + "/api/scans/" + finishedScan(t, srv)
+
+	// The summary has everything but the hosts and URLs.
+	code, body := do(t, "GET", base+"/summary", "")
+	if code != 200 || body["status"] != "completed" || body["counts"].(map[string]any)["urls"] != float64(1) {
+		t.Fatalf("summary = %d %v", code, body)
+	}
+	if _, has := body["hosts"]; has {
+		t.Errorf("summary must not list hosts: %v", body["hosts"])
+	}
+	if body["technologies"] == nil || body["limits"] == nil {
+		t.Errorf("summary = %v", body)
+	}
+
+	code, body = do(t, "GET", base+"/hosts?limit=10", "")
+	hosts, _ := body["hosts"].([]any)
+	if code != 200 || len(hosts) != 1 {
+		t.Fatalf("hosts = %d %v", code, body)
+	}
+	host := hosts[0].(map[string]any)
+	if _, has := host["urls"]; has || host["hostname"] != "example.com" || host["counts"].(map[string]any)["urls"] != float64(1) {
+		t.Errorf("host = %v", host)
+	}
+	if _, has := body["next"]; has {
+		t.Errorf("a last page must not have a next cursor: %v", body["next"])
+	}
+
+	code, body = do(t, "GET", base+"/urls?host=example.com&type=page,unknown", "")
+	urls, _ := body["urls"].([]any)
+	if code != 200 || len(urls) != 1 || urls[0].(map[string]any)["title"] != "Home" {
+		t.Fatalf("urls = %d %v", code, body)
+	}
+	if code, body = do(t, "GET", base+"/urls?type=api", ""); code != 200 || len(body["urls"].([]any)) != 0 {
+		t.Errorf("api urls = %d %v", code, body)
+	}
+
+	code, body = do(t, "GET", base+"/tree?host=example.com", "")
+	if code != 200 || body["path"] != "/" || body["total"] != float64(1) || len(body["urls"].([]any)) != 1 || len(body["children"].([]any)) != 0 {
+		t.Errorf("tree = %d %v", code, body)
+	}
+
+	for path, want := range map[string]int{
+		"/urls?type=pages":              400,
+		"/urls?limit=0":                 400,
+		"/urls?after=nonsense":          400,
+		"/hosts?limit=x":                400,
+		"/tree":                         400,
+		"/tree?host=example.com&path=x": 400,
+		"/tree?host=other.example.com":  404,
+	} {
+		if code, body := do(t, "GET", base+path, ""); code != want || body["error"] == "" {
+			t.Errorf("GET %s = %d %v, want %d", path, code, body, want)
+		}
+	}
+}
+
+func TestExport(t *testing.T) {
+	srv := newServer(t, true)
+	resp, err := http.Get(srv.URL + "/api/scans/" + finishedScan(t, srv) + "/export")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/csv") ||
+		!strings.Contains(resp.Header.Get("Content-Disposition"), "example.com-urls.csv") {
+		t.Errorf("export = %d %v", resp.StatusCode, resp.Header)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], "url,host,type,") ||
+		!strings.HasPrefix(lines[1], "https://example.com/,example.com,page,,verified,200,text/html,Home,target,") {
+		t.Errorf("export body =\n%s", b)
+	}
+}
+
+func TestPagedResultsBeforeFinish(t *testing.T) {
+	srv := newServer(t, false) // no workers: the scan stays queued
+	_, body := do(t, "POST", srv.URL+"/api/scans", `{"target":"example.com"}`)
+	base := srv.URL + "/api/scans/" + body["id"].(string)
+	for _, path := range []string{"/summary", "/hosts", "/urls", "/tree?host=example.com", "/export"} {
+		if code, body := do(t, "GET", base+path, ""); code != http.StatusConflict || body["status"] != "queued" {
+			t.Errorf("GET %s = %d %v, want 409", path, code, body)
+		}
+	}
+	if code, _ := do(t, "GET", srv.URL+"/api/scans/nope/summary", ""); code != http.StatusNotFound {
+		t.Errorf("unknown scan = %d", code)
+	}
+}

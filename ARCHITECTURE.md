@@ -131,7 +131,8 @@ sequenceDiagram
         C->>A: GET /api/scans/{id}
         A->>St: status (small, fixed size)
     end
-    C->>A: GET /api/scans/{id}/results
+    C->>A: GET /api/scans/{id}/summary
+    C->>A: GET .../hosts, .../urls, .../tree (pages, as the user looks)
 ```
 
 1. **Create** ([scan/service.go](server/internal/scan/service.go)). The target
@@ -427,8 +428,16 @@ would have to be compacted).
 - **Finishing.** The result is saved before the finished status is
   published, so a client that sees a finished scan can always read it. The
   database then leaves write-ahead-log mode and becomes a single plain file.
-- **Reading.** `GET /results` streams the document host by host, URL by URL,
-  from the file; a result is never built in memory.
+- **Reading** ([reader.go](server/internal/store/reader.go)). A result is
+  read in pages: hosts, URLs (filtered by host, type or search text) and one
+  level of a host's path tree at a time. Every query is a range read of
+  `urls` in its stored order, continued from the last key of the previous
+  page, so a page costs the same for a thousand URLs or a million. The tree
+  finds each child with one lookup by skipping over the paths below the
+  previous one. Type filters and searches have no index: they read rows
+  until a page is full, which is a full pass in the worst case (measured:
+  0.1 s for 500,000 URLs on a laptop). `GET /results` and `/export` stream
+  the whole result without building it in memory.
 - **Status records** are also held in memory (they are small and polled
   constantly) and written to disk when a scan is created and when it
   finishes.
@@ -456,7 +465,12 @@ detail in [server/README.md](server/README.md#api):
 | `GET /api/health` | liveness, scheduler, pools, caches, bandwidth, process memory |
 | `POST /api/scans` | create or join a scan: `{"target", "mode"}` |
 | `GET /api/scans/{id}` | status: state, phase, progress, counts, limits (small, poll this) |
-| `GET /api/scans/{id}/results` | the full result, once the scan has finished |
+| `GET /api/scans/{id}/summary` | a finished scan's result without hosts and URLs |
+| `GET /api/scans/{id}/hosts` | hosts, a page at a time |
+| `GET /api/scans/{id}/urls` | URLs, a page at a time; filter by host, type or text |
+| `GET /api/scans/{id}/tree` | one level of a host's path tree |
+| `GET /api/scans/{id}/export` | every URL as CSV |
+| `GET /api/scans/{id}/results` | the whole result as one document |
 | `POST /api/scans/{id}/cancel` | release a subscription: `{"subscriptionId"}` |
 
 Responses are JSON, gzipped when the client accepts it. Errors are
@@ -472,10 +486,14 @@ The client ([client/](client/)) is a Next.js App Router app with two pages:
   APIs, assets and technologies.
 
 Data flow is deliberately simple. [lib/use-scan.ts](client/src/lib/use-scan.ts)
-polls the status every 1.5 s and loads the result once when the scan
-finishes. [lib/types.ts](client/src/lib/types.ts) mirrors the server's JSON by
-hand, and [lib/api.ts](client/src/lib/api.ts) is the only place that makes
-requests. The subscription token from a create response is kept in
+polls the status (every 1.5 s at first, slowing to 5 s for long scans, and
+not at all while the tab is hidden) and loads the result summary when the
+scan finishes. The result itself is never downloaded whole: each tab reads
+pages through [lib/use-pages.ts](client/src/lib/use-pages.ts) as the user
+looks at them, searches run on the server, and the map loads a folder's
+children when it is expanded. [lib/types.ts](client/src/lib/types.ts) mirrors
+the server's JSON by hand, and [lib/api.ts](client/src/lib/api.ts) is the
+only place that makes requests. The subscription token from a create response is kept in
 `sessionStorage` so "Cancel" only releases this tab's interest in a shared
 scan. In development, `next.config.ts` proxies `/api/*` to the Go server.
 
@@ -603,10 +621,10 @@ Honest notes for contributors; these are good first issues:
 - Cancelling without a `subscriptionId` is still accepted for unshared
   scans, so anyone who knows a scan ID can cancel it. There are no user
   accounts; scan IDs are random 64-bit values.
-- The web client still downloads a whole result in one response and renders
-  it in the browser, which is why `SCAN_MAX_RECORDED_URLS` defaults to
-  50,000 although the store can hold millions. Paged result endpoints are
-  the next step.
+- Results can only be read once a scan has finished; a running scan shows
+  counters, not hosts or URLs.
+- URL type filters and searches read rows until a page is full. On very
+  large results a rare type or a search with few matches takes a full pass.
 - The discovery cache is in memory; a restart empties it.
 
 ## Glossary

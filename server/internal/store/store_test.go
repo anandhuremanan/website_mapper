@@ -63,10 +63,16 @@ func load(t testing.TB, s *store.Store, id string) scan.Result {
 		t.Fatalf("OpenResult(%s): %v", id, err)
 	}
 	defer r.Close()
-	res := r.Result()
+	res := r.Summary()
+	hosts, err := r.Hosts(ctx, scan.HostQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Hosts = hosts.Hosts
 	for i := range res.Hosts {
 		h := &res.Hosts[i]
-		if err := r.URLs(ctx, h.Hostname, func(u results.URL) error { h.URLs = append(h.URLs, u); return nil }); err != nil {
+		h.URLs = nil
+		if _, err := r.URLs(ctx, scan.URLQuery{Host: h.Hostname}, func(u results.URL) error { h.URLs = append(h.URLs, u); return nil }); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -486,10 +492,8 @@ func TestLargeScanCost(t *testing.T) {
 	}
 	defer r.Close()
 	read := 0
-	for _, h := range r.Result().Hosts {
-		if err := r.URLs(ctx, h.Hostname, func(results.URL) error { read++; return nil }); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := r.URLs(ctx, scan.URLQuery{}, func(results.URL) error { read++; return nil }); err != nil {
+		t.Fatal(err)
 	}
 	if read != n {
 		t.Errorf("read %d URLs, want %d", read, n)

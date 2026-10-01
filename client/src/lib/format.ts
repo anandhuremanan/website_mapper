@@ -1,4 +1,4 @@
-import type { AssetKind, DiscoveredUrl, Host, ScanMode, Source, UrlType } from "./types";
+import type { AssetKind, Host, ScanMode, Source, UrlType } from "./types";
 
 export const sourceLabels: Record<Source, string> = {
   target: "Entered by you",
@@ -128,9 +128,4 @@ export function hostStatus(h: Host): HostStatus {
     label: "not checked",
     detail: `Discovered, not checked${dns?.skipped ? ` (${dns.skipped})` : ""}.`,
   };
-}
-
-/** Every URL in a result, across hosts. */
-export function allUrls(hosts: Host[]): DiscoveredUrl[] {
-  return hosts.flatMap((h) => h.urls);
 }

@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,9 +14,11 @@ import (
 	"net/http"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
+	"websitemapper/internal/classify"
 	"websitemapper/internal/discovery"
 	"websitemapper/internal/results"
 	"websitemapper/internal/scan"
@@ -45,6 +48,11 @@ func NewHandler(scans Scans, log *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /api/health", h.health)
 	mux.HandleFunc("POST /api/scans", h.createScan)
 	mux.HandleFunc("GET /api/scans/{id}", h.getScan)
+	mux.HandleFunc("GET /api/scans/{id}/summary", h.getSummary)
+	mux.HandleFunc("GET /api/scans/{id}/hosts", h.getHosts)
+	mux.HandleFunc("GET /api/scans/{id}/urls", h.getURLs)
+	mux.HandleFunc("GET /api/scans/{id}/tree", h.getTree)
+	mux.HandleFunc("GET /api/scans/{id}/export", h.exportURLs)
 	mux.HandleFunc("GET /api/scans/{id}/results", h.getResults)
 	mux.HandleFunc("POST /api/scans/{id}/cancel", h.cancelScan)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
@@ -165,19 +173,25 @@ func (h *handler) cancelScan(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *handler) getResults(w http.ResponseWriter, r *http.Request) {
+// Page sizes for the result listings.
+const (
+	defaultPageSize = 100
+	maxPageSize     = 500
+)
+
+// streamTimeout is how long a response that streams a whole result (the
+// full document, an export) may take; the server's usual write timeout is
+// too short for a large result on a slow connection.
+const streamTimeout = 10 * time.Minute
+
+// withResult opens a scan's result for fn, answering 404 or 409 itself
+// when there is none to read.
+func (h *handler) withResult(w http.ResponseWriter, r *http.Request, fn func(rd scan.ResultReader)) {
 	id := r.PathValue("id")
 	rd, err := h.scans.OpenResult(r.Context(), id)
 	if err == nil {
 		defer rd.Close()
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusOK)
-		// The status line is sent, so a failure can only be logged; the
-		// client sees a truncated document.
-		if err := writeResult(r.Context(), w, rd); err != nil {
-			h.log.Warn("sending result failed", "scan_id", id, "error", err)
-		}
+		fn(rd)
 		return
 	}
 	if !errors.Is(err, scan.ErrNotFound) {
@@ -197,39 +211,202 @@ func (h *handler) getResults(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// fail answers a failed result query: 400 for a bad cursor or path, 404
+// for a host the result does not have, 500 otherwise.
+func (h *handler) fail(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, scan.ErrBadQuery):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, scan.ErrNotFound):
+		writeError(w, http.StatusNotFound, "host not found in this result")
+	default:
+		h.log.Error("reading result failed", "scan_id", r.PathValue("id"), "path", r.URL.Path, "error", err)
+		writeError(w, http.StatusInternalServerError, "could not read results")
+	}
+}
+
+// pageSize reads the limit parameter, bounded to maxPageSize.
+func pageSize(r *http.Request) (int, bool) {
+	v := r.URL.Query().Get("limit")
+	if v == "" {
+		return defaultPageSize, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	return min(n, maxPageSize), true
+}
+
+// urlTypes reads the type parameter: a comma-separated list of URL types.
+func urlTypes(r *http.Request) ([]classify.Type, bool) {
+	v := r.URL.Query().Get("type")
+	if v == "" {
+		return nil, true
+	}
+	var out []classify.Type
+	for _, s := range strings.Split(v, ",") {
+		switch t := classify.Type(s); t {
+		case classify.TypePage, classify.TypeAPI, classify.TypeAsset, classify.TypeUnknown:
+			out = append(out, t)
+		default:
+			return nil, false
+		}
+	}
+	return out, true
+}
+
+// getSummary returns a result without its hosts and URLs.
+func (h *handler) getSummary(w http.ResponseWriter, r *http.Request) {
+	h.withResult(w, r, func(rd scan.ResultReader) {
+		writeJSON(w, http.StatusOK, summaryOf(rd.Summary()))
+	})
+}
+
+// summary is a scan.Result without the "hosts" field. (A nil field with the
+// same JSON name hides the embedded one.)
+type summary struct {
+	scan.Result
+	Hosts *struct{} `json:"hosts,omitempty"`
+}
+
+func summaryOf(res scan.Result) summary { return summary{Result: res} }
+
+// hostOnly is a results.Host without the "urls" field.
+type hostOnly struct {
+	results.Host
+	URLs *struct{} `json:"urls,omitempty"`
+}
+
+func (h *handler) getHosts(w http.ResponseWriter, r *http.Request) {
+	limit, ok := pageSize(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "limit must be a positive number")
+		return
+	}
+	q := r.URL.Query()
+	h.withResult(w, r, func(rd scan.ResultReader) {
+		page, err := rd.Hosts(r.Context(), scan.HostQuery{Search: q.Get("q"), After: q.Get("after"), Limit: limit})
+		if err != nil {
+			h.fail(w, r, err)
+			return
+		}
+		hosts := make([]hostOnly, len(page.Hosts))
+		for i, host := range page.Hosts {
+			hosts[i] = hostOnly{Host: host}
+		}
+		writeJSON(w, http.StatusOK, struct {
+			Hosts []hostOnly `json:"hosts"`
+			Next  string     `json:"next,omitempty"`
+		}{hosts, page.Next})
+	})
+}
+
+func (h *handler) getURLs(w http.ResponseWriter, r *http.Request) {
+	limit, ok := pageSize(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "limit must be a positive number")
+		return
+	}
+	types, ok := urlTypes(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "type must list page, api, asset or unknown")
+		return
+	}
+	q := r.URL.Query()
+	h.withResult(w, r, func(rd scan.ResultReader) {
+		urls := []results.URL{}
+		next, err := rd.URLs(r.Context(), scan.URLQuery{
+			Host: q.Get("host"), Types: types, Search: q.Get("q"), After: q.Get("after"), Limit: limit,
+		}, func(u results.URL) error {
+			urls = append(urls, u)
+			return nil
+		})
+		if err != nil {
+			h.fail(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, struct {
+			URLs []results.URL `json:"urls"`
+			Next string        `json:"next,omitempty"`
+		}{urls, next})
+	})
+}
+
+func (h *handler) getTree(w http.ResponseWriter, r *http.Request) {
+	limit, ok := pageSize(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "limit must be a positive number")
+		return
+	}
+	q := r.URL.Query()
+	if q.Get("host") == "" {
+		writeError(w, http.StatusBadRequest, "host is required")
+		return
+	}
+	h.withResult(w, r, func(rd scan.ResultReader) {
+		tree, err := rd.Tree(r.Context(), scan.TreeQuery{
+			Host: q.Get("host"), Path: q.Get("path"), Assets: q.Get("assets") == "true", After: q.Get("after"), Limit: limit,
+		})
+		if err != nil {
+			h.fail(w, r, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, tree)
+	})
+}
+
+// stream prepares a response that sends a whole result.
+func stream(w http.ResponseWriter, contentType string) {
+	// Not supported by every ResponseWriter (tests); the default applies then.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(streamTimeout))
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-store")
+}
+
+// getResults sends a whole result as one JSON document. Clients that show
+// results should read them in pages instead (summary, hosts, urls, tree).
+func (h *handler) getResults(w http.ResponseWriter, r *http.Request) {
+	h.withResult(w, r, func(rd scan.ResultReader) {
+		stream(w, "application/json")
+		w.WriteHeader(http.StatusOK)
+		// The status line is sent, so a failure can only be logged; the
+		// client sees a truncated document.
+		if err := writeResult(r.Context(), w, rd); err != nil {
+			h.log.Warn("sending result failed", "scan_id", r.PathValue("id"), "error", err)
+		}
+	})
+}
+
 // writeResult streams a result as one JSON document: the encoding of a
 // scan.Result whose hosts carry their URLs. URLs are read from the store
 // and written one at a time, so the response is never held in memory.
 func writeResult(ctx context.Context, w io.Writer, rd scan.ResultReader) error {
-	res := rd.Result()
+	hosts, err := rd.Hosts(ctx, scan.HostQuery{})
+	if err != nil {
+		return err
+	}
 	bw := bufio.NewWriterSize(w, 32<<10)
 
 	// Encode everything but the hosts, then reopen the object for them.
-	// (A nil field with the same JSON name hides the embedded one.)
-	head, err := openObject(struct {
-		scan.Result
-		Hosts *struct{} `json:"hosts,omitempty"`
-	}{Result: res})
+	head, err := openObject(summaryOf(rd.Summary()))
 	if err != nil {
 		return err
 	}
 	bw.Write(head)
 	bw.WriteString(`,"hosts":[`)
-	for i, host := range res.Hosts {
+	for i, host := range hosts.Hosts {
 		if i > 0 {
 			bw.WriteByte(',')
 		}
-		head, err := openObject(struct {
-			results.Host
-			URLs *struct{} `json:"urls,omitempty"`
-		}{Host: host})
+		head, err := openObject(hostOnly{Host: host})
 		if err != nil {
 			return err
 		}
 		bw.Write(head)
 		bw.WriteString(`,"urls":[`)
 		first := true
-		err = rd.URLs(ctx, host.Hostname, func(u results.URL) error {
+		_, err = rd.URLs(ctx, scan.URLQuery{Host: host.Hostname}, func(u results.URL) error {
 			b, err := json.Marshal(u)
 			if err != nil {
 				return err
@@ -264,6 +441,53 @@ func openObject(v any) ([]byte, error) {
 	return b, nil
 }
 
+// exportURLs sends every URL of a result as CSV, one row per URL.
+func (h *handler) exportURLs(w http.ResponseWriter, r *http.Request) {
+	h.withResult(w, r, func(rd scan.ResultReader) {
+		stream(w, "text/csv; charset=utf-8")
+		name := rd.Summary().Domain.Canonical
+		if name == "" {
+			name = "scan"
+		}
+		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`-urls.csv"`)
+		w.WriteHeader(http.StatusOK)
+
+		cw := csv.NewWriter(w)
+		_ = cw.Write([]string{"url", "host", "type", "asset_kind", "state", "status", "content_type", "title", "sources", "first_archived"})
+		_, err := rd.URLs(r.Context(), scan.URLQuery{}, func(u results.URL) error {
+			status, archived := "", ""
+			if u.Status != 0 {
+				status = strconv.Itoa(u.Status)
+			}
+			if u.Archived != nil {
+				archived = u.Archived.FirstSeen.Format(time.DateOnly)
+			}
+			sources := make([]string, len(u.Sources))
+			for i, s := range u.Sources {
+				sources[i] = string(s)
+			}
+			return cw.Write([]string{u.URL, u.Hostname, string(u.Type), string(u.AssetKind), string(u.State), status,
+				u.ContentType, plainCell(u.Title), strings.Join(sources, " "), archived})
+		})
+		cw.Flush()
+		if err == nil {
+			err = cw.Error()
+		}
+		if err != nil {
+			h.log.Warn("sending export failed", "scan_id", r.PathValue("id"), "error", err)
+		}
+	})
+}
+
+// plainCell keeps a spreadsheet from running text taken from a web page
+// (a title) as a formula.
+func plainCell(s string) string {
+	if s != "" && strings.ContainsRune("=+-@\t\r", rune(s[0])) {
+		return "'" + s
+	}
+	return s
+}
+
 func (h *handler) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -295,6 +519,9 @@ type statusRecorder struct {
 	http.ResponseWriter
 	status int
 }
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code

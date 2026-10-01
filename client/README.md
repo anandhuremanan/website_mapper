@@ -28,6 +28,6 @@ src/components/site-header.tsx   top bar (hidden on the home page)
 src/components/site-footer.tsx   credits, source and license links
 src/components/results/          overview, hosts (DNS/HTTP/crawl + routes per host), map, URL lists
 src/lib/api.ts, types.ts         typed API client mirroring server/README.md
-src/lib/use-scan.ts              polls scan status every 1.5 s, then loads results
-src/lib/tree.ts                  groups URLs into a per-host path tree for the map
+src/lib/use-scan.ts              polls scan status, then loads the result summary
+src/lib/use-pages.ts             loads hosts, URLs and tree levels a page at a time
 ```

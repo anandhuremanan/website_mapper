@@ -1,38 +1,48 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { SourceTags } from "@/components/source-list";
-import { allUrls, plural, statusTone, typeLabels } from "@/lib/format";
-import { buildTrees, type TreeNode } from "@/lib/tree";
+import { getHosts, getTree } from "@/lib/api";
+import { plural, statusTone, typeLabels } from "@/lib/format";
 import type { DiscoveredUrl, Host } from "@/lib/types";
+import { usePages } from "@/lib/use-pages";
 import { UrlDetail } from "./url-detail";
+import { ListFooter } from "./url-list";
 
-const MAX_CHILDREN = 100;
+/** What every part of the map needs to show and change the selected URL. */
+interface Selection {
+  selected: DiscoveredUrl | null;
+  onSelect: (u: DiscoveredUrl) => void;
+  onClose: () => void;
+}
 
 /**
  * A browsable map of the site: hosts, with their discovered paths as a tree.
+ *
+ * Nothing is loaded until it is looked at: hosts come in pages, a host's
+ * tree when the host is opened, and each folder's children when the folder
+ * is expanded. The first host starts open.
  *
  * Selecting a path shows its details in a side panel on wide screens. On
  * narrow screens the layout is a single column, where that panel would end
  * up below every host's tree, far from the tapped row, so details open
  * inline under the selected path instead.
  */
-export function SiteMap({ hosts }: { hosts: Host[] }) {
+export function SiteMap({ scanId }: { scanId: string }) {
   const [includeAssets, setIncludeAssets] = useState(false);
   const [selected, setSelected] = useState<DiscoveredUrl | null>(null);
-  // Selecting the open entry again closes it.
-  const toggle = (u: DiscoveredUrl) =>
-    setSelected((cur) => (cur?.url === u.url ? null : u));
-  const close = () => setSelected(null);
+  const selection: Selection = {
+    selected,
+    // Selecting the open entry again closes it.
+    onSelect: (u) => setSelected((cur) => (cur?.url === u.url ? null : u)),
+    onClose: () => setSelected(null),
+  };
 
-  const trees = useMemo(() => {
-    const urls = allUrls(hosts);
-    return buildTrees(
-      includeAssets ? urls : urls.filter((u) => u.type !== "asset"),
-    );
-  }, [hosts, includeAssets]);
-  const mapped = hosts.filter((h) => trees.has(h.hostname));
-  const empty = hosts.length - mapped.length;
+  const { pages, loading, error, hasMore, loadMore } = usePages((after) =>
+    getHosts(scanId, { after }),
+  );
+  const hosts = pages.flatMap((p) => p.hosts);
+  const mapped = hosts.filter((h) => mappedUrls(h, includeAssets) > 0);
 
   return (
     <div className="space-y-4">
@@ -49,43 +59,32 @@ export function SiteMap({ hosts }: { hosts: Host[] }) {
           implicit column would grow to its widest row and overflow the page. */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_24rem]">
         <div className="min-w-0 space-y-4">
-          {mapped.map((h) => {
-            const tree = trees.get(h.hostname);
-            return (
-              <section
-                key={h.hostname}
-                className="overflow-x-auto rounded-md border border-border bg-surface p-3"
-              >
-                <h3 className="mb-2 flex flex-wrap items-baseline gap-x-2 text-sm">
-                  <span className="break-all font-mono font-medium">
-                    {h.hostname}
-                  </span>
-                  <span className="text-xs text-muted">
-                    {tree
-                      ? plural(tree.total, "URL")
-                      : "no URLs discovered on this host"}
-                  </span>
-                </h3>
-                {tree && (
-                  <Branch
-                    node={tree}
-                    depth={0}
-                    selected={selected}
-                    onSelect={toggle}
-                    onClose={close}
-                  />
-                )}
-              </section>
-            );
-          })}
-          {empty > 0 && (
+          {mapped.map((h, i) => (
+            // Assets change every count in a tree, so it is loaded again.
+            <HostTree
+              key={`${h.hostname}|${includeAssets}`}
+              scanId={scanId}
+              host={h}
+              assets={includeAssets}
+              defaultOpen={i === 0}
+              {...selection}
+            />
+          ))}
+          {hosts.length === 0 && loading && <p className="text-sm text-muted">Loading…</p>}
+          {hosts.length > 0 && (
             <p className="text-sm text-muted">
-              {plural(empty, "other host")} {empty === 1 ? "has" : "have"} no
-              discovered URLs
-              {includeAssets ? "" : " (besides assets)"}. See the Hosts tab for
-              their DNS and HTTP status.
+              {mapped.length === 0 ? "None of these hosts has" : "Hosts are listed only if they have"}{" "}
+              discovered URLs{includeAssets ? "" : " besides assets"}. See the Hosts tab for every
+              host&apos;s DNS and HTTP status.
             </p>
           )}
+          <ListFooter
+            shown={hosts.length}
+            loading={loading}
+            error={error}
+            hasMore={hasMore}
+            onMore={loadMore}
+          />
         </div>
 
         <aside className="hidden lg:sticky lg:top-4 lg:block lg:self-start">
@@ -93,9 +92,7 @@ export function SiteMap({ hosts }: { hosts: Host[] }) {
             {selected ? (
               <UrlDetail url={selected} />
             ) : (
-              <p className="text-sm text-muted">
-                Select a path to see how it was discovered.
-              </p>
+              <p className="text-sm text-muted">Select a path to see how it was discovered.</p>
             )}
           </div>
         </aside>
@@ -104,36 +101,143 @@ export function SiteMap({ hosts }: { hosts: Host[] }) {
   );
 }
 
-interface BranchProps {
-  node: TreeNode;
-  depth: number;
-  selected: DiscoveredUrl | null;
-  onSelect: (u: DiscoveredUrl) => void;
-  onClose: () => void;
+/** The URLs of a host that the map shows. */
+function mappedUrls(h: Host, includeAssets: boolean): number {
+  return h.counts.urls - (includeAssets ? 0 : h.counts.assets);
 }
 
-function Branch({ node, depth, selected, onSelect, onClose }: BranchProps) {
-  const [expanded, setExpanded] = useState(depth < 1);
-  const [showAll, setShowAll] = useState(false);
-  const hasChildren = node.children.length > 0;
-  const children = showAll
-    ? node.children
-    : node.children.slice(0, MAX_CHILDREN);
-  const selectedHere = node.urls.find((u) => u.url === selected?.url);
-  const label = depth === 0 ? "/" : node.name;
+interface HostTreeProps extends Selection {
+  scanId: string;
+  host: Host;
+  assets: boolean;
+  defaultOpen: boolean;
+}
 
+function HostTree({ scanId, host, assets, defaultOpen, ...selection }: HostTreeProps) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <section className="overflow-x-auto rounded-md border border-border bg-surface p-3">
+      <h3 className="flex flex-wrap items-baseline gap-x-2 text-sm">
+        <button
+          type="button"
+          onClick={() => setOpen(!open)}
+          aria-expanded={open}
+          className="flex min-w-0 items-baseline gap-1 text-left"
+        >
+          <span aria-hidden className="w-4 shrink-0 text-muted">
+            {open ? "▾" : "▸"}
+          </span>
+          <span className="break-all font-mono font-medium">{host.hostname}</span>
+        </button>
+        <span className="text-xs text-muted">{plural(mappedUrls(host, assets), "URL")}</span>
+      </h3>
+      {open && (
+        <div className="mt-2">
+          <Level scanId={scanId} host={host.hostname} assets={assets} root {...selection} />
+        </div>
+      )}
+    </section>
+  );
+}
+
+interface LevelProps extends Selection {
+  scanId: string;
+  host: string;
+  /** The parent path; the host's root when omitted. */
+  path?: string;
+  assets: boolean;
+  /** Show the parent itself ("/") above its children. */
+  root?: boolean;
+}
+
+/** One level of a host's tree: the children of a path, loaded when shown. */
+function Level({ scanId, host, path, assets, root, ...selection }: LevelProps) {
+  const { pages, loading, error, hasMore, loadMore } = usePages((after) =>
+    getTree(scanId, { host, path, assets, after }),
+  );
+  const children = pages.flatMap((p) => p.children);
+  const first = pages[0];
+
+  const list = (
+    <>
+      {children.map((c) => (
+        <Branch key={c.path} scanId={scanId} host={host} assets={assets} node={c} {...selection} />
+      ))}
+      {!first && loading && <p className="ml-5 text-xs text-muted">Loading…</p>}
+      <div className="ml-5 text-xs">
+        <ListFooter
+          shown={children.length}
+          loading={loading}
+          error={error}
+          hasMore={hasMore}
+          onMore={loadMore}
+        />
+      </div>
+    </>
+  );
+  if (!root) return <div className="text-sm">{list}</div>;
   return (
     <div className="text-sm">
+      {first && <NodeRow label="/" urls={first.urls} total={first.total} {...selection} />}
+      <div className="ml-2 border-l border-border pl-3">{list}</div>
+    </div>
+  );
+}
+
+interface BranchProps extends Selection {
+  scanId: string;
+  host: string;
+  assets: boolean;
+  node: { name: string; path: string; total: number; hasChildren: boolean; urls: DiscoveredUrl[] };
+}
+
+function Branch({ scanId, host, assets, node, ...selection }: BranchProps) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="text-sm">
+      <NodeRow
+        label={node.name}
+        path={node.path}
+        urls={node.urls}
+        total={node.hasChildren ? node.total : undefined}
+        expanded={node.hasChildren ? expanded : undefined}
+        onToggle={() => setExpanded(!expanded)}
+        {...selection}
+      />
+      {expanded && node.hasChildren && (
+        <div className="ml-2 border-l border-border pl-3">
+          <Level scanId={scanId} host={host} path={node.path} assets={assets} {...selection} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface NodeRowProps extends Selection {
+  label: string;
+  /** Full path, for the expand button's label. */
+  path?: string;
+  /** URLs that end exactly at this node. */
+  urls: DiscoveredUrl[];
+  /** URLs at or below the node; shown for nodes that have children. */
+  total?: number;
+  /** Whether the node is expanded; undefined for nodes without children. */
+  expanded?: boolean;
+  onToggle?: () => void;
+}
+
+function NodeRow({ label, path, urls, total, expanded, onToggle, selected, onSelect, onClose }: NodeRowProps) {
+  const selectedHere = urls.find((u) => u.url === selected?.url);
+  return (
+    <>
       {/* The arrow keeps its place; the name and badges wrap beside it. */}
       <div className="flex items-start gap-1" data-row>
-        {hasChildren ? (
+        {expanded !== undefined ? (
           <button
             type="button"
-            onClick={() => setExpanded(!expanded)}
+            onClick={onToggle}
             aria-expanded={expanded}
-            aria-label={
-              expanded ? `Collapse ${node.path}` : `Expand ${node.path}`
-            }
+            aria-label={expanded ? `Collapse ${path}` : `Expand ${path}`}
             className="w-4 shrink-0 text-muted hover:text-fg"
           >
             {expanded ? "▾" : "▸"}
@@ -142,11 +246,11 @@ function Branch({ node, depth, selected, onSelect, onClose }: BranchProps) {
           <span className="w-4 shrink-0" />
         )}
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-1 gap-y-0.5">
-          {node.urls.length > 0 ? (
+          {urls.length > 0 ? (
             // The path itself is the obvious thing to tap, especially on phones.
             <button
               type="button"
-              onClick={() => onSelect(node.urls[0])}
+              onClick={() => onSelect(urls[0])}
               aria-expanded={selectedHere !== undefined}
               className="min-w-0 break-all text-left font-mono hover:underline"
             >
@@ -155,10 +259,10 @@ function Branch({ node, depth, selected, onSelect, onClose }: BranchProps) {
           ) : (
             <span className="min-w-0 break-all font-mono">{label}</span>
           )}
-          {hasChildren && (
-            <span className="text-xs text-muted">({node.total})</span>
+          {total !== undefined && (
+            <span className="text-xs text-muted">({total.toLocaleString()})</span>
           )}
-          {node.urls.map((u) => (
+          {urls.map((u) => (
             <button
               key={u.url}
               type="button"
@@ -169,9 +273,7 @@ function Branch({ node, depth, selected, onSelect, onClose }: BranchProps) {
               }`}
               title={u.url}
             >
-              <span className={`font-mono ${statusTone(u.status)}`}>
-                {u.status ?? "—"}
-              </span>
+              <span className={`font-mono ${statusTone(u.status)}`}>{u.status ?? "—"}</span>
               <span className="text-muted">{typeLabels[u.type]}</span>
               <span className="hidden sm:inline">
                 <SourceTags sources={u.sources} />
@@ -183,40 +285,13 @@ function Branch({ node, depth, selected, onSelect, onClose }: BranchProps) {
       {selectedHere && (
         <div className="my-2 rounded-md border border-border bg-surface p-3 lg:hidden">
           <div className="mb-2 flex justify-end">
-            <button
-              type="button"
-              onClick={onClose}
-              className="text-xs text-muted hover:text-fg"
-            >
+            <button type="button" onClick={onClose} className="text-xs text-muted hover:text-fg">
               Close
             </button>
           </div>
           <UrlDetail url={selectedHere} />
         </div>
       )}
-      {expanded && hasChildren && (
-        <div className="ml-2 border-l border-border pl-3">
-          {children.map((c) => (
-            <Branch
-              key={c.path}
-              node={c}
-              depth={depth + 1}
-              selected={selected}
-              onSelect={onSelect}
-              onClose={onClose}
-            />
-          ))}
-          {node.children.length > children.length && (
-            <button
-              type="button"
-              onClick={() => setShowAll(true)}
-              className="ml-5 text-xs text-accent hover:underline"
-            >
-              Show {node.children.length - children.length} more
-            </button>
-          )}
-        </div>
-      )}
-    </div>
+    </>
   );
 }

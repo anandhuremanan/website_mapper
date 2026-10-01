@@ -1,40 +1,39 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
-import { allUrls, formatDuration, hostStatus, modeLabels, plural, sourceLabel } from "@/lib/format";
-import type { Scan, ScanResult } from "@/lib/types";
+import { useState } from "react";
+import { exportUrl, getHosts } from "@/lib/api";
+import { formatDuration, hostStatus, modeLabels, plural, sourceLabel } from "@/lib/format";
+import type { Scan, ScanSummary } from "@/lib/types";
+import { usePages } from "@/lib/use-pages";
 import { HostList } from "./host-list";
 import { SiteMap } from "./site-map";
-import { UrlList } from "./url-list";
+import { ListFooter, UrlList } from "./url-list";
 
 type Tab = "overview" | "hosts" | "map" | "pages" | "apis" | "assets" | "technologies";
 
-export function ResultsView({ scan, result }: { scan: Scan; result: ScanResult }) {
+/**
+ * A finished scan's result. Only the summary is loaded up front; each tab
+ * reads its hosts and URLs from the server in pages as they are shown.
+ */
+export function ResultsView({ scan, result }: { scan: Scan; result: ScanSummary }) {
   const [tab, setTab] = useState<Tab>("overview");
   const [openHost, setOpenHost] = useState<string | null>(null);
 
-  const urls = useMemo(() => allUrls(result.hosts), [result.hosts]);
-  const groups = useMemo(
-    () => ({
-      pages: urls.filter((u) => u.type === "page" || u.type === "unknown"),
-      apis: urls.filter((u) => u.type === "api"),
-      assets: urls.filter((u) => u.type === "asset"),
-    }),
-    [urls],
-  );
+  const { counts, domain } = result;
+  // The Pages tab also lists URLs of unknown type (for example form targets).
+  const pages = counts.urls - counts.apis - counts.assets;
 
   const tabs: { id: Tab; label: string; count?: number }[] = [
     { id: "overview", label: "Overview" },
-    { id: "hosts", label: "Hosts", count: result.hosts.length },
+    { id: "hosts", label: "Hosts", count: counts.hosts },
     { id: "map", label: "Map" },
-    { id: "pages", label: "Pages", count: groups.pages.length },
-    { id: "apis", label: "APIs", count: groups.apis.length },
-    { id: "assets", label: "Assets", count: groups.assets.length },
+    { id: "pages", label: "Pages", count: pages },
+    { id: "apis", label: "APIs", count: counts.apis },
+    { id: "assets", label: "Assets", count: counts.assets },
     { id: "technologies", label: "Technologies", count: result.technologies.length },
   ];
 
-  const { counts, domain } = result;
   const showHost = (hostname: string) => {
     setOpenHost(hostname);
     setTab("hosts");
@@ -45,9 +44,16 @@ export function ResultsView({ scan, result }: { scan: Scan; result: ScanResult }
       <header className="space-y-2">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
           <h1 className="font-mono text-2xl font-semibold tracking-tight">{domain.canonical}</h1>
-          <Link href="/" className="text-sm text-accent hover:underline">
-            New scan
-          </Link>
+          <span className="flex flex-wrap gap-x-4 text-sm">
+            {counts.urls > 0 && (
+              <a href={exportUrl(scan.id)} download className="text-accent hover:underline">
+                Download URLs (CSV)
+              </a>
+            )}
+            <Link href="/" className="text-accent hover:underline">
+              New scan
+            </Link>
+          </span>
         </div>
         <p className="text-sm">
           {plural(counts.hosts, "host")} ({counts.hostsReachable} reachable) ·{" "}
@@ -102,7 +108,9 @@ export function ResultsView({ scan, result }: { scan: Scan; result: ScanResult }
             >
               {t.label}
               {t.count !== undefined && (
-                <span className="ml-1.5 font-mono text-xs text-muted">{t.count}</span>
+                <span className="ml-1.5 font-mono text-xs text-muted">
+                  {t.count.toLocaleString()}
+                </span>
               )}
             </button>
           ))}
@@ -110,19 +118,24 @@ export function ResultsView({ scan, result }: { scan: Scan; result: ScanResult }
       </nav>
 
       <section>
-        {tab === "overview" && <Overview result={result} goTo={setTab} showHost={showHost} />}
+        {tab === "overview" && (
+          <Overview scanId={scan.id} result={result} goTo={setTab} showHost={showHost} />
+        )}
         {tab === "hosts" && (
           <HostList
             key={openHost ?? ""}
-            hosts={result.hosts}
+            scanId={scan.id}
             apex={domain.canonical}
+            total={counts.hosts}
             initialOpen={openHost}
           />
         )}
-        {tab === "map" && <SiteMap hosts={result.hosts} />}
+        {tab === "map" && <SiteMap scanId={scan.id} />}
         {tab === "pages" && (
           <UrlList
-            urls={groups.pages}
+            scanId={scan.id}
+            types={["page", "unknown"]}
+            total={pages}
             showKind
             empty="No pages were discovered."
             note="Pages are URLs that returned HTML or were linked from HTML, on every host. Unknown URLs (for example form targets) are listed here too."
@@ -130,13 +143,21 @@ export function ResultsView({ scan, result }: { scan: Scan; result: ScanResult }
         )}
         {tab === "apis" && (
           <UrlList
-            urls={groups.apis}
+            scanId={scan.id}
+            types={["api"]}
+            total={counts.apis}
             empty="No API-like endpoints were discovered."
             note="API-like means the URL returned JSON, or its path looks like an API route. Open an entry to see which evidence applies — a matching path alone is not proof."
           />
         )}
         {tab === "assets" && (
-          <UrlList urls={groups.assets} showKind empty="No assets were discovered." />
+          <UrlList
+            scanId={scan.id}
+            types={["asset"]}
+            total={counts.assets}
+            showKind
+            empty="No assets were discovered."
+          />
         )}
         {tab === "technologies" && <Technologies result={result} />}
       </section>
@@ -145,12 +166,13 @@ export function ResultsView({ scan, result }: { scan: Scan; result: ScanResult }
 }
 
 interface OverviewProps {
-  result: ScanResult;
+  scanId: string;
+  result: ScanSummary;
   goTo: (t: Tab) => void;
   showHost: (hostname: string) => void;
 }
 
-function Overview({ result, goTo, showHost }: OverviewProps) {
+function Overview({ scanId, result, goTo, showHost }: OverviewProps) {
   const { counts } = result;
   const rows: { label: string; value: number; tab: Tab }[] = [
     { label: "Hosts discovered", value: counts.hosts, tab: "hosts" },
@@ -206,39 +228,63 @@ function Overview({ result, goTo, showHost }: OverviewProps) {
         )}
       </div>
 
-      <div className="text-sm">
-        <h2 className="mb-2 font-medium">Hosts</h2>
-        <ul className="divide-y divide-border rounded-md border border-border bg-surface">
-          {result.hosts.map((h) => {
-            const st = hostStatus(h);
-            return (
-              <li key={h.hostname}>
-                <button
-                  type="button"
-                  onClick={() => showHost(h.hostname)}
-                  className="grid w-full grid-cols-[1.25rem_minmax(0,1fr)_auto] items-center gap-x-2 px-3 py-1.5 text-left hover:bg-subtle"
-                >
-                  <span aria-hidden className={`text-center ${st.tone}`}>
-                    {st.icon}
-                  </span>
-                  <span className="truncate font-mono">{h.hostname}</span>
-                  <span className={`text-right font-mono text-xs ${st.tone}`}>
-                    {st.label}
-                    {h.counts.urls > 0 && (
-                      <span className="ml-3 text-muted">{plural(h.counts.urls, "URL")}</span>
-                    )}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      </div>
+      <OverviewHosts scanId={scanId} showHost={showHost} />
     </div>
   );
 }
 
-function Technologies({ result }: { result: ScanResult }) {
+/** The result's hosts with their status, a page at a time. */
+function OverviewHosts({ scanId, showHost }: Pick<OverviewProps, "scanId" | "showHost">) {
+  const { pages, loading, error, hasMore, loadMore } = usePages((after) =>
+    getHosts(scanId, { after }),
+  );
+  const hosts = pages.flatMap((p) => p.hosts);
+
+  return (
+    <div className="space-y-3 text-sm">
+      <h2 className="font-medium">Hosts</h2>
+      <ul className="divide-y divide-border rounded-md border border-border bg-surface">
+        {hosts.map((h) => {
+          const st = hostStatus(h);
+          return (
+            <li key={h.hostname}>
+              <button
+                type="button"
+                onClick={() => showHost(h.hostname)}
+                className="grid w-full grid-cols-[1.25rem_minmax(0,1fr)_auto] items-center gap-x-2 px-3 py-1.5 text-left hover:bg-subtle"
+              >
+                <span aria-hidden className={`text-center ${st.tone}`}>
+                  {st.icon}
+                </span>
+                <span className="truncate font-mono">{h.hostname}</span>
+                <span className={`text-right font-mono text-xs ${st.tone}`}>
+                  {st.label}
+                  {h.counts.urls > 0 && (
+                    <span className="ml-3 text-muted">{plural(h.counts.urls, "URL")}</span>
+                  )}
+                </span>
+              </button>
+            </li>
+          );
+        })}
+        {hosts.length === 0 && (
+          <li className="px-3 py-3 text-muted">
+            {loading ? "Loading…" : error ? "" : "No hosts were discovered."}
+          </li>
+        )}
+      </ul>
+      <ListFooter
+        shown={hosts.length}
+        loading={loading}
+        error={error}
+        hasMore={hasMore}
+        onMore={loadMore}
+      />
+    </div>
+  );
+}
+
+function Technologies({ result }: { result: ScanSummary }) {
   if (result.technologies.length === 0) {
     return (
       <p className="text-sm text-muted">
