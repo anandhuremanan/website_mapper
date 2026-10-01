@@ -72,6 +72,8 @@ type ScanConfig struct {
 	// ArchiveEnabled turns web archive route discovery on or off.
 	ArchiveEnabled bool
 	// ArchiveMaxURLs bounds the URLs listed from the web archive per scan.
+	// Keep it below MaxRecordedURLs, so that routes found on the live site
+	// always have room.
 	ArchiveMaxURLs int
 	// SitemapMaxURLs and SitemapMaxFiles bound what is read from one host's
 	// sitemaps.
@@ -161,7 +163,7 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 		Scan: ScanConfig{
 			DefaultMode:          p.oneOf("SCAN_DEFAULT_MODE", "light", "passive", "light", "full"),
 			ArchiveEnabled:       p.bool("SCAN_ARCHIVE_ENABLED", true),
-			ArchiveMaxURLs:       p.int("SCAN_ARCHIVE_MAX_URLS", 5000, 1),
+			ArchiveMaxURLs:       p.int("SCAN_ARCHIVE_MAX_URLS", 1000000, 1),
 			SitemapMaxURLs:       p.int("SCAN_SITEMAP_MAX_URLS", 2000, 1),
 			SitemapMaxFiles:      p.int("SCAN_SITEMAP_MAX_FILES", 5, 1),
 			RequestTimeout:       p.duration("SCAN_REQUEST_TIMEOUT", 10*time.Second),
@@ -170,7 +172,7 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 			MaxRequests:          p.int("SCAN_MAX_REQUESTS", 50000, 1),
 			MaxDownloadBytes:     int64(p.int("SCAN_MAX_DOWNLOAD_MB", 500, 1)) << 20,
 			MaxDiscoveredHosts:   p.int("SCAN_MAX_DISCOVERED_HOSTS", 10000, 1),
-			MaxRecordedURLs:      p.int("SCAN_MAX_RECORDED_URLS", 1000000, 1),
+			MaxRecordedURLs:      p.int("SCAN_MAX_RECORDED_URLS", 2000000, 1),
 			MaxDepth:             p.int("SCAN_MAX_DEPTH", 3, 0),
 			MaxURLs:              p.int("SCAN_MAX_URLS", 500, 1),
 			Concurrency:          p.int("SCAN_CONCURRENCY", 4, 1),

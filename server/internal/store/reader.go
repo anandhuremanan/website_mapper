@@ -284,23 +284,39 @@ func (t *tree) next(bound string, strict bool, upper string) (string, bool, erro
 	return p, err == nil, err
 }
 
-// urls returns the URLs that end exactly at node p.
+// urls returns the URLs that end exactly at node p: p itself, then p with a
+// query. They are read as two ranges; one query with OR would make SQLite
+// scan every path of the host.
 func (t *tree) urls(hostname, p string) ([]results.URL, error) {
-	rows, err := t.db.QueryContext(t.ctx, `SELECT path, origin, `+urlColumns+` FROM urls WHERE host_id = ? AND (path = ? OR (path >= ? AND path < ?))`+
-		t.filter+` ORDER BY path, origin LIMIT ?`, t.host, p, p+"?", p+afterQuery, nodeURLLimit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	out := []results.URL{}
-	for rows.Next() {
-		rec := results.URLRecord{HostID: t.host}
-		if err := scanRecord(rows, &rec, &rec.Path, &rec.Origin); err != nil {
+	for _, where := range []struct {
+		cond string
+		args []any
+	}{
+		{`path = ?`, []any{p}},
+		{`path >= ? AND path < ?`, []any{p + "?", p + afterQuery}},
+	} {
+		args := append(append([]any{t.host}, where.args...), nodeURLLimit-len(out))
+		rows, err := t.db.QueryContext(t.ctx, `SELECT path, origin, `+urlColumns+` FROM urls WHERE host_id = ? AND `+where.cond+
+			t.filter+` ORDER BY path, origin LIMIT ?`, args...)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, rec.View(hostname))
+		for rows.Next() {
+			rec := results.URLRecord{HostID: t.host}
+			if err := scanRecord(rows, &rec, &rec.Path, &rec.Origin); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out = append(out, rec.View(hostname))
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // Tree lists the children of a path by skipping through the host's paths:
@@ -430,7 +446,12 @@ func (r *reader) Tree(ctx context.Context, q scan.TreeQuery) (scan.Tree, error) 
 
 // own counts the URLs that end exactly at node p.
 func (t *tree) own(p string) (int, error) {
-	return t.count(`(path = ? OR (path >= ? AND path < ?))`, p, p+"?", p+afterQuery)
+	exact, err := t.exact(p)
+	if err != nil {
+		return 0, err
+	}
+	queries, err := t.count(`path >= ? AND path < ?`, p+"?", p+afterQuery)
+	return exact + queries, err
 }
 
 // total counts the URLs at or below node p.

@@ -306,6 +306,11 @@ func TestPageCost(t *testing.T) {
 					Source: discovery.SourceArchive, Hint: discovery.HintArchive})
 			}
 		}
+		// One host far larger than the rest, with large folders.
+		for u := 0; u < 150000; u++ {
+			a.Add(discovery.Finding{URL: fmt.Sprintf("https://big.example.com/dir-%d/sub-%d/page-%d", u%120, u%7, u),
+				Source: discovery.SourceArchive, Hint: discovery.HintArchive})
+		}
 		// One API-like URL at the very end: the worst case for a type filter.
 		a.Add(link(fmt.Sprintf("https://host-%03d.example.com/zz/api/v1/last", hosts-1)))
 	})
@@ -324,7 +329,7 @@ func TestPageCost(t *testing.T) {
 			return n
 		}
 	}
-	t.Logf("%d URLs on %d hosts", hosts*perHost+1, hosts)
+	t.Logf("%d URLs on %d hosts", hosts*perHost+150001, hosts+1)
 	timed("first page of all URLs", count(scan.URLQuery{Limit: 100}))
 	timed("first page of one host", count(scan.URLQuery{Host: "host-050.example.com", Limit: 100}))
 	timed("rare type (scans everything)", count(scan.URLQuery{Types: []classify.Type{classify.TypeAPI}, Limit: 100}))
@@ -332,6 +337,13 @@ func TestPageCost(t *testing.T) {
 	timed("search with no match (scans everything)", count(scan.URLQuery{Search: "no-such-text", Limit: 100}))
 	timed("tree: root of one host (50 children)", func() int {
 		tr, err := r.Tree(ctx, scan.TreeQuery{Host: "host-050.example.com", Limit: 100})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(tr.Children)
+	})
+	timed("tree: root of a 150,000-URL host (100 of 120)", func() int {
+		tr, err := r.Tree(ctx, scan.TreeQuery{Host: "big.example.com", Limit: 100})
 		if err != nil {
 			t.Fatal(err)
 		}

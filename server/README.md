@@ -75,7 +75,10 @@ much the scanner contacts the site (`"mode"` in `POST /api/scans`, default
 | `light` | one probe plus robots.txt and sitemaps per live host | archive + sitemaps |
 | `full` | also crawls pages, following links | archive + sitemaps + links |
 
-Measured cold (nothing cached) with the deployment profile:
+Measured cold (nothing cached) with the deployment profile. These figures
+were taken when the archive listing stopped at 5,000 URLs. It now reads the
+whole listing (up to `SCAN_ARCHIVE_MAX_URLS`), so scans of well-archived
+sites find far more URLs and take longer; see the archive note below.
 
 | Site | Mode | Time | Requests | Downloaded | Hosts (live) | URLs |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -87,6 +90,11 @@ Measured cold (nothing cached) with the deployment profile:
 | python.org | full | 142.9 s | 4,677 | 28.0 MB | 78 (54) | 13,427 |
 
 \* 59 s of it waiting for crt.sh; the scanner's own work took about 7 s.
+
+With the complete listing, a passive scan of python.org capped at 200,000
+archived URLs took 80 s: 8 archive requests, 2.5 MB downloaded, 199,541 URLs
+recorded, a peak heap of 18 MB and a 20 MB result file. Time grows with the
+listing, about 25,000 URLs per request and at most 20 requests a minute.
 
 Small sites are barely archived, so passive mode finds few routes for them;
 large sites are well archived. Archived URLs are never requested, also not
@@ -103,7 +111,7 @@ a scan runs only the stages of its mode.
 | Step | Modes | Engines | What happens |
 | --- | --- | --- | --- |
 | Validating target | all | (built in) | Input parsed and scope derived when the scan is created |
-| Searching web archives | all | `archive` | One Wayback Machine CDX query for the domain and all subdomains: URLs archived with HTTP 200, first capture, content type. Started first and left running **in the background** while the steps below proceed |
+| Searching web archives | all | `archive` | The Wayback Machine CDX index for the domain and all subdomains, read a page at a time: URLs archived with HTTP 200, first capture, content type. Started first and left running **in the background** while the steps below proceed |
 | Discovering subdomains | all | `subdomains` | Certificate Transparency via crt.sh and Cert Spotter, run concurrently and merged |
 | Resolving discovered hosts | all | `dns` | A/AAAA/CNAME lookup for every known host |
 | Checking which hosts are live | light, full | `http` | `GET https://host/`, falling back to `http://host/`, on resolved public hosts |
@@ -244,7 +252,7 @@ still builds its own result, combining cached and newly observed data.
 | dns | hostname | addresses, CNAME, non-public flag, or NXDOMAIN | `CACHE_DNS_TTL` (5 min); NXDOMAIN 1 min; timeouts never |
 | probe | hostname + target scope | reachable?, status, redirect, final URL, title, server | `CACHE_PROBE_TTL` (2 min), reachable or not |
 | page | URL | status, content type, title, redirect, and every link/asset reference | `CACHE_PAGE_TTL` (15 min) |
-| archive | domain | archived URLs with first capture and content type | `CACHE_ARCHIVE_TTL` (24 h); failures 5 min |
+| archive | domain | archived URLs with first capture and content type, for listings of up to 20,000 URLs (longer ones are read again) | `CACHE_ARCHIVE_TTL` (24 h); failures 5 min |
 | sitemap | URL | a robots.txt's sitemap list or a sitemap's URLs | `CACHE_PAGE_TTL` (15 min) |
 
 - **What is never cached:** response bodies, asset contents, and outcomes
@@ -772,6 +780,26 @@ URL fields:
   is retried twice.
 - **Cert Spotter** returns only current certificates. Unauthenticated use is
   limited to about 10 requests per hour per IP; each scan uses up to 3.
-- Neither source is a complete DNS inventory. Hosts that never had their own
+- **The Wayback Machine's CDX index** lists every capture of a domain. The
+  scanner asks for one row per URL (`collapse=urlkey`), 25,000 at a time,
+  and continues each page with the index's resume key.
+  - *Pace.* The Internet Archive limits clients (about 60 requests a minute
+    when last stated, tightened since) and blocks ones that keep sending
+    after an HTTP 429. All scans share one limit of a request every 3 s. On
+    a 429 the scanner stops, reports the listing as incomplete, and leaves
+    the archive alone for at least 2 minutes (longer if `Retry-After` says
+    so); it never retries through one.
+  - *A quirk worth knowing.* With `collapse`, the resume key the index
+    hands out names the first capture of the *next* URL, which it has read
+    but not returned, and a resumed listing continues strictly after its
+    key. Used as given, the key skips that capture, and so any URL captured
+    only once: one URL silently lost per page. The scanner rewrites the
+    key's timestamp to `0`, the start of that URL (see `fromStart` in
+    [archive.go](internal/discovery/archive/archive.go)). Observed in
+    October 2026; if the index changes, the worst case is one repeated row
+    per page, which results merge anyway.
+  - *Limits.* A listing stops at `SCAN_ARCHIVE_MAX_URLS`, and the result
+    says so. Archived URLs are historical: they may no longer exist.
+- Neither certificate source is a complete DNS inventory. Hosts that never had their own
   certificate (for example ones covered only by a wildcard) will not appear
   unless they are linked from a crawled page.

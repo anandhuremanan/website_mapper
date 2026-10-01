@@ -61,7 +61,8 @@ func run() error {
 		http: resource.NewPool("http", cfg.GlobalHTTPConcurrency),
 		dns:  resource.NewPool("dns", cfg.GlobalDNSConcurrency),
 		ct:   resource.NewPool("certificate-transparency", ctConcurrency),
-		// archive.org asks for moderate use of its index.
+		// archive.org asks for moderate use of its index; the pace of
+		// requests is set by the archive client's rate limit.
 		archive: resource.NewPool("archive", 2),
 		// Every byte any scan downloads, including certificate-log answers.
 		bandwidth: resource.NewBandwidth(cfg.GlobalDownloadBytesPerSec),
@@ -263,12 +264,17 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log
 	lightAndFull := []scan.Mode{scan.ModeLight, scan.ModeFull}
 	var stages []scan.Stage
 	if cfg.ArchiveEnabled {
+		// The listing is read a page at a time. This client is shared by
+		// every scan, so its rate limit is the server's whole pace towards
+		// the archive: one request every 3 s, 20 a minute, which is below
+		// the Internet Archive's limit however many scans are running.
 		archiveClient := fetch.New(fetch.Options{
-			Timeout:      cfg.CTTimeout,
-			MaxBodyBytes: 16 << 20,
-			UserAgent:    cfg.UserAgent,
-			Pool:         pools.archive,
-			Bandwidth:    pools.bandwidth,
+			Timeout:           cfg.CTTimeout,
+			MaxBodyBytes:      32 << 20,
+			UserAgent:         cfg.UserAgent,
+			RequestsPerSecond: 1.0 / 3,
+			Pool:              pools.archive,
+			Bandwidth:         pools.bandwidth,
 		})
 		// The archive is slow and nothing has to wait for its routes, so it
 		// runs in the background while hosts are discovered and checked. The

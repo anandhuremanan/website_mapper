@@ -229,7 +229,7 @@ certificate providers failing).
 | Engine | Package | What it does | Requests to the target |
 | --- | --- | --- | --- |
 | `subdomains` | `discovery/subdomains` | Asks crt.sh and Cert Spotter (in parallel) for certificate names; keeps in-scope hostnames | none |
-| `archive` | `discovery/archive` | One Wayback Machine CDX query for the domain and all subdomains: URLs archived with HTTP 200, first capture date, content type; drops malformed junk | none |
+| `archive` | `discovery/archive` | The Wayback Machine CDX index for the domain and all subdomains, a page of 25,000 URLs at a time: URLs archived with HTTP 200, first capture date, content type; drops malformed junk. Reported as it arrives, so memory stays at one page | none |
 | `dns` | `discovery/dnsresolve` | A/AAAA/CNAME per host; flags hosts that resolve only to private addresses | none (DNS only) |
 | `http` | `discovery/httpprobe` | `GET https://host/`, falling back to `http://`; status, redirect, title, server | 1–2 per host |
 | `sitemap` | `discovery/sitemap` | robots.txt `Sitemap:` lines (never `Disallow`), else `/sitemap.xml`; sitemap indexes, `.xml.gz`, text sitemaps | a few per host |
@@ -368,7 +368,7 @@ bodies ([cache/cache.go](server/internal/cache/cache.go)).
 | Layer | Key | Holds | Default TTL |
 | --- | --- | --- | --- |
 | certificate | provider + domain | hostnames from one provider, or its failure | 6 h (rate limited 15 min, other failures 5 min) |
-| archive | domain | archived URLs with first capture and content type | 24 h (failures 5 min) |
+| archive | domain | archived URLs with first capture and content type; only listings of up to 20,000 URLs | 24 h (failures 5 min) |
 | dns | hostname | addresses, CNAME, non-public flag, or NXDOMAIN | 5 min (NXDOMAIN 1 min, timeouts never) |
 | probe | host + scope | reachability, status, redirect, title | 2 min |
 | sitemap | URL | a robots.txt's sitemap list, or a sitemap's URLs | 15 min |
@@ -625,6 +625,9 @@ small servers, `server/deploy/websitemapper.env`.
 
 Honest notes for contributors; these are good first issues:
 
+- Long archive listings (over 20,000 URLs) are not cached: each scan of a
+  well-archived domain reads the listing again, at the archive's pace. Two
+  scans of the same domain in different modes read it twice.
 - `scan/service.go` is large (scheduling, coalescing, the stage runner and
   progress/notices in one file) and could be split without behaviour
   changes.

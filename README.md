@@ -38,9 +38,12 @@ forms, guesses paths or brute-forces names.
 | Standard *(default)* | one check per live host, plus its robots.txt and sitemaps | archive + sitemaps |
 | Full crawl | also follows links on every live host | archive + sitemaps + links |
 
-Measured examples (cold, on a small server): python.org takes about 18 s
-passive (6 requests), 53 s standard (186 requests) and 143 s as a full crawl
-(4,677 requests). See [server/README.md](server/README.md#scan-modes).
+How long a scan takes depends mostly on how much the web archive holds for
+the domain: the listing is read at no more than 20 requests a minute, about
+25,000 URLs each, in the background while the rest of the scan runs. A
+passive scan of python.org limited to 200,000 archived URLs took 80 s.
+Results can be browsed while a scan runs. See
+[server/README.md](server/README.md#scan-modes).
 
 ## Quick start
 
