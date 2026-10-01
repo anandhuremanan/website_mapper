@@ -56,7 +56,7 @@ describe("SiteMap details on narrow screens", () => {
     expect(panel.closest("section")?.textContent).toContain("example.com");
     expect(within(panel as HTMLElement).getByText("About us")).toBeTruthy();
     // It immediately follows the tapped row.
-    const row = screen.getByRole("button", { name: "about" }).closest("div");
+    const row = screen.getByRole("button", { name: "about" }).closest("[data-row]");
     expect(row?.nextElementSibling).toBe(panel);
   });
 

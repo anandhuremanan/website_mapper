@@ -8,7 +8,7 @@ export function UrlDetail({ url }: { url: DiscoveredUrl }) {
     : typeLabels[url.type];
 
   return (
-    <dl className="grid grid-cols-[8rem_1fr] gap-x-4 gap-y-2 text-sm">
+    <dl className="grid grid-cols-[6.5rem_minmax(0,1fr)] gap-x-3 gap-y-2 text-sm sm:grid-cols-[8rem_minmax(0,1fr)] sm:gap-x-4">
       <Row label="URL">
         <a
           href={url.url}

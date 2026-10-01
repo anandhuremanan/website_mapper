@@ -21,12 +21,15 @@ export function SiteMap({ hosts }: { hosts: Host[] }) {
   const [includeAssets, setIncludeAssets] = useState(false);
   const [selected, setSelected] = useState<DiscoveredUrl | null>(null);
   // Selecting the open entry again closes it.
-  const toggle = (u: DiscoveredUrl) => setSelected((cur) => (cur?.url === u.url ? null : u));
+  const toggle = (u: DiscoveredUrl) =>
+    setSelected((cur) => (cur?.url === u.url ? null : u));
   const close = () => setSelected(null);
 
   const trees = useMemo(() => {
     const urls = allUrls(hosts);
-    return buildTrees(includeAssets ? urls : urls.filter((u) => u.type !== "asset"));
+    return buildTrees(
+      includeAssets ? urls : urls.filter((u) => u.type !== "asset"),
+    );
   }, [hosts, includeAssets]);
   const mapped = hosts.filter((h) => trees.has(h.hostname));
   const empty = hosts.length - mapped.length;
@@ -42,29 +45,45 @@ export function SiteMap({ hosts }: { hosts: Host[] }) {
         Include assets (scripts, styles, images, fonts)
       </label>
 
-      <div className="grid gap-4 lg:grid-cols-[1fr_24rem]">
-        <div className="space-y-4">
+      {/* grid-cols-1 gives the column a real width (minmax(0, 1fr)); an
+          implicit column would grow to its widest row and overflow the page. */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_24rem]">
+        <div className="min-w-0 space-y-4">
           {mapped.map((h) => {
             const tree = trees.get(h.hostname);
             return (
-              <section key={h.hostname} className="rounded-md border border-border bg-surface p-3">
-                <h3 className="mb-2 flex items-baseline gap-2 text-sm">
-                  <span className="font-mono font-medium">{h.hostname}</span>
+              <section
+                key={h.hostname}
+                className="overflow-x-auto rounded-md border border-border bg-surface p-3"
+              >
+                <h3 className="mb-2 flex flex-wrap items-baseline gap-x-2 text-sm">
+                  <span className="break-all font-mono font-medium">
+                    {h.hostname}
+                  </span>
                   <span className="text-xs text-muted">
-                    {tree ? plural(tree.total, "URL") : "no URLs discovered on this host"}
+                    {tree
+                      ? plural(tree.total, "URL")
+                      : "no URLs discovered on this host"}
                   </span>
                 </h3>
                 {tree && (
-                  <Branch node={tree} depth={0} selected={selected} onSelect={toggle} onClose={close} />
+                  <Branch
+                    node={tree}
+                    depth={0}
+                    selected={selected}
+                    onSelect={toggle}
+                    onClose={close}
+                  />
                 )}
               </section>
             );
           })}
           {empty > 0 && (
             <p className="text-sm text-muted">
-              {plural(empty, "other host")} {empty === 1 ? "has" : "have"} no discovered URLs
-              {includeAssets ? "" : " (besides assets)"}. See the Hosts tab for their DNS and
-              HTTP status.
+              {plural(empty, "other host")} {empty === 1 ? "has" : "have"} no
+              discovered URLs
+              {includeAssets ? "" : " (besides assets)"}. See the Hosts tab for
+              their DNS and HTTP status.
             </p>
           )}
         </div>
@@ -74,7 +93,9 @@ export function SiteMap({ hosts }: { hosts: Host[] }) {
             {selected ? (
               <UrlDetail url={selected} />
             ) : (
-              <p className="text-sm text-muted">Select a path to see how it was discovered.</p>
+              <p className="text-sm text-muted">
+                Select a path to see how it was discovered.
+              </p>
             )}
           </div>
         </aside>
@@ -95,63 +116,78 @@ function Branch({ node, depth, selected, onSelect, onClose }: BranchProps) {
   const [expanded, setExpanded] = useState(depth < 1);
   const [showAll, setShowAll] = useState(false);
   const hasChildren = node.children.length > 0;
-  const children = showAll ? node.children : node.children.slice(0, MAX_CHILDREN);
+  const children = showAll
+    ? node.children
+    : node.children.slice(0, MAX_CHILDREN);
   const selectedHere = node.urls.find((u) => u.url === selected?.url);
   const label = depth === 0 ? "/" : node.name;
 
   return (
     <div className="text-sm">
-      <div className="flex items-center gap-1">
+      {/* The arrow keeps its place; the name and badges wrap beside it. */}
+      <div className="flex items-start gap-1" data-row>
         {hasChildren ? (
           <button
             type="button"
             onClick={() => setExpanded(!expanded)}
             aria-expanded={expanded}
-            aria-label={expanded ? `Collapse ${node.path}` : `Expand ${node.path}`}
-            className="w-4 text-muted hover:text-fg"
+            aria-label={
+              expanded ? `Collapse ${node.path}` : `Expand ${node.path}`
+            }
+            className="w-4 shrink-0 text-muted hover:text-fg"
           >
             {expanded ? "▾" : "▸"}
           </button>
         ) : (
-          <span className="w-4" />
+          <span className="w-4 shrink-0" />
         )}
-        {node.urls.length > 0 ? (
-          // The path itself is the obvious thing to tap, especially on phones.
-          <button
-            type="button"
-            onClick={() => onSelect(node.urls[0])}
-            aria-expanded={selectedHere !== undefined}
-            className="break-all text-left font-mono hover:underline"
-          >
-            {label}
-          </button>
-        ) : (
-          <span className="break-all font-mono">{label}</span>
-        )}
-        {hasChildren && <span className="text-xs text-muted">({node.total})</span>}
-        {node.urls.map((u) => (
-          <button
-            key={u.url}
-            type="button"
-            onClick={() => onSelect(u)}
-            aria-expanded={selected?.url === u.url}
-            className={`ml-2 flex shrink-0 items-center gap-1.5 rounded px-1.5 py-px text-xs hover:bg-subtle ${
-              selected?.url === u.url ? "bg-subtle ring-1 ring-border" : ""
-            }`}
-            title={u.url}
-          >
-            <span className={`font-mono ${statusTone(u.status)}`}>{u.status ?? "—"}</span>
-            <span className="text-muted">{typeLabels[u.type]}</span>
-            <span className="hidden sm:inline">
-              <SourceTags sources={u.sources} />
-            </span>
-          </button>
-        ))}
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-1 gap-y-0.5">
+          {node.urls.length > 0 ? (
+            // The path itself is the obvious thing to tap, especially on phones.
+            <button
+              type="button"
+              onClick={() => onSelect(node.urls[0])}
+              aria-expanded={selectedHere !== undefined}
+              className="min-w-0 break-all text-left font-mono hover:underline"
+            >
+              {label}
+            </button>
+          ) : (
+            <span className="min-w-0 break-all font-mono">{label}</span>
+          )}
+          {hasChildren && (
+            <span className="text-xs text-muted">({node.total})</span>
+          )}
+          {node.urls.map((u) => (
+            <button
+              key={u.url}
+              type="button"
+              onClick={() => onSelect(u)}
+              aria-expanded={selected?.url === u.url}
+              className={`ml-1 flex shrink-0 items-center gap-1.5 rounded px-1.5 py-px text-xs hover:bg-subtle ${
+                selected?.url === u.url ? "bg-subtle ring-1 ring-border" : ""
+              }`}
+              title={u.url}
+            >
+              <span className={`font-mono ${statusTone(u.status)}`}>
+                {u.status ?? "—"}
+              </span>
+              <span className="text-muted">{typeLabels[u.type]}</span>
+              <span className="hidden sm:inline">
+                <SourceTags sources={u.sources} />
+              </span>
+            </button>
+          ))}
+        </div>
       </div>
       {selectedHere && (
-        <div className="my-2 ml-5 rounded-md border border-border bg-surface p-3 lg:hidden">
+        <div className="my-2 rounded-md border border-border bg-surface p-3 lg:hidden">
           <div className="mb-2 flex justify-end">
-            <button type="button" onClick={onClose} className="text-xs text-muted hover:text-fg">
+            <button
+              type="button"
+              onClick={onClose}
+              className="text-xs text-muted hover:text-fg"
+            >
               Close
             </button>
           </div>

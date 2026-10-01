@@ -267,6 +267,8 @@ Result
   and the final result's counts use the same code, so they always agree.
 - **Limits.** The aggregator caps recorded hosts and URLs per scan and per
   host; anything beyond is counted as omitted, never silently dropped.
+  Archived URLs arrive first and are historical, so they may fill at most
+  half of a host's slots; routes found on the live site always have room.
 
 The aggregator also implements `discovery.State`, which is how engines see
 what earlier engines found.

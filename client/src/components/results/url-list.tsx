@@ -56,7 +56,7 @@ export function UrlList({ urls, empty, showKind, note }: Props) {
                 type="button"
                 onClick={() => setOpen(isOpen ? null : u.url)}
                 aria-expanded={isOpen}
-                className="grid w-full grid-cols-[3rem_1fr] items-center gap-x-3 gap-y-1 px-3 py-2 text-left text-sm hover:bg-subtle sm:grid-cols-[3rem_1fr_auto]"
+                className="grid w-full grid-cols-[3rem_minmax(0,1fr)] items-center gap-x-3 gap-y-1 px-3 py-2 text-left text-sm hover:bg-subtle sm:grid-cols-[3rem_minmax(0,1fr)_auto]"
               >
                 <span className={`font-mono tabular-nums ${statusTone(u.status)}`}>
                   {u.status ?? "—"}

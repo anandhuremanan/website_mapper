@@ -34,6 +34,9 @@ function heading(scan: Scan): string {
       return "Scan failed";
     case "cancelled":
       return scan.stopReason === "server_shutdown" ? "Stopped: the server shut down" : "Cancelled";
+    case "completed":
+      // Shown only while the finished scan's results are downloading.
+      return "Loading results…";
     default: {
       const label = phaseLabel[scan.phase] ?? "Scanning";
       const p = scan.progress;

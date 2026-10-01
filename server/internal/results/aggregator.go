@@ -62,6 +62,7 @@ type hostEntry struct {
 	// scan's own work and/or through reused cache entries.
 	liveSeen, cachedSeen bool
 	urls                 int // recorded URLs
+	archived             int // of those, first recorded from a web archive
 	omitted              int // URLs seen after the per-host limit was reached
 	sources              set[discovery.Source]
 	dns                  *discovery.DNSInfo
@@ -112,11 +113,22 @@ func (a *Aggregator) Add(f discovery.Finding) {
 		// recorded (bounded by the request budget); the rest are counted.
 		full := (a.limits.MaxURLsPerHost > 0 && host.urls >= a.limits.MaxURLsPerHost) ||
 			(a.limits.MaxURLs > 0 && len(a.urls) >= a.limits.MaxURLs)
+		// Archived URLs are historical and arrive first (the archive is
+		// queried before the site is contacted). They may fill at most half
+		// of a host's slots, so routes found on the live site (sitemaps,
+		// links) always have room.
+		fromArchive := f.Source == discovery.SourceArchive
+		if fromArchive && a.limits.MaxURLsPerHost > 0 && host.archived >= max(a.limits.MaxURLsPerHost/2, 1) {
+			full = true
+		}
 		if full && f.Response == nil && f.Error == "" {
 			host.omitted++
 			return
 		}
 		host.urls++
+		if fromArchive {
+			host.archived++
+		}
 		e = &urlEntry{u: u, sources: set[discovery.Source]{}, hints: set[discovery.Hint]{}, methods: set[string]{}}
 		a.urls[key] = e
 	} else {

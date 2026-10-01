@@ -164,7 +164,7 @@ function Overview({ result, goTo, showHost }: OverviewProps) {
   ];
 
   return (
-    <div className="grid gap-8 md:grid-cols-[18rem_1fr]">
+    <div className="grid grid-cols-1 gap-8 md:grid-cols-[18rem_minmax(0,1fr)]">
       <div className="space-y-6">
         <table className="w-full text-sm">
           <tbody className="divide-y divide-border">
@@ -216,7 +216,7 @@ function Overview({ result, goTo, showHost }: OverviewProps) {
                 <button
                   type="button"
                   onClick={() => showHost(h.hostname)}
-                  className="grid w-full grid-cols-[1.25rem_1fr_auto] items-center gap-x-2 px-3 py-1.5 text-left hover:bg-subtle"
+                  className="grid w-full grid-cols-[1.25rem_minmax(0,1fr)_auto] items-center gap-x-2 px-3 py-1.5 text-left hover:bg-subtle"
                 >
                   <span aria-hidden className={`text-center ${st.tone}`}>
                     {st.icon}

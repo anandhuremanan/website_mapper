@@ -68,12 +68,15 @@ export function ScanForm() {
           placeholder="https://example.com"
           value={target}
           onChange={(e) => setTarget(e.target.value)}
-          className="h-11 flex-1 rounded-md border border-border bg-surface px-3 font-mono text-sm outline-none placeholder:text-muted/70 focus:border-accent focus:ring-2 focus:ring-accent/20"
+          // flex-1 only applies side by side: in the stacked phone layout it
+          // would collapse the input's height. 16px text on phones stops iOS
+          // from zooming the page when the field is focused.
+          className="h-11 w-full shrink-0 rounded-md border border-border bg-surface px-3 font-mono text-base outline-none placeholder:text-muted/70 focus:border-accent focus:ring-2 focus:ring-accent/20 sm:w-auto sm:flex-1 sm:shrink sm:text-sm"
         />
         <button
           type="submit"
           disabled={submitting}
-          className="h-11 rounded-md bg-fg px-5 text-sm font-medium text-bg transition-opacity hover:opacity-90 disabled:opacity-50"
+          className="h-11 shrink-0 rounded-md bg-fg px-5 text-sm font-medium text-bg transition-opacity hover:opacity-90 disabled:opacity-50"
         >
           {submitting ? "Starting…" : "Map website"}
         </button>

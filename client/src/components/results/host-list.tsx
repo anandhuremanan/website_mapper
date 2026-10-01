@@ -31,7 +31,7 @@ export function HostList({ hosts, apex, initialOpen = null }: Props) {
               type="button"
               onClick={() => setOpen(isOpen ? null : h.hostname)}
               aria-expanded={isOpen}
-              className="grid w-full grid-cols-[1.25rem_1fr] items-center gap-x-2 gap-y-1 px-3 py-2 text-left text-sm hover:bg-subtle sm:grid-cols-[1.25rem_1fr_9rem_auto]"
+              className="grid w-full grid-cols-[1.25rem_minmax(0,1fr)] items-center gap-x-2 gap-y-1 px-3 py-2 text-left text-sm hover:bg-subtle sm:grid-cols-[1.25rem_minmax(0,1fr)_9rem_auto]"
             >
               <span aria-hidden className={`text-center ${st.tone}`}>
                 {st.icon}
@@ -83,7 +83,7 @@ export function HostDetail({ host }: { host: Host }) {
         <span className={st.tone}>{st.icon}</span> {st.detail}
       </p>
 
-      <dl className="grid grid-cols-[8rem_1fr] gap-x-4 gap-y-2 text-sm">
+      <dl className="grid grid-cols-[6.5rem_minmax(0,1fr)] gap-x-3 gap-y-2 text-sm sm:grid-cols-[8rem_minmax(0,1fr)] sm:gap-x-4">
         <Row label="Discovered through">
           <FoundThrough sources={host.sources} />
         </Row>

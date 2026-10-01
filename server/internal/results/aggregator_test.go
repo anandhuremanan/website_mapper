@@ -3,6 +3,7 @@ package results
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -388,5 +389,47 @@ func TestAggregatorCacheProvenance(t *testing.T) {
 	}
 	if rc := res.Counts(); rc != c {
 		t.Errorf("result counts %+v != live %+v", rc, c)
+	}
+}
+
+// TestArchiveLeavesRoomForLiveURLs: the archive is queried first and can
+// list thousands of old URLs for one host. It must not use up the host's
+// whole quota before the live site's routes are seen.
+func TestArchiveLeavesRoomForLiveURLs(t *testing.T) {
+	tgt, _ := discovery.ParseTarget("example.com")
+	a := NewAggregator(tgt, Limits{MaxURLsPerHost: 10})
+	archived := &discovery.ArchiveInfo{FirstSeen: time.Date(2015, 1, 1, 0, 0, 0, 0, time.UTC), ContentType: "text/html"}
+	for i := 0; i < 40; i++ {
+		a.Add(discovery.Finding{URL: fmt.Sprintf("https://example.com/old-%d", i), Source: discovery.SourceArchive,
+			Hint: discovery.HintArchive, Archive: archived})
+	}
+	if c := a.Counts(); c.URLs != 5 || c.Limits.URLsOmitted != 35 {
+		t.Fatalf("after archive: recorded %d, omitted %d; want 5 and 35", c.URLs, c.Limits.URLsOmitted)
+	}
+	// Routes from the live site fill the other half...
+	for i := 0; i < 5; i++ {
+		a.Add(discovery.Finding{URL: fmt.Sprintf("https://example.com/live-%d", i), Source: discovery.SourceSitemap, Hint: discovery.HintSitemap})
+	}
+	// ...a live source confirming an archived URL costs no extra slot...
+	a.Add(discovery.Finding{URL: "https://example.com/old-0", Source: discovery.SourceSitemap, Hint: discovery.HintSitemap})
+	// ...and the overall per-host limit still applies.
+	a.Add(discovery.Finding{URL: "https://example.com/live-extra", Source: discovery.SourceSitemap, Hint: discovery.HintSitemap})
+
+	res := a.Result()
+	h := findHost(t, res, "example.com")
+	live := 0
+	for _, u := range h.URLs {
+		if strings.HasPrefix(u.Path, "/live-") {
+			live++
+		}
+		if u.Path == "/old-0" && len(u.Sources) != 2 {
+			t.Errorf("old-0 sources = %v, want archive and sitemap", u.Sources)
+		}
+	}
+	if len(h.URLs) != 10 || live != 5 || h.Omitted != 36 {
+		t.Errorf("recorded %d (live %d), omitted %d; want 10 (5), 36", len(h.URLs), live, h.Omitted)
+	}
+	if rc := res.Counts(); rc != a.Counts() {
+		t.Errorf("result counts %+v != live counts %+v", rc, a.Counts())
 	}
 }
