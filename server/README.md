@@ -255,7 +255,7 @@ still builds its own result, combining cached and newly observed data.
 | dns | hostname | addresses, CNAME, non-public flag, or NXDOMAIN | `CACHE_DNS_TTL` (5 min); NXDOMAIN 1 min; timeouts never |
 | probe | hostname + target scope | reachable?, status, redirect, final URL, title, server | `CACHE_PROBE_TTL` (2 min), reachable or not |
 | page | URL | status, content type, title, redirect, and every link/asset reference | `CACHE_PAGE_TTL` (15 min) |
-| archive | domain | archived URLs with first capture and content type, for listings of up to 20,000 URLs (longer ones are read again) | `CACHE_ARCHIVE_TTL` (24 h); failures 5 min |
+| archive | domain | archived URLs with first capture and content type, for listings of up to 20,000 URLs (longer ones are read again) | `CACHE_ARCHIVE_TTL` (24 h); failures 1 min |
 | sitemap | URL | a robots.txt's sitemap list or a sitemap's URLs | `CACHE_PAGE_TTL` (15 min) |
 
 - **What is never cached:** response bodies, asset contents, and outcomes
@@ -847,6 +847,9 @@ URL fields:
     [archive.go](internal/discovery/archive/archive.go)). Observed in
     October 2026; if the index changes, the worst case is one repeated row
     per page, which results merge anyway.
+  - *Slow moments.* A page may take up to 2 minutes. A page that times out or
+    gets a server error is asked for once more after 5 s; if that fails too,
+    the listing ends (keeping what it has) and the scan says so.
   - *Limits.* A listing stops at `SCAN_ARCHIVE_MAX_URLS`, and the result
     says so. Archived URLs are historical: they may no longer exist.
 - Neither certificate source is a complete DNS inventory. Hosts that never had their own

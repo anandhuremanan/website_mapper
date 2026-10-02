@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -75,6 +76,8 @@ const (
 	defaultCooldown = 2 * time.Minute
 	// maxCooldown bounds a Retry-After sent by the archive.
 	maxCooldown = time.Hour
+	// defaultRetryDelay is the pause before a failed page is asked again.
+	defaultRetryDelay = 5 * time.Second
 )
 
 // maxCachedEntries is the longest listing kept in the cache.
@@ -94,6 +97,9 @@ type Options struct {
 	// Cooldown is how long no request is sent after the archive answers
 	// with HTTP 429 (0: default).
 	Cooldown time.Duration
+	// RetryDelay is the pause before a failed page is asked for again
+	// (0: default).
+	RetryDelay time.Duration
 	// BaseURL is the archive's address; overridable for tests.
 	BaseURL string
 	// Now is the clock; overridable for tests.
@@ -121,6 +127,9 @@ func New(f Fetcher, opts Options) *Engine {
 	}
 	if opts.Cooldown <= 0 {
 		opts.Cooldown = defaultCooldown
+	}
+	if opts.RetryDelay <= 0 {
+		opts.RetryDelay = defaultRetryDelay
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -205,16 +214,32 @@ func (e *Engine) list(ctx context.Context, t discovery.Target, emit discovery.Em
 	for {
 		size := min(e.opts.PageSize, e.opts.MaxURLs-listed)
 		page, err := e.page(ctx, t, size, resume)
+		if transient(err) && ctx.Err() == nil {
+			// The archive is sometimes slow or briefly unavailable: ask
+			// once more after a pause, which also keeps within its pace.
+			select {
+			case <-ctx.Done():
+			case <-time.After(e.opts.RetryDelay):
+				page, err = e.page(ctx, t, size, resume)
+				if transient(err) {
+					err = fmt.Errorf("%w, also when asked again", err)
+				}
+			}
+		}
 		if err != nil {
 			switch {
 			case ctx.Err() != nil:
 				return Listing{}, listed, false, ctx.Err()
 			case listed > 0:
-				return Listing{}, listed, false, fmt.Errorf("the web archive stopped answering after %d URLs (%w); the listing is incomplete", listed, err)
+				return Listing{}, listed, false, fmt.Errorf("listed %d URLs, then %w; the listing is incomplete", listed, err)
 			case errors.Is(err, resource.ErrBudgetExhausted), errors.Is(err, errRateLimited):
 				return Listing{}, 0, false, err // about this scan or this moment, not the domain
 			}
-			return Listing{Err: err.Error()}, 0, true, err
+			msg := err.Error()
+			if transient(err) {
+				msg += "; try the scan again in a few minutes"
+			}
+			return Listing{Err: msg}, 0, true, errors.New(msg)
 		}
 		for _, en := range page.entries {
 			emit(finding(en, time.Time{}))
@@ -239,6 +264,31 @@ func (e *Engine) list(ctx context.Context, t discovery.Target, emit discovery.Em
 		}
 		resume = page.resume
 	}
+}
+
+// pageError is a page that could not be read, with a message for people.
+type pageError struct {
+	msg string
+	// retry is true when asking again may help (no answer, server error).
+	retry bool
+}
+
+func (e *pageError) Error() string { return e.msg }
+
+// transient reports whether err is worth asking again for.
+func transient(err error) bool {
+	var pe *pageError
+	return errors.As(err, &pe) && pe.retry
+}
+
+// describe turns a failed request into a sentence.
+func describe(err error) string {
+	var ne net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) ||
+		strings.Contains(err.Error(), "Client.Timeout") {
+		return "the web archive did not answer in time"
+	}
+	return "the web archive could not be reached"
 }
 
 // errRateLimited marks an HTTP 429 from the archive.
@@ -273,18 +323,20 @@ func (e *Engine) page(ctx context.Context, t discovery.Target, size int, resume 
 		if errors.Is(err, resource.ErrBudgetExhausted) {
 			return page{}, err
 		}
-		return page{}, fmt.Errorf("web archive request failed: %w", err)
+		return page{}, &pageError{msg: describe(err), retry: true}
 	}
 	switch {
 	case resp.StatusCode == 429:
 		e.blockedUntil.Store(e.opts.Now().Add(e.cooldown(resp)).UnixNano())
 		return page{}, errRateLimited
+	case resp.StatusCode >= 500:
+		return page{}, &pageError{msg: fmt.Sprintf("the web archive returned a server error (HTTP %d)", resp.StatusCode), retry: true}
 	case resp.StatusCode != 200:
-		return page{}, fmt.Errorf("web archive returned HTTP %d", resp.StatusCode)
+		return page{}, &pageError{msg: fmt.Sprintf("the web archive refused the request (HTTP %d)", resp.StatusCode)}
 	case resp.Truncated:
 		// The resume key is at the end of the body, so the listing cannot
 		// continue from a cut-off page.
-		return page{}, errors.New("web archive response exceeded the size limit")
+		return page{}, &pageError{msg: "the web archive's answer was larger than allowed"}
 	}
 	return parsePage(resp.Body, t), nil
 }
