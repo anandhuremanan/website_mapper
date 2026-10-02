@@ -39,6 +39,9 @@ const shutdownGrace = 15 * time.Second
 // each scan makes one query per provider.
 const ctConcurrency = 4
 
+// archivePageTimeout bounds one request for a page of the archive listing.
+const archivePageTimeout = 2 * time.Minute
+
 // lookupConcurrency bounds the quick subdomain lookups across all scans.
 // Their answers are small and arrive in about a second.
 const lookupConcurrency = 8
@@ -299,7 +302,9 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log
 		// the archive: one request every 3 s, 20 a minute, which is below
 		// the Internet Archive's limit however many scans are running.
 		archiveClient := fetch.New(fetch.Options{
-			Timeout:           cfg.CTTimeout,
+			// A page of 25,000 URLs usually takes 5-15 s, but the archive
+			// has slow moments; a page that fails is asked again once.
+			Timeout:           archivePageTimeout,
 			MaxBodyBytes:      32 << 20,
 			UserAgent:         cfg.UserAgent,
 			RequestsPerSecond: 1.0 / 3,
@@ -311,7 +316,7 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log
 		// follow-up stages join it, to check any hosts only it found.
 		stages = append(stages, scan.Stage{ID: "archive", Label: "Searching web archives", Modes: all, Background: true,
 			Engines: []discovery.Engine{archive.New(archiveClient, archive.Options{
-				MaxURLs: cfg.ArchiveMaxURLs, Cache: caches.archive, TTL: caches.ttl.ArchiveTTL, FailureTTL: 5 * time.Minute,
+				MaxURLs: cfg.ArchiveMaxURLs, Cache: caches.archive, TTL: caches.ttl.ArchiveTTL, FailureTTL: time.Minute,
 			})}})
 	}
 	if cfg.CTEnabled {

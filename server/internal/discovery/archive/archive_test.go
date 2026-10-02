@@ -74,6 +74,8 @@ type fakeArchive struct {
 	status     int
 	failFrom   int32
 	retryAfter string
+	// onlyOnce, if set, makes the failure happen on one request only.
+	onlyOnce *atomic.Int32
 
 	mu      sync.Mutex
 	resumes []string // decoded resume keys received
@@ -99,7 +101,7 @@ func (a *fakeArchive) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		q.Get("collapse") != "urlkey" || q.Get("fl") != "original,timestamp,mimetype" || q.Get("showResumeKey") != "true" {
 		a.t.Errorf("unexpected query %s", r.URL)
 	}
-	if a.status != 0 && n >= max(a.failFrom, 1) {
+	if a.status != 0 && n >= max(a.failFrom, 1) && (a.onlyOnce == nil || a.onlyOnce.Add(1) == 1) {
 		if a.retryAfter != "" {
 			w.Header().Set("Retry-After", a.retryAfter)
 		}
@@ -178,6 +180,9 @@ func (c *clock) Advance(d time.Duration) { c.now.Add(int64(d)) }
 
 func engine(baseURL string, opts Options) *Engine {
 	opts.BaseURL = baseURL
+	if opts.RetryDelay == 0 {
+		opts.RetryDelay = time.Millisecond
+	}
 	return New(fetch.New(fetch.Options{AllowPrivate: true}), opts)
 }
 
@@ -355,9 +360,10 @@ func TestFailureBeforeAnythingIsListed(t *testing.T) {
 			t.Errorf("run %d: err = %v, findings %d", i, err, len(col.findings))
 		}
 	}
-	// The failure is remembered briefly, so the archive is not asked again.
-	if calls := arch.calls.Load(); calls != 1 {
-		t.Errorf("requests = %d, want 1", calls)
+	// It was asked twice (a server error is worth one more try), then the
+	// failure is remembered briefly, so the second scan does not ask.
+	if calls := arch.calls.Load(); calls != 2 {
+		t.Errorf("requests = %d, want 2", calls)
 	}
 	clk.Advance(6 * time.Minute)
 	arch.status = 0
@@ -374,7 +380,7 @@ func TestFailurePartWayKeepsWhatWasListed(t *testing.T) {
 
 	col, err := discover(t, e)
 	var partial *discovery.PartialError
-	if !errors.As(err, &partial) || !strings.Contains(err.Error(), "after 8 URLs") || !strings.Contains(err.Error(), "500") {
+	if !errors.As(err, &partial) || !strings.Contains(err.Error(), "listed 8 URLs") || !strings.Contains(err.Error(), "500") {
 		t.Errorf("err = %v", err)
 	}
 	if len(col.findings) != 8 {
@@ -441,5 +447,39 @@ func TestCancelledListingStops(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) || n != 4 {
 		t.Errorf("err = %v after %d findings", err, n)
+	}
+}
+
+// TestRetriesASlowOrFailingPageOnce: one bad answer does not lose the
+// listing; two in a row end it with a readable message.
+func TestRetriesASlowOrFailingPageOnce(t *testing.T) {
+	arch, url := newFakeArchive(t, site(10)...)
+	arch.status, arch.failFrom = 503, 2
+	arch.onlyOnce = &atomic.Int32{} // only the second request fails
+	col, err := discover(t, engine(url, Options{MaxURLs: 100, PageSize: 4}))
+	if err != nil || len(col.findings) != 10 {
+		t.Errorf("one failure: %d findings, err %v", len(col.findings), err)
+	}
+	if calls := arch.calls.Load(); calls != 4 {
+		t.Errorf("requests = %d, want 4 (3 pages, one asked twice)", calls)
+	}
+
+	// A request that times out, twice.
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+	}))
+	t.Cleanup(slow.Close)
+	e := New(fetch.New(fetch.Options{AllowPrivate: true, Timeout: 50 * time.Millisecond}),
+		Options{MaxURLs: 10, BaseURL: slow.URL, RetryDelay: time.Millisecond})
+	_, err = discover(t, e)
+	if err == nil || err.Error() != "the web archive did not answer in time, also when asked again; try the scan again in a few minutes" {
+		t.Errorf("timeout message = %v", err)
+	}
+
+	// A refusal (4xx) is not asked again.
+	arch, url = newFakeArchive(t, site(3)...)
+	arch.status = 400
+	if _, err := discover(t, engine(url, Options{MaxURLs: 10})); err == nil || arch.calls.Load() != 1 || !strings.Contains(err.Error(), "refused") {
+		t.Errorf("refused: err %v, requests %d", err, arch.calls.Load())
 	}
 }

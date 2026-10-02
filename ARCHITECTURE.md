@@ -373,7 +373,7 @@ bodies ([cache/cache.go](server/internal/cache/cache.go)).
 | Layer | Key | Holds | Default TTL |
 | --- | --- | --- | --- |
 | certificate | provider + domain | hostnames from one provider, or its failure | 6 h (rate limited 15 min, other failures 5 min) |
-| archive | domain | archived URLs with first capture and content type; only listings of up to 20,000 URLs | 24 h (failures 5 min) |
+| archive | domain | archived URLs with first capture and content type; only listings of up to 20,000 URLs | 24 h (failures 1 min) |
 | dns | hostname | addresses, CNAME, non-public flag, or NXDOMAIN | 5 min (NXDOMAIN 1 min, timeouts never) |
 | probe | host + scope | reachability, status, redirect, title | 2 min |
 | sitemap | URL | a robots.txt's sitemap list, or a sitemap's URLs | 15 min |
