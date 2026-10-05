@@ -8,6 +8,7 @@ import { createScan, exportUrl, getHosts } from "@/lib/api";
 import { formatDuration, hostStatus, modeLabels, plural, sourceLabel } from "@/lib/format";
 import type { Scan, ScanSummary } from "@/lib/types";
 import { usePages } from "@/lib/use-pages";
+import { useVerification } from "@/lib/verification";
 import { HostList } from "./host-list";
 import { SiteMap } from "./site-map";
 import { ListFooter, UrlList } from "./url-list";
@@ -244,12 +245,14 @@ function ScanAgain({ scan }: { scan: Scan }) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { attach: attachVerification, getToken } = useVerification();
 
   async function onClick() {
     setBusy(true);
     setError(null);
     try {
-      const next = await createScan(scan.target, scan.mode, true);
+      const verificationToken = await getToken();
+      const next = await createScan(scan.target, scan.mode, { fresh: true, verificationToken });
       track("scan_again", { mode: scan.mode });
       router.push(`/scans/${next.id}`);
     } catch (err) {
@@ -268,6 +271,7 @@ function ScanAgain({ scan }: { scan: Scan }) {
       >
         {busy ? "Starting…" : "Scan again"}
       </button>
+      <div ref={attachVerification} />
       {error && (
         <span role="alert" className="text-warn">
           {error}

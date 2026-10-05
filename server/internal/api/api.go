@@ -107,6 +107,9 @@ type createRequest struct {
 	Mode string `json:"mode"`
 	// Fresh asks for a new scan even if a recent one could be returned.
 	Fresh bool `json:"fresh"`
+	// VerificationToken is the challenge token from the visitor's browser,
+	// required when the server verifies visitors.
+	VerificationToken string `json:"verificationToken"`
 }
 
 func (h *handler) createScan(w http.ResponseWriter, r *http.Request) {
@@ -118,8 +121,22 @@ func (h *handler) createScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The start limit applies only if this request starts a new scan.
 	visitor := h.access.visitor(r)
+	if v := h.access.Verifier; v != nil {
+		ok, err := v.Verify(r.Context(), req.VerificationToken, visitor)
+		switch {
+		case err != nil:
+			h.log.Error("visitor verification failed", "event", "verification_error", "error", err)
+			w.Header().Set("Retry-After", "10")
+			writeError(w, http.StatusServiceUnavailable, "Visitors cannot be verified right now. Please try again in a moment.")
+			return
+		case !ok:
+			writeError(w, http.StatusForbidden, "The verification did not succeed. Please complete the check and try again.")
+			return
+		}
+	}
+
+	// The start limit applies only if this request starts a new scan.
 	sc, err := h.scans.Create(r.Context(), scan.CreateRequest{
 		Target: req.Target, Mode: scan.Mode(req.Mode), Fresh: req.Fresh,
 		BeforeStart: func() error {

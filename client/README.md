@@ -19,6 +19,16 @@ npm run lint
 npm run build && npm start
 ```
 
+## Visitor verification
+
+Optional and off by default. Setting `NEXT_PUBLIC_TURNSTILE_SITE_KEY` shows
+Cloudflare Turnstile's check on the form and on "Scan again"
+([src/lib/verification.ts](src/lib/verification.ts)). It runs in the
+background and appears only if Cloudflare wants the visitor to tick a box.
+The token it produces is sent with the request to start a scan; the server
+must be given the matching secret key (`TURNSTILE_SECRET_KEY`), or the token
+is ignored.
+
 ## Analytics
 
 Usage analytics are optional and off by default. Setting

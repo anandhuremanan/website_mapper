@@ -107,7 +107,10 @@ describe("ResultsView for a finished scan", () => {
     render(<ResultsView scan={scan("completed")} result={finished} />);
     fireEvent.click(screen.getByRole("button", { name: "Scan again" }));
     await waitFor(() => expect(push).toHaveBeenCalledWith("/scans/s2"));
-    expect(api.createScan).toHaveBeenCalledWith("example.com", "light", true);
+    expect(api.createScan).toHaveBeenCalledWith("example.com", "light", {
+      fresh: true,
+      verificationToken: undefined,
+    });
   });
 });
 

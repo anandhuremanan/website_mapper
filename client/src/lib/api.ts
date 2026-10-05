@@ -58,15 +58,33 @@ function subscriptionFor(scanId: string): string | null {
   }
 }
 
+export interface CreateOptions {
+  /** Always scan, even if a recent result could be returned. */
+  fresh?: boolean;
+  /** The visitor-verification token, when the site verifies visitors. */
+  verificationToken?: string;
+}
+
 /**
  * Starts a scan, or joins an equivalent one already running. Unless `fresh`
  * is set, a scan of the same target and mode that finished recently is
  * returned instead (`reused: true`).
  */
-export async function createScan(target: string, mode: ScanMode, fresh = false): Promise<Scan> {
+export async function createScan(
+  target: string,
+  mode: ScanMode,
+  options: CreateOptions = {},
+): Promise<Scan> {
   const scan = await request<Scan>("/api/scans", {
     method: "POST",
-    body: JSON.stringify({ target, mode, fresh }),
+    // An undefined token is left out, so a server that does not verify
+    // visitors is sent nothing it does not know.
+    body: JSON.stringify({
+      target,
+      mode,
+      fresh: options.fresh ?? false,
+      verificationToken: options.verificationToken,
+    }),
   });
   rememberSubscription(scan);
   return scan;
