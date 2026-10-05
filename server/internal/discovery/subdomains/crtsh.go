@@ -25,6 +25,9 @@ type CRTSh struct {
 	BaseURL string
 	// RetryDelay is the wait before retrying a failed request.
 	RetryDelay time.Duration
+	// DB, if set, is asked first: crt.sh's database is often available
+	// when its website is not. The website is the fallback.
+	DB NameLister
 }
 
 // NewCRTSh creates a crt.sh source. The fetcher should allow a long timeout
@@ -38,9 +41,32 @@ func (c *CRTSh) Name() string                 { return "crt.sh" }
 func (c *CRTSh) Provenance() discovery.Source { return discovery.SourceCT }
 
 // Discover returns every name on certificates logged for the domain and
-// its subdomains. crt.sh often fails transiently under load, so a failed
-// request is retried twice with increasing delays.
+// its subdomains: from crt.sh's database if one is set and answers, else
+// from its website. The website often fails transiently under load, so a
+// failed request there is retried twice with increasing delays.
 func (c *CRTSh) Discover(ctx context.Context, domain string) ([]string, error) {
+	if c.DB == nil {
+		return c.website(ctx, domain)
+	}
+	names, dbErr := c.DB.Names(ctx, domain)
+	if dbErr == nil {
+		return names, nil
+	}
+	if ctx.Err() != nil {
+		return nil, dbErr
+	}
+	names, webErr := c.website(ctx, domain)
+	if webErr != nil {
+		if errors.Is(webErr, ErrRateLimited) {
+			return nil, fmt.Errorf("%w (and %s)", webErr, dbErr)
+		}
+		return nil, fmt.Errorf("%s; %s", dbErr, webErr)
+	}
+	return names, nil
+}
+
+// website asks crt.sh's web interface.
+func (c *CRTSh) website(ctx context.Context, domain string) ([]string, error) {
 	u := c.BaseURL + "/?q=" + url.QueryEscape("%."+domain) + "&output=json"
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {

@@ -94,6 +94,16 @@ func run() error {
 		return err
 	}
 	defer repo.Close()
+	// What each subdomain provider last answered, kept on disk so that an
+	// outage or a restart does not lose it.
+	if cfg.Scan.NameMemory > 0 {
+		names, err := store.OpenNames(cfg.Store.DataDir, cfg.Scan.NameMemory, log)
+		if err != nil {
+			return err
+		}
+		defer names.Close()
+		caches.names = names
+	}
 	svc := scan.NewService(repo, pipeline(cfg.Scan, pools, caches, log), scan.Options{
 		DefaultMode:      defaultMode,
 		MaxRunning:       cfg.MaxConcurrentScans,
@@ -183,6 +193,8 @@ type sharedCaches struct {
 	sitemap *sitemap.Cache
 	page    *htmlcrawl.Cache
 	ttl     config.CacheConfig
+	// names is the on-disk memory of subdomain providers' answers (nil: none).
+	names subdomains.Memory
 }
 
 // newCaches splits the memory budget between the layers. Pages dominate
@@ -345,6 +357,9 @@ func pipeline(cfg config.ScanConfig, pools sharedPools, caches sharedCaches, log
 // fastSourceTimeout bounds each quick subdomain provider in total.
 const fastSourceTimeout = 10 * time.Second
 
+// crtshDatabaseTimeout bounds one query to crt.sh's database.
+const crtshDatabaseTimeout = 90 * time.Second
+
 // slowSourceWait is how long a scan that has nothing else left to do waits
 // for the slow subdomain providers. They keep being asked after that, up to
 // SCAN_CT_TIMEOUT, and their answers are cached for later scans.
@@ -385,7 +400,11 @@ func subdomainStages(cfg config.ScanConfig, pools sharedPools, caches sharedCach
 	for _, name := range cfg.SubdomainSources {
 		switch name {
 		case "crtsh":
-			slow = append(slow, subdomains.NewCRTSh(slowClient))
+			crtsh := subdomains.NewCRTSh(slowClient)
+			if cfg.CRTShDatabase {
+				crtsh.DB = &subdomains.CRTShDB{Pool: pools.ct, Timeout: crtshDatabaseTimeout}
+			}
+			slow = append(slow, crtsh)
 		case "certspotter":
 			slow = append(slow, subdomains.NewCertSpotter(slowClient))
 		case "anubis":
@@ -399,19 +418,26 @@ func subdomainStages(cfg config.ScanConfig, pools sharedPools, caches sharedCach
 	engine := func(sources []subdomains.Source, timeout time.Duration) []discovery.Engine {
 		return []discovery.Engine{subdomains.New(sources, timeout, log).WithCache(subdomains.CacheOptions{
 			Cache: caches.cert, TTL: caches.ttl.CertTTL, RateLimitTTL: 15 * time.Minute, FailureTTL: 5 * time.Minute,
+			Memory: caches.names,
 		})}
+	}
+	// crt.sh's database can take most of a minute, and its website is tried
+	// after it; neither holds up a scan (see slowSourceWait).
+	slowTimeout := cfg.CTTimeout
+	if cfg.CRTShDatabase {
+		slowTimeout += crtshDatabaseTimeout
 	}
 	switch {
 	case len(quick) > 0 && len(slow) > 0:
 		return []scan.Stage{
 			{ID: "certificates", Label: "Searching certificate logs", Background: true, JoinWait: slowSourceWait,
-				Engines: engine(slow, cfg.CTTimeout)},
+				Engines: engine(slow, slowTimeout)},
 			{ID: "subdomains", Label: "Discovering subdomains", Engines: engine(quick, fastSourceTimeout)},
 		}
 	case len(quick) > 0:
 		return []scan.Stage{{ID: "subdomains", Label: "Discovering subdomains", Engines: engine(quick, fastSourceTimeout)}}
 	case len(slow) > 0:
-		return []scan.Stage{{ID: "subdomains", Label: "Discovering subdomains", Engines: engine(slow, cfg.CTTimeout)}}
+		return []scan.Stage{{ID: "subdomains", Label: "Discovering subdomains", Engines: engine(slow, slowTimeout)}}
 	}
 	return nil
 }

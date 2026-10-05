@@ -135,6 +135,11 @@ type ScanConfig struct {
 	CTEnabled bool
 	// SubdomainSources are the providers asked for subdomains.
 	SubdomainSources []string
+	// CRTShDatabase asks crt.sh's public database before its website.
+	CRTShDatabase bool
+	// NameMemory is how long each provider's last answer is kept on disk
+	// (0: not kept).
+	NameMemory time.Duration
 	// CTTimeout bounds the Certificate Transparency query (crt.sh is slow).
 	CTTimeout time.Duration
 	// RequestsPerSecond is the per-host request rate limit.
@@ -208,6 +213,8 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 			DNSServers:           p.dnsServers("SCAN_DNS_SERVERS", "1.1.1.1:53,8.8.8.8:53"),
 			ConnectTimeout:       p.duration("SCAN_CONNECT_TIMEOUT", 4*time.Second),
 			SubdomainSources:     p.list("SCAN_SUBDOMAIN_SOURCES", "crtsh,certspotter,anubis,thc,shodan", SubdomainSources...),
+			CRTShDatabase:        p.bool("SCAN_CRTSH_DATABASE", true),
+			NameMemory:           time.Duration(p.int("SCAN_NAME_MEMORY_DAYS", 30, 0)) * 24 * time.Hour,
 			CTEnabled:            p.bool("SCAN_CT_ENABLED", true),
 			CTTimeout:            p.duration("SCAN_CT_TIMEOUT", 60*time.Second),
 			RequestsPerSecond:    p.float("SCAN_REQUESTS_PER_SECOND", 5),

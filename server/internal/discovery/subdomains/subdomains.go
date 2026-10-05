@@ -25,6 +25,21 @@ var ErrRateLimited = errors.New("rate limited")
 type Answer struct {
 	Hosts []string
 	Err   string
+	// At is when the provider gave Hosts, if that was not just now: the
+	// answer was taken from the Memory.
+	At time.Time
+	// Note explains an answer taken from the Memory because the provider
+	// failed. It is reported, but the hosts are used.
+	Note string
+}
+
+// Memory keeps providers' answers for longer than the Cache does, and
+// across restarts (see store.Names).
+type Memory interface {
+	// Load returns what source last listed for domain, and when.
+	Load(source, domain string) (hosts []string, at time.Time, ok bool)
+	// Save records what source listed for domain just now.
+	Save(source, domain string, hosts []string)
 }
 
 // Cache holds provider answers, keyed by provider and domain.
@@ -43,6 +58,10 @@ type CacheOptions struct {
 	// RateLimitTTL is how long a rate-limited answer is reused, so the
 	// provider is not asked again until its allowance may have recovered.
 	RateLimitTTL time.Duration
+	// Memory, if set, remembers every provider's last answer. It is used
+	// when the answer is still fresh after a restart, when the provider
+	// fails, and when the scan moves on before the provider has answered.
+	Memory Memory
 	// FailureTTL is how long other failures (errors, timeouts) are reused.
 	// Keep it short: they are often transient, but retrying a provider that
 	// is down on every scan costs each scan up to the provider timeout.
@@ -114,6 +133,7 @@ func (e *Engine) Discover(ctx context.Context, in discovery.Input, emit discover
 	}
 
 	var errs []error
+	good := 0 // providers whose hosts were used
 	waiting := map[string]bool{}
 	for _, src := range e.sources {
 		waiting[src.Name()] = true
@@ -133,6 +153,12 @@ collect:
 			if r.info.Hit || r.info.Shared {
 				cachedAt = r.info.CreatedAt
 			}
+			if !r.answer.At.IsZero() {
+				cachedAt = r.answer.At
+			}
+			if r.answer.Note != "" {
+				errs = append(errs, fmt.Errorf("%s: %s", r.src.Name(), r.answer.Note))
+			}
 			if r.answer.Err != "" {
 				msg := r.answer.Err
 				if r.info.Hit {
@@ -142,6 +168,7 @@ collect:
 				errs = append(errs, fmt.Errorf("%s: %s", r.src.Name(), msg))
 				continue
 			}
+			good++
 			e.log.Info("passive source finished", "source", r.src.Name(), "hosts", len(r.answer.Hosts), "cached", !cachedAt.IsZero())
 			for _, h := range r.answer.Hosts {
 				emit(discovery.Finding{Host: h, Source: r.src.Provenance(), CachedAt: cachedAt})
@@ -150,14 +177,26 @@ collect:
 	}
 	// In source order, so the message is the same every time.
 	for _, src := range e.sources {
-		if waiting[src.Name()] {
-			errs = append(errs, fmt.Errorf("%s: had not answered when the scan moved on; its answer will be used by later scans", src.Name()))
+		if !waiting[src.Name()] {
+			continue
 		}
+		// The provider is still being asked. If it answered an earlier
+		// scan, use that answer now.
+		if hosts, at, ok := e.remembered(src, in.Target); ok {
+			good++
+			for _, h := range hosts {
+				emit(discovery.Finding{Host: h, Source: src.Provenance(), CachedAt: at})
+			}
+			errs = append(errs, fmt.Errorf("%s: had not answered when the scan moved on; used its answer from %s",
+				src.Name(), at.UTC().Format("2 Jan 2006")))
+			continue
+		}
+		errs = append(errs, fmt.Errorf("%s: had not answered when the scan moved on; its answer will be used by later scans", src.Name()))
 	}
 	switch {
 	case len(errs) == 0:
 		return nil
-	case len(errs) == len(e.sources):
+	case good == 0:
 		return errors.Join(errs...)
 	}
 	return discovery.Partial(errors.Join(errs...))
@@ -173,15 +212,28 @@ func (e *Engine) ask(ctx context.Context, src Source, t discovery.Target) (cache
 		sctx, cancel = context.WithTimeout(ctx, e.timeout)
 		defer cancel()
 	}
+	l := cache.Loaded[Answer]{Group: t.Domain}
+	// An answer remembered from before a restart, if it is as fresh as a
+	// cached one would be, saves asking the provider at all.
+	hosts, at, remembered := e.remembered(src, t)
+	if remembered && time.Since(at) < e.cache.TTL {
+		l.Value = Answer{Hosts: hosts, At: at}
+		l.TTL = e.cache.TTL - time.Since(at)
+		l.Cost = 64 + cache.StringCost(hosts...)
+		return l, nil
+	}
+
 	names, err := src.Discover(sctx, t.Domain)
 	if ctx.Err() != nil {
 		return cache.Loaded[Answer]{}, ctx.Err()
 	}
-	l := cache.Loaded[Answer]{Group: t.Domain}
 	switch {
 	case err == nil:
 		l.Value.Hosts = Filter(names, t)
 		l.TTL = e.cache.TTL
+		if e.cache.Memory != nil {
+			e.cache.Memory.Save(src.Name(), t.Domain, l.Value.Hosts)
+		}
 	case sctx.Err() != nil:
 		l.Value.Err = fmt.Sprintf("no answer within %s", e.timeout)
 		l.TTL = min(e.cache.FailureTTL, e.cache.TTL)
@@ -192,8 +244,22 @@ func (e *Engine) ask(ctx context.Context, src Source, t discovery.Target) (cache
 		l.Value.Err = err.Error()
 		l.TTL = min(e.cache.FailureTTL, e.cache.TTL)
 	}
-	l.Cost = 64 + cache.StringCost(l.Value.Err) + cache.StringCost(l.Value.Hosts...)
+	if l.Value.Err != "" && remembered {
+		// The provider failed, but it answered before: use that answer and
+		// say so. It is asked again as soon as a failure would be.
+		l.Value = Answer{Hosts: hosts, At: at,
+			Note: fmt.Sprintf("%s; used its answer from %s", l.Value.Err, at.UTC().Format("2 Jan 2006"))}
+	}
+	l.Cost = 64 + cache.StringCost(l.Value.Err, l.Value.Note) + cache.StringCost(l.Value.Hosts...)
 	return l, nil
+}
+
+// remembered returns the provider's last stored answer for the target.
+func (e *Engine) remembered(src Source, t discovery.Target) ([]string, time.Time, bool) {
+	if e.cache.Memory == nil {
+		return nil, time.Time{}, false
+	}
+	return e.cache.Memory.Load(src.Name(), t.Domain)
 }
 
 // Filter normalizes raw names (lowercase, no trailing dot, no "*." prefix),
