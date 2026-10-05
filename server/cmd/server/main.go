@@ -117,18 +117,22 @@ func run() error {
 		"gomaxprocs", runtime.GOMAXPROCS(0))
 
 	log.Info("API access", "event", "api_access", "restricted_to_web_client", cfg.APIProxySecret != "",
-		"start_limit", cfg.StartLimit, "start_window", cfg.StartWindow)
+		"visitors_verified", cfg.TurnstileSecret != "", "start_limit", cfg.StartLimit, "start_window", cfg.StartWindow)
+	access := api.Access{
+		ProxySecret: cfg.APIProxySecret,
+		StartLimit:  cfg.StartLimit,
+		StartWindow: cfg.StartWindow,
+	}
+	if cfg.TurnstileSecret != "" {
+		access.Verifier = api.Turnstile{Secret: cfg.TurnstileSecret}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	srv := &http.Server{
-		Addr: ":" + cfg.Port,
-		Handler: api.NewHandler(svc, log, api.Access{
-			ProxySecret: cfg.APIProxySecret,
-			StartLimit:  cfg.StartLimit,
-			StartWindow: cfg.StartWindow,
-		}),
+		Addr:              ":" + cfg.Port,
+		Handler:           api.NewHandler(svc, log, access),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,

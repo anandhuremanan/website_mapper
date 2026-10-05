@@ -518,6 +518,14 @@ On an open API the first `X-Forwarded-For` address is used (or the peer),
 which a direct caller can forge; closing the API is what makes the limit
 hold.
 
+**Verifying visitors.** Set `TURNSTILE_SECRET_KEY` (and the matching site key
+on the web client) to require a [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/)
+token for every `POST /api/scans`, sent as `"verificationToken"` in the
+body. Turnstile checks the browser in the background; most visitors see
+nothing. A missing, invalid or already used token gets `403`; if Cloudflare
+cannot be reached the answer is `503`, never a silent pass. Reading results
+needs no token. The start limit still applies on top.
+
 Keep the secret out of files that are replaced from the repository. On the
 deployment described below, put it in its own file readable only by root
 and load it with a second `EnvironmentFile=` line in the unit.

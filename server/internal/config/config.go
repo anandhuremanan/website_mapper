@@ -26,6 +26,9 @@ type Config struct {
 	// APIProxySecret, if set, closes the API to everyone but the web
 	// client, which sends it with every request it forwards.
 	APIProxySecret string
+	// TurnstileSecret, if set, makes starting a scan require a Cloudflare
+	// Turnstile token, which the web client gets from its widget.
+	TurnstileSecret string
 	// StartLimit is how many scans one visitor may start per StartWindow
 	// (0: no limit).
 	StartLimit  int
@@ -159,6 +162,7 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 		MaxConcurrentScans: p.int("MAX_CONCURRENT_SCANS", 3, 1),
 		QueueSize:          p.int("SCAN_QUEUE_SIZE", 100, 1),
 		APIProxySecret:     p.str("API_PROXY_SECRET", ""),
+		TurnstileSecret:    p.str("TURNSTILE_SECRET_KEY", ""),
 		StartLimit:         p.int("SCAN_START_LIMIT", 10, 0),
 		StartWindow:        p.duration("SCAN_START_WINDOW", 10*time.Minute),
 		Store: StoreConfig{

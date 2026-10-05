@@ -31,6 +31,9 @@ type Access struct {
 	// nothing.
 	StartLimit  int
 	StartWindow time.Duration
+	// Verifier, if set, must accept a challenge token sent with every
+	// request to start a scan (see Turnstile).
+	Verifier Verifier
 	// Now is the clock; overridable for tests.
 	Now func() time.Time
 }

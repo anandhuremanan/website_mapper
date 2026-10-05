@@ -5,6 +5,7 @@ import { useState, type FormEvent } from "react";
 import { track } from "@/lib/analytics";
 import { createScan } from "@/lib/api";
 import type { ScanMode } from "@/lib/types";
+import { useVerification } from "@/lib/verification";
 
 const modes: { id: ScanMode; label: string; detail: string }[] = [
   {
@@ -33,6 +34,7 @@ export function ScanForm() {
   const [mode, setMode] = useState<ScanMode>("light");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const { attach: attachVerification, getToken } = useVerification();
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
@@ -43,7 +45,8 @@ export function ScanForm() {
     setSubmitting(true);
     setError(null);
     try {
-      const scan = await createScan(target.trim(), mode);
+      const verificationToken = await getToken();
+      const scan = await createScan(target.trim(), mode, { verificationToken });
       track("scan_started", {
         mode,
         outcome: scan.reused ? "reused" : scan.coalesced ? "joined" : "new",
@@ -86,6 +89,8 @@ export function ScanForm() {
           {submitting ? "Starting…" : "Map website"}
         </button>
       </div>
+      {/* The visitor check: empty unless Cloudflare asks for a click. */}
+      <div ref={attachVerification} />
       <fieldset className="space-y-2 pt-1">
         <legend className="mb-2 text-sm font-medium">Scan Mode</legend>
         {modes.map((m) => (
