@@ -245,7 +245,8 @@ function ScanAgain({ scan }: { scan: Scan }) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const { attach: attachVerification, getToken } = useVerification();
+  // Checked only when the button is pressed, not on every result page.
+  const { attach: attachVerification, getToken } = useVerification({ onDemand: true });
 
   async function onClick() {
     setBusy(true);
