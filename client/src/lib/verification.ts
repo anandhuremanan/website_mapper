@@ -67,7 +67,17 @@ export interface Verification {
   getToken: () => Promise<string | undefined>;
 }
 
-export function useVerification(): Verification {
+export interface VerificationOptions {
+  /**
+   * Run the check only when a token is asked for, instead of as soon as the
+   * component appears. For actions most visitors never take (such as "Scan
+   * again" on a result page): nobody is checked, or shown a checkbox, for
+   * something they did not ask to do. The price is a short wait on the click.
+   */
+  onDemand?: boolean;
+}
+
+export function useVerification({ onDemand = false }: VerificationOptions = {}): Verification {
   const container = useRef<HTMLDivElement | null>(null);
   const attach = useCallback((element: HTMLDivElement | null) => {
     container.current = element;
@@ -75,19 +85,21 @@ export function useVerification(): Verification {
   const widget = useRef<string | undefined>(undefined);
   const token = useRef<string | undefined>(undefined);
   const failed = useRef(false);
+  const gone = useRef(false);
   const waiting = useRef<{ resolve: (t: string) => void; reject: (e: Error) => void }[]>([]);
 
-  useEffect(() => {
+  const fail = useCallback(() => {
+    failed.current = true;
+    waiting.current.splice(0).forEach((w) => w.reject(new Error(FAILED)));
+  }, []);
+
+  /** Shows the widget, which starts the check. Does nothing if it is shown. */
+  const start = useCallback(() => {
     const sitekey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
-    if (!sitekey) return;
-    let gone = false;
-    const fail = () => {
-      failed.current = true;
-      waiting.current.splice(0).forEach((w) => w.reject(new Error(FAILED)));
-    };
+    if (!sitekey || widget.current) return;
     loadTurnstile()
       .then(() => {
-        if (gone || !container.current || !window.turnstile) return;
+        if (gone.current || widget.current || !container.current || !window.turnstile) return;
         widget.current = window.turnstile.render(container.current, {
           sitekey,
           appearance: "interaction-only",
@@ -99,33 +111,43 @@ export function useVerification(): Verification {
           },
           "expired-callback": () => {
             token.current = undefined;
-            if (widget.current) window.turnstile?.reset(widget.current);
+            // Keep a token ready only where one is wanted in advance.
+            if (!onDemand && widget.current) window.turnstile?.reset(widget.current);
           },
           "error-callback": fail,
         });
       })
       .catch(fail);
+  }, [fail, onDemand]);
+
+  useEffect(() => {
+    gone.current = false;
+    if (!onDemand) start();
     return () => {
-      gone = true;
+      gone.current = true;
       if (widget.current) window.turnstile?.remove(widget.current);
       widget.current = undefined;
     };
-  }, []);
+  }, [onDemand, start]);
 
   const getToken = useCallback(async () => {
     if (!process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY) return undefined;
-    // A token works once: hand it over and ask for the next one.
+    // A token works once. Where tokens are prepared in advance, hand this
+    // one over and ask for the next.
     const ready = token.current;
     if (ready) {
       token.current = undefined;
-      if (widget.current) window.turnstile?.reset(widget.current);
+      if (!onDemand && widget.current) window.turnstile?.reset(widget.current);
       return ready;
     }
-    if (failed.current) {
-      // Try again from the start; the wait below reports a second failure.
+    if (!widget.current) {
+      if (!onDemand && failed.current) throw new Error(FAILED);
       failed.current = false;
-      if (widget.current) window.turnstile?.reset(widget.current);
-      else throw new Error(FAILED);
+      start(); // on demand: the first request shows the widget
+    } else if (onDemand || failed.current) {
+      // The last token was used, or the last check failed: check again.
+      failed.current = false;
+      window.turnstile?.reset(widget.current);
     }
     return new Promise<string>((resolve, reject) => {
       const entry = { resolve, reject };
@@ -135,8 +157,8 @@ export function useVerification(): Verification {
       }, TIMEOUT_MS);
       entry.resolve = (t) => {
         clearTimeout(timer);
-        // This token is used now; prepare the next one.
-        if (widget.current) window.turnstile?.reset(widget.current);
+        // This token is used now; prepare the next one where wanted.
+        if (!onDemand && widget.current) window.turnstile?.reset(widget.current);
         resolve(t);
       };
       entry.reject = (e) => {
@@ -145,7 +167,7 @@ export function useVerification(): Verification {
       };
       waiting.current.push(entry);
     });
-  }, []);
+  }, [onDemand, start]);
 
   return { attach, getToken };
 }

@@ -26,10 +26,10 @@ function fakeTurnstile() {
 }
 
 /** Renders the hook with its container attached, as a component would. */
-async function mount() {
+async function mount(options: { onDemand?: boolean } = {}) {
   const el = document.createElement("div");
   const hook = renderHook(() => {
-    const v = useVerification();
+    const v = useVerification(options);
     v.attach(el);
     return v;
   });
@@ -89,6 +89,28 @@ describe("useVerification", () => {
     const outcome = expect(stuck).rejects.toThrow(/could not verify your browser/);
     await vi.advanceTimersByTimeAsync(30_000);
     await outcome;
+  });
+
+  it("on demand, checks nobody until a token is asked for", async () => {
+    const widget = fakeTurnstile();
+    const { result } = await mount({ onDemand: true });
+    // The page has loaded and nothing has run: no widget, no checkbox.
+    expect(widget.options).toBeUndefined();
+
+    const first = result.current.getToken();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(widget.options).toBeDefined();
+    widget.options!.callback("token-1");
+    expect(await first).toBe("token-1");
+    // No next token is fetched in advance...
+    expect(widget.resets).toBe(0);
+
+    // ...only when asked again.
+    const second = result.current.getToken();
+    expect(widget.resets).toBe(1);
+    widget.options!.callback("token-2");
+    expect(await second).toBe("token-2");
   });
 
   it("removes the widget with the component", async () => {
