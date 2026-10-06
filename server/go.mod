@@ -3,6 +3,7 @@ module websitemapper
 go 1.26.0
 
 require (
+	github.com/lib/pq v1.12.3
 	github.com/miekg/dns v1.1.73
 	golang.org/x/net v0.57.0
 	modernc.org/sqlite v1.60.1

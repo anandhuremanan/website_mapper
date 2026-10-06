@@ -814,6 +814,20 @@ URL fields:
 - **crt.sh** returns the full certificate history, which includes names that
   no longer resolve. It is slow and often returns 502/503 under load, so it
   is retried twice. It allows about 5 requests a minute per IP.
+- **crt.sh's database.** The website is a front end to a public PostgreSQL
+  database (`crt.sh:5432`, user `guest`), which is often reachable while the
+  website returns errors. The scanner asks the database first and the
+  website only if that fails (`SCAN_CRTSH_DATABASE`). A query takes 30-50 s
+  for a small domain and is sometimes refused ("no more connections
+  allowed"), so it always runs in the background. The database sits behind a
+  pooler that does not accept prepared statements; the query is sent as one
+  plain statement with the (validated) domain written into it.
+- **Remembering answers.** Every provider's last answer for a domain is kept
+  on disk for `SCAN_NAME_MEMORY_DAYS` (30) in `DATA_DIR/names.sqlite`. It is
+  used when the provider fails, when the scan finishes before the provider
+  has answered, and after a restart; the result then says "used its answer
+  from <date>". This is what makes a slow provider useful: its first answer
+  arrives after the scan, and every later scan has it at once.
 - **Cert Spotter** returns only current certificates. Unauthenticated use is
   limited to about 10 requests per hour per IP; each scan uses up to 3.
 - Because those two are slow or often unavailable, they run in the

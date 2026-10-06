@@ -235,6 +235,7 @@ certificate providers failing).
 | --- | --- | --- | --- |
 | `subdomains` | `discovery/subdomains` | Asks public sources (in parallel) for names under the domain and keeps in-scope hostnames. Two instances: the quick sources (Shodan's certificate search, AnubisDB, ip.thc.org) in the foreground, the slow certificate logs (crt.sh, Cert Spotter) in the background | none |
 | `archive` | `discovery/archive` | The Wayback Machine CDX index for the domain and all subdomains, a page of 25,000 URLs at a time: URLs archived with HTTP 200, first capture date, content type; drops malformed junk. Reported as it arrives, so memory stays at one page | none |
+| | | crt.sh is asked through its public database first, then its website. Each provider's last answer is remembered on disk ([store/names.go](server/internal/store/names.go)) and used when the provider is down, slow, or the server restarted | |
 | `dns` | `discovery/dnsresolve` | One A question per host to public resolvers, whose answer carries the alias chain (AAAA only if there is no IPv4 address); flags hosts that resolve only to private addresses. Falls back to the system resolver if the servers cannot be reached | none (DNS only) |
 | `http` | `discovery/httpprobe` | `GET https://host/`, falling back to `http://`; status, redirect, title, server | 1–2 per host |
 | `sitemap` | `discovery/sitemap` | robots.txt `Sitemap:` lines (never `Disallow`), else `/sitemap.xml`; sitemap indexes, `.xml.gz`, text sitemaps | a few per host |
